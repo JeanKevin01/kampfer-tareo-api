@@ -142,11 +142,11 @@ async def registrar(data: dict):
             })
             continue
 
-        # Insertar usando SQL puro con fecha literal
+        # Insertar — fecha y hora como literales SQL para evitar problema de tipo asyncpg
         try:
             insert_sql = f"""
                 INSERT INTO registros (trab_id, otm_id, supervisor_id, fecha, hora)
-                VALUES (:trab_id, :otm_id, :supervisor_id, '{fecha_str}'::date, :hora)
+                VALUES (:trab_id, :otm_id, :supervisor_id, '{fecha_str}'::date, '{hora}'::time)
             """
             await database.execute(
                 insert_sql,
@@ -154,7 +154,6 @@ async def registrar(data: dict):
                     "trab_id":       trab_id,
                     "otm_id":        otm_id,
                     "supervisor_id": supervisor_id,
-                    "hora":          hora,
                 }
             )
             resultados.append({
