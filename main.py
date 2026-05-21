@@ -420,3 +420,27 @@ async def actualizar_estado_otm(otm_id: str, data: dict):
         {"estado": estado, "id": otm_id}
     )
     return {"status": "ok"}
+
+# ── EDITAR TRABAJADOR ─────────────────────────────────────────
+@app.put("/admin/trabajador/{trab_id}")
+async def editar_trabajador(trab_id: str, data: dict):
+    row = await database.fetch_one(
+        "SELECT id FROM trabajadores WHERE id = :id",
+        {"id": trab_id}
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Trabajador no encontrado")
+    await database.execute(
+        "UPDATE trabajadores SET nombre = :nombre, cargo = :cargo, dni = :dni WHERE id = :id",
+        {
+            "id":     trab_id,
+            "nombre": data.get("nombre", "").upper().strip(),
+            "cargo":  data.get("cargo",  "").upper().strip(),
+            "dni":    data.get("dni",    ""),
+        }
+    )
+    updated = await database.fetch_one(
+        "SELECT id, nombre, cargo, dni FROM trabajadores WHERE id = :id",
+        {"id": trab_id}
+    )
+    return dict(updated)
