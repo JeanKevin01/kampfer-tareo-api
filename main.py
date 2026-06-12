@@ -3,6 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import database
 from datetime import date, datetime
 from typing import Optional
+from routers.valor_ganado import router as ev_router
+app.include_router(ev_router)
 
 app = FastAPI(title="Kampfer Tareo API", version="1.2.0")
 
