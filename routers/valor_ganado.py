@@ -1,16 +1,26 @@
 # ============================================================
-# routers/valor_ganado.py
-# Módulo Valor Ganado - lógica del ISP Fluor digitalizada
+# routers/valor_ganado.py  —  v2
+# Módulo Valor Ganado - lógica ISP Fluor digitalizada
 #
-# Integración en main.py (2 líneas):
+# Novedades v2:
+#   - OTM por encima de fase/sub-fase (ev_partidas.otm_id)
+#   - POST /ev/importar: carga masiva de partidas (desde cero o con
+#     histórico de avances y HH) en una sola transacción
+#   - GET/POST /ev/plantillas: catálogo de rules of credit por tipo
+#     de actividad
+#   - HH automáticas desde el tareo QR (vista ev_hh_tareo) sumadas a
+#     las HH manuales; mapeo fecha->semana vía ev_config.fecha_base
+#   - POST /ev/asignar-hh: etiquetar registros del tareo con partida
+#   - GET /ev/curva-fase: tendencia de PF por disciplina
+#
+# Integración en main.py (sin cambios respecto a v1):
 #   from routers.valor_ganado import router as ev_router
-#   app.include_router(ev_router)
-#
-# Usa su propio pool asyncpg leyendo DATABASE_URL del entorno.
-# Si prefieres reutilizar el pool de main.py, reemplaza db() abajo.
+#   app.include_router(ev_router)   # después de crear app
 # ============================================================
 import os
+import json
 from collections import defaultdict
+from datetime import date, timedelta
 from typing import Optional
 
 import asyncpg
@@ -41,6 +51,7 @@ class HitoIn(BaseModel):
 
 class PartidaIn(BaseModel):
     codigo: str
+    otm_id: Optional[str] = None
     fase: str
     sub_fase: Optional[str] = None
     descripcion: str
@@ -68,6 +79,51 @@ class CapturaIn(BaseModel):
     hh_gastadas: list[HHIn] = []
 
 
+class PlantillaIn(BaseModel):
+    tipo_actividad: str
+    hitos: list[HitoIn]
+
+
+class ImpPartida(BaseModel):
+    codigo: str
+    otm_id: Optional[str] = None
+    fase: str
+    sub_fase: Optional[str] = None
+    descripcion: str
+    unidad: str
+    sistema: Optional[str] = None
+    metrado_presup: float = 0
+    metrado_proyec: Optional[float] = None
+    hh_presup: float = 0
+    tipo_actividad: Optional[str] = None      # busca hitos en el catálogo
+    hitos: Optional[list[HitoIn]] = None      # o hitos explícitos
+
+
+class ImpAvance(BaseModel):
+    codigo: str
+    semana: int
+    hito: int = Field(ge=1, le=10)
+    cantidad_acum: float = Field(ge=0)
+
+
+class ImpHH(BaseModel):
+    codigo: str
+    semana: int
+    hh: float = Field(ge=0)
+
+
+class ImportarIn(BaseModel):
+    partidas: list[ImpPartida]
+    avances: list[ImpAvance] = []
+    hh: list[ImpHH] = []
+
+
+class AsignarHHIn(BaseModel):
+    otm_id: str
+    fecha: date
+    partida_id: int
+
+
 def _validar_pesos(hitos: list[HitoIn]):
     total = round(sum(h.peso for h in hitos), 4)
     if abs(total - 1.0) > 0.0001:
@@ -79,23 +135,99 @@ def _validar_pesos(hitos: list[HitoIn]):
         raise HTTPException(400, "Números de hito repetidos")
 
 
-# ---------------------- CRUD Partidas ----------------------
-@router.get("/partidas")
-async def listar_partidas():
+# ---------------------- Config (fecha base) ----------------------
+async def _fecha_base(con) -> Optional[date]:
+    v = await con.fetchval("SELECT valor FROM ev_config WHERE clave='fecha_base'")
+    if v:
+        return date.fromisoformat(v)
+    # fallback: lunes de la semana del primer registro etiquetado en el tareo
+    f = await con.fetchval("SELECT MIN(fecha) FROM ev_hh_tareo")
+    if f:
+        return f - timedelta(days=f.weekday())
+    return None
+
+
+def _semana_de(fecha: date, base: date) -> int:
+    return (fecha - base).days // 7 + 1
+
+
+@router.get("/config")
+async def get_config():
     pool = await db()
     async with pool.acquire() as con:
-        partidas = await con.fetch(
-            "SELECT * FROM ev_partidas WHERE activo ORDER BY codigo"
+        base = await _fecha_base(con)
+    return {"fecha_base": base.isoformat() if base else None}
+
+
+@router.put("/config")
+async def put_config(body: dict):
+    fb = body.get("fecha_base")
+    if not fb:
+        raise HTTPException(400, "fecha_base requerida (YYYY-MM-DD)")
+    date.fromisoformat(fb)  # valida formato
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            """INSERT INTO ev_config (clave, valor) VALUES ('fecha_base', $1)
+               ON CONFLICT (clave) DO UPDATE SET valor=$1""", fb
         )
-        hitos = await con.fetch(
-            "SELECT * FROM ev_hitos ORDER BY partida_id, numero"
+    return {"ok": True, "fecha_base": fb}
+
+
+# ---------------------- Plantillas de hitos ----------------------
+@router.get("/plantillas")
+async def listar_plantillas():
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch("SELECT * FROM ev_plantillas_hitos ORDER BY tipo_actividad")
+    return [
+        {"tipo_actividad": r["tipo_actividad"], "hitos": json.loads(r["hitos"])}
+        for r in rows
+    ]
+
+
+@router.post("/plantillas")
+async def guardar_plantilla(body: PlantillaIn):
+    _validar_pesos(body.hitos)
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            """INSERT INTO ev_plantillas_hitos (tipo_actividad, hitos) VALUES ($1, $2)
+               ON CONFLICT (tipo_actividad) DO UPDATE SET hitos=$2""",
+            body.tipo_actividad.strip().upper(),
+            json.dumps([h.model_dump() for h in body.hitos]),
         )
+    return {"ok": True}
+
+
+# ---------------------- CRUD Partidas ----------------------
+@router.get("/partidas")
+async def listar_partidas(otm: Optional[str] = None):
+    pool = await db()
+    async with pool.acquire() as con:
+        if otm:
+            partidas = await con.fetch(
+                "SELECT * FROM ev_partidas WHERE activo AND otm_id=$1 ORDER BY codigo", otm
+            )
+        else:
+            partidas = await con.fetch("SELECT * FROM ev_partidas WHERE activo ORDER BY codigo")
+        hitos = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
     por_partida = defaultdict(list)
     for h in hitos:
         por_partida[h["partida_id"]].append(dict(h))
-    return [
-        {**dict(p), "hitos": por_partida.get(p["id"], [])} for p in partidas
-    ]
+    return [{**dict(p), "hitos": por_partida.get(p["id"], [])} for p in partidas]
+
+
+@router.get("/otms")
+async def listar_otms_ev():
+    """OTMs que tienen partidas en el módulo EV."""
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            """SELECT COALESCE(otm_id,'SIN OTM') AS otm_id, COUNT(*) AS partidas
+               FROM ev_partidas WHERE activo GROUP BY otm_id ORDER BY otm_id"""
+        )
+    return [dict(r) for r in rows]
 
 
 @router.post("/partidas")
@@ -107,10 +239,10 @@ async def crear_partida(body: PartidaIn):
             try:
                 pid = await con.fetchval(
                     """INSERT INTO ev_partidas
-                       (codigo, fase, sub_fase, descripcion, unidad, sistema,
+                       (codigo, otm_id, fase, sub_fase, descripcion, unidad, sistema,
                         metrado_presup, metrado_proyec, hh_presup)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id""",
-                    body.codigo, body.fase, body.sub_fase, body.descripcion,
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id""",
+                    body.codigo, body.otm_id, body.fase, body.sub_fase, body.descripcion,
                     body.unidad, body.sistema, body.metrado_presup,
                     body.metrado_proyec, body.hh_presup,
                 )
@@ -132,16 +264,15 @@ async def actualizar_partida(partida_id: int, body: PartidaIn):
     async with pool.acquire() as con:
         async with con.transaction():
             res = await con.execute(
-                """UPDATE ev_partidas SET codigo=$2, fase=$3, sub_fase=$4,
-                   descripcion=$5, unidad=$6, sistema=$7, metrado_presup=$8,
-                   metrado_proyec=$9, hh_presup=$10 WHERE id=$1""",
-                partida_id, body.codigo, body.fase, body.sub_fase,
+                """UPDATE ev_partidas SET codigo=$2, otm_id=$3, fase=$4, sub_fase=$5,
+                   descripcion=$6, unidad=$7, sistema=$8, metrado_presup=$9,
+                   metrado_proyec=$10, hh_presup=$11 WHERE id=$1""",
+                partida_id, body.codigo, body.otm_id, body.fase, body.sub_fase,
                 body.descripcion, body.unidad, body.sistema,
                 body.metrado_presup, body.metrado_proyec, body.hh_presup,
             )
             if res == "UPDATE 0":
                 raise HTTPException(404, "Partida no encontrada")
-            # Reemplazo del set de hitos preservando avances cuando el número coincide
             existentes = await con.fetch(
                 "SELECT id, numero FROM ev_hitos WHERE partida_id=$1", partida_id
             )
@@ -153,8 +284,7 @@ async def actualizar_partida(partida_id: int, body: PartidaIn):
             for h in body.hitos:
                 if h.numero in por_numero:
                     await con.execute(
-                        """UPDATE ev_hitos SET descripcion=$2, peso=$3, es_principal=$4
-                           WHERE id=$1""",
+                        "UPDATE ev_hitos SET descripcion=$2, peso=$3, es_principal=$4 WHERE id=$1",
                         por_numero[h.numero], h.descripcion, h.peso, h.es_principal,
                     )
                 else:
@@ -170,10 +300,174 @@ async def actualizar_partida(partida_id: int, body: PartidaIn):
 async def eliminar_partida(partida_id: int):
     pool = await db()
     async with pool.acquire() as con:
-        await con.execute(
-            "UPDATE ev_partidas SET activo=FALSE WHERE id=$1", partida_id
-        )
+        await con.execute("UPDATE ev_partidas SET activo=FALSE WHERE id=$1", partida_id)
     return {"ok": True}
+
+
+# ---------------------- Importador masivo ----------------------
+@router.post("/importar")
+async def importar(body: ImportarIn):
+    """Carga masiva en UNA transacción: partidas (upsert por código) +
+    histórico opcional de avances y HH. Si una fila falla, nada se guarda."""
+    pool = await db()
+    creadas, actualizadas = 0, 0
+    errores: list[str] = []
+
+    async with pool.acquire() as con:
+        pl_rows = await con.fetch("SELECT * FROM ev_plantillas_hitos")
+        plantillas = {r["tipo_actividad"]: json.loads(r["hitos"]) for r in pl_rows}
+
+        async with con.transaction():
+            codigo_a_id: dict[str, int] = {}
+
+            for i, p in enumerate(body.partidas, start=1):
+                # Resolver hitos: explícitos > plantilla > GENERICO
+                if p.hitos:
+                    hitos_raw = [h.model_dump() for h in p.hitos]
+                elif p.tipo_actividad:
+                    hitos_raw = plantillas.get(p.tipo_actividad.strip().upper())
+                    if hitos_raw is None:
+                        errores.append(
+                            f"Fila {i} ({p.codigo}): tipo_actividad '{p.tipo_actividad}' no existe en el catálogo"
+                        )
+                        continue
+                else:
+                    hitos_raw = plantillas.get("GENERICO", [
+                        {"numero": 1, "descripcion": "Ejecución", "peso": 1.0, "es_principal": True}
+                    ])
+                try:
+                    hitos = [HitoIn(**h) for h in hitos_raw]
+                    _validar_pesos(hitos)
+                except HTTPException as e:
+                    errores.append(f"Fila {i} ({p.codigo}): {e.detail}")
+                    continue
+                except Exception as e:
+                    errores.append(f"Fila {i} ({p.codigo}): hitos inválidos ({e})")
+                    continue
+
+                existente = await con.fetchval(
+                    "SELECT id FROM ev_partidas WHERE codigo=$1", p.codigo
+                )
+                if existente:
+                    await con.execute(
+                        """UPDATE ev_partidas SET otm_id=$2, fase=$3, sub_fase=$4, descripcion=$5,
+                           unidad=$6, sistema=$7, metrado_presup=$8, metrado_proyec=$9,
+                           hh_presup=$10, activo=TRUE WHERE id=$1""",
+                        existente, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
+                        p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
+                    )
+                    await con.execute("DELETE FROM ev_hitos WHERE partida_id=$1", existente)
+                    pid = existente
+                    actualizadas += 1
+                else:
+                    pid = await con.fetchval(
+                        """INSERT INTO ev_partidas
+                           (codigo, otm_id, fase, sub_fase, descripcion, unidad, sistema,
+                            metrado_presup, metrado_proyec, hh_presup)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id""",
+                        p.codigo, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
+                        p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
+                    )
+                    creadas += 1
+                codigo_a_id[p.codigo] = pid
+                for h in hitos:
+                    await con.execute(
+                        """INSERT INTO ev_hitos (partida_id, numero, descripcion, peso, es_principal)
+                           VALUES ($1,$2,$3,$4,$5)""",
+                        pid, h.numero, h.descripcion, h.peso, h.es_principal,
+                    )
+
+            if errores:
+                raise HTTPException(400, {"errores": errores})
+
+            # mapa hito (partida, numero) -> id para el histórico
+            hitos_db = await con.fetch("SELECT id, partida_id, numero FROM ev_hitos")
+            hito_id = {(h["partida_id"], h["numero"]): h["id"] for h in hitos_db}
+
+            av_ins, hist_err = 0, []
+            for a in body.avances:
+                pid = codigo_a_id.get(a.codigo) or await con.fetchval(
+                    "SELECT id FROM ev_partidas WHERE codigo=$1", a.codigo
+                )
+                if not pid:
+                    hist_err.append(f"Avance: código {a.codigo} no existe")
+                    continue
+                hid = hito_id.get((pid, a.hito))
+                if not hid:
+                    hist_err.append(f"Avance: {a.codigo} no tiene hito {a.hito}")
+                    continue
+                await con.execute(
+                    """INSERT INTO ev_avances (hito_id, semana, cantidad_acum)
+                       VALUES ($1,$2,$3)
+                       ON CONFLICT (hito_id, semana) DO UPDATE SET cantidad_acum=$3""",
+                    hid, a.semana, a.cantidad_acum,
+                )
+                av_ins += 1
+
+            hh_ins = 0
+            for r in body.hh:
+                pid = codigo_a_id.get(r.codigo) or await con.fetchval(
+                    "SELECT id FROM ev_partidas WHERE codigo=$1", r.codigo
+                )
+                if not pid:
+                    hist_err.append(f"HH: código {r.codigo} no existe")
+                    continue
+                await con.execute(
+                    """INSERT INTO ev_hh_gastadas (partida_id, semana, hh, fuente)
+                       VALUES ($1,$2,$3,'importado')
+                       ON CONFLICT (partida_id, semana) DO UPDATE SET hh=$3""",
+                    pid, r.semana, r.hh,
+                )
+                hh_ins += 1
+
+            if hist_err:
+                raise HTTPException(400, {"errores": hist_err})
+
+    return {
+        "ok": True,
+        "partidas_creadas": creadas,
+        "partidas_actualizadas": actualizadas,
+        "avances_importados": av_ins,
+        "hh_importadas": hh_ins,
+    }
+
+
+# ---------------------- Tareo QR → partida ----------------------
+@router.get("/hh-sin-asignar")
+async def hh_sin_asignar(desde: Optional[date] = None):
+    """Días × OTM con HH del tareo aún sin partida asignada."""
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            """SELECT otm_id, fecha, SUM(hh) AS hh, COUNT(*) AS registros
+               FROM registros
+               WHERE partida_id IS NULL AND hh IS NOT NULL
+                 AND ($1::date IS NULL OR fecha >= $1)
+               GROUP BY otm_id, fecha ORDER BY fecha DESC, otm_id""",
+            desde,
+        )
+    return [
+        {"otm_id": r["otm_id"], "fecha": r["fecha"].isoformat(),
+         "hh": float(r["hh"]), "registros": r["registros"]}
+        for r in rows
+    ]
+
+
+@router.post("/asignar-hh")
+async def asignar_hh(body: AsignarHHIn):
+    """Etiqueta los registros del tareo de una OTM en una fecha con la partida trabajada."""
+    pool = await db()
+    async with pool.acquire() as con:
+        ok = await con.fetchval(
+            "SELECT id FROM ev_partidas WHERE id=$1 AND activo", body.partida_id
+        )
+        if not ok:
+            raise HTTPException(404, "Partida no encontrada")
+        res = await con.execute(
+            "UPDATE registros SET partida_id=$1 WHERE otm_id=$2 AND fecha=$3",
+            body.partida_id, body.otm_id, body.fecha,
+        )
+    return {"ok": True, "registros_actualizados": int(res.split()[-1])}
 
 
 # ---------------------- Captura semanal ----------------------
@@ -181,45 +475,56 @@ async def eliminar_partida(partida_id: int):
 async def semanas():
     pool = await db()
     async with pool.acquire() as con:
+        base = await _fecha_base(con)
         rows = await con.fetch(
             """SELECT DISTINCT semana FROM (
                  SELECT semana FROM ev_avances
                  UNION SELECT semana FROM ev_hh_gastadas
-               ) s ORDER BY semana"""
+               ) s"""
         )
-    return [r["semana"] for r in rows]
+        sem = {r["semana"] for r in rows}
+        if base:
+            tareo = await con.fetch("SELECT DISTINCT fecha FROM ev_hh_tareo")
+            for t in tareo:
+                sem.add(_semana_de(t["fecha"], base))
+    return sorted(sem)
+
+
+async def _hh_tareo_por_semana(con) -> dict:
+    """{(partida_id, semana): hh} desde la vista del tareo QR."""
+    base = await _fecha_base(con)
+    out: dict = defaultdict(float)
+    if not base:
+        return out
+    rows = await con.fetch("SELECT partida_id, fecha, hh FROM ev_hh_tareo")
+    for r in rows:
+        out[(r["partida_id"], _semana_de(r["fecha"], base))] += float(r["hh"])
+    return out
 
 
 @router.get("/captura")
 async def captura(semana: int):
-    """Estructura para el formulario de registro: por partida, cada hito con su
-    acumulado de la semana anterior (carry-forward) y el de la semana actual."""
     pool = await db()
     async with pool.acquire() as con:
-        partidas = await con.fetch(
-            "SELECT * FROM ev_partidas WHERE activo ORDER BY codigo"
-        )
+        partidas = await con.fetch("SELECT * FROM ev_partidas WHERE activo ORDER BY codigo")
         hitos = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
         avances = await con.fetch(
             """SELECT hito_id, semana, cantidad_acum FROM ev_avances
                WHERE semana <= $1 ORDER BY hito_id, semana""", semana
         )
-        hh = await con.fetch(
-            """SELECT partida_id, semana, hh FROM ev_hh_gastadas
-               WHERE semana <= $1 ORDER BY partida_id, semana""", semana
+        hh_man = await con.fetch(
+            "SELECT partida_id, semana, hh FROM ev_hh_gastadas WHERE semana = $1", semana
         )
+        tareo = await _hh_tareo_por_semana(con)
 
     ult_av, av_actual = {}, {}
     for a in avances:
         if a["semana"] == semana:
             av_actual[a["hito_id"]] = float(a["cantidad_acum"])
         else:
-            ult_av[a["hito_id"]] = float(a["cantidad_acum"])  # queda el de mayor semana < actual
+            ult_av[a["hito_id"]] = float(a["cantidad_acum"])
 
-    hh_actual = {}
-    for r in hh:
-        if r["semana"] == semana:
-            hh_actual[r["partida_id"]] = float(r["hh"])
+    hh_manual = {r["partida_id"]: float(r["hh"]) for r in hh_man}
 
     por_partida = defaultdict(list)
     for h in hitos:
@@ -230,16 +535,16 @@ async def captura(semana: int):
         out.append({
             "partida_id": p["id"],
             "codigo": p["codigo"],
+            "otm_id": p["otm_id"],
             "descripcion": p["descripcion"],
             "unidad": p["unidad"],
             "metrado_proyec": float(p["metrado_proyec"] or p["metrado_presup"]),
-            "hh_semana": hh_actual.get(p["id"], 0.0),
+            "hh_tareo": round(tareo.get((p["id"], semana), 0.0), 2),
+            "hh_semana": hh_manual.get(p["id"], 0.0),
             "hitos": [
                 {
-                    "hito_id": h["id"],
-                    "numero": h["numero"],
-                    "descripcion": h["descripcion"],
-                    "peso": float(h["peso"]),
+                    "hito_id": h["id"], "numero": h["numero"],
+                    "descripcion": h["descripcion"], "peso": float(h["peso"]),
                     "es_principal": h["es_principal"],
                     "cant_anterior": ult_av.get(h["id"], 0.0),
                     "cant_actual": av_actual.get(h["id"], ult_av.get(h["id"], 0.0)),
@@ -267,8 +572,7 @@ async def guardar_captura(body: CapturaIn):
                 await con.execute(
                     """INSERT INTO ev_hh_gastadas (partida_id, semana, hh, fuente)
                        VALUES ($1,$2,$3,'manual')
-                       ON CONFLICT (partida_id, semana)
-                       DO UPDATE SET hh=$3""",
+                       ON CONFLICT (partida_id, semana) DO UPDATE SET hh=$3""",
                     r.partida_id, body.semana, r.hh,
                 )
     return {"ok": True}
@@ -276,15 +580,16 @@ async def guardar_captura(body: CapturaIn):
 
 # ---------------------- Motor de cálculo ----------------------
 def _acum_a_semana(avances, semana: int) -> dict:
-    """cantidad acumulada por hito con carry-forward hasta `semana`."""
     acum = {}
-    for a in avances:  # vienen ordenados por semana ascendente
+    for a in avances:
         if a["semana"] <= semana:
             acum[a["hito_id"]] = float(a["cantidad_acum"])
     return acum
 
 
-def _calcular(partidas, hitos, avances, hh_rows, semana: int):
+def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int):
+    """hh_rows: ev_hh_gastadas (manual/importado). tareo: {(pid,sem):hh} del QR.
+    HH gastadas totales = manual + tareo."""
     por_partida = defaultdict(list)
     for h in hitos:
         por_partida[h["partida_id"]].append(h)
@@ -298,6 +603,11 @@ def _calcular(partidas, hitos, avances, hh_rows, semana: int):
             hh_acum[r["partida_id"]] += float(r["hh"])
         if r["semana"] == semana:
             hh_sem[r["partida_id"]] += float(r["hh"])
+    for (pid, s), v in tareo.items():
+        if s <= semana:
+            hh_acum[pid] += v
+        if s == semana:
+            hh_sem[pid] += v
 
     filas = []
     for p in partidas:
@@ -306,7 +616,7 @@ def _calcular(partidas, hitos, avances, hh_rows, semana: int):
         m_presup = float(p["metrado_presup"])
         hh_presup = float(p["hh_presup"])
         prod_presup = (hh_presup / m_presup) if m_presup > 0 else 0.0
-        hh_proyec = mp * prod_presup  # T = N x L del ISP
+        hh_proyec = mp * prod_presup
 
         pct, pct_prev, cant_inst = 0.0, 0.0, 0.0
         for h in por_partida.get(pid, []):
@@ -317,7 +627,7 @@ def _calcular(partidas, hitos, avances, hh_rows, semana: int):
             if h["es_principal"]:
                 cant_inst = acum_s.get(h["id"], 0.0)
 
-        ganadas_acum = pct * hh_proyec            # Y = Z x T del ISP
+        ganadas_acum = pct * hh_proyec
         ganadas_sem = ganadas_acum - (pct_prev * hh_proyec)
         gastadas_acum = hh_acum.get(pid, 0.0)
         gastadas_sem = hh_sem.get(pid, 0.0)
@@ -325,13 +635,13 @@ def _calcular(partidas, hitos, avances, hh_rows, semana: int):
         pf_acum = (ganadas_acum / gastadas_acum) if gastadas_acum > 0 else 0.0
         pf_sem = (ganadas_sem / gastadas_sem) if gastadas_sem > 0 else 0.0
         prod_real = (gastadas_acum / cant_inst) if cant_inst > 0 else 0.0
-        # EAC del ISP: HH proyectadas al cierre = prod real x saldo + gastadas
         saldo_met = max(mp - cant_inst, 0.0)
         eac_hh = (prod_real * saldo_met + gastadas_acum) if cant_inst > 0 else hh_proyec
 
         filas.append({
             "partida_id": pid,
             "codigo": p["codigo"],
+            "otm_id": p["otm_id"],
             "fase": p["fase"],
             "sistema": p["sistema"],
             "descripcion": p["descripcion"],
@@ -378,10 +688,15 @@ def _agrupar(filas, clave):
     return out
 
 
-async def _datos_base(semana: int):
+async def _datos_base(semana: int, otm: Optional[str] = None):
     pool = await db()
     async with pool.acquire() as con:
-        partidas = await con.fetch("SELECT * FROM ev_partidas WHERE activo ORDER BY codigo")
+        if otm:
+            partidas = await con.fetch(
+                "SELECT * FROM ev_partidas WHERE activo AND otm_id=$1 ORDER BY codigo", otm
+            )
+        else:
+            partidas = await con.fetch("SELECT * FROM ev_partidas WHERE activo ORDER BY codigo")
         hitos = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
         avances = await con.fetch(
             "SELECT hito_id, semana, cantidad_acum FROM ev_avances WHERE semana <= $1 ORDER BY semana",
@@ -390,13 +705,14 @@ async def _datos_base(semana: int):
         hh = await con.fetch(
             "SELECT partida_id, semana, hh FROM ev_hh_gastadas WHERE semana <= $1", semana
         )
-    return partidas, hitos, avances, hh
+        tareo = await _hh_tareo_por_semana(con)
+    return partidas, hitos, avances, hh, tareo
 
 
 @router.get("/reporte")
-async def reporte(semana: int):
-    partidas, hitos, avances, hh = await _datos_base(semana)
-    filas = _calcular(partidas, hitos, avances, hh, semana)
+async def reporte(semana: int, otm: Optional[str] = None):
+    partidas, hitos, avances, hh, tareo = await _datos_base(semana, otm)
+    filas = _calcular(partidas, hitos, avances, hh, tareo, semana)
 
     tot_proyec = sum(f["hh_proyec"] for f in filas)
     tot_ganadas = sum(f["hh_ganadas_acum"] for f in filas)
@@ -407,6 +723,7 @@ async def reporte(semana: int):
 
     return {
         "semana": semana,
+        "otm": otm,
         "totales": {
             "hh_proyec": round(tot_proyec, 2),
             "hh_ganadas_acum": round(tot_ganadas, 2),
@@ -419,6 +736,7 @@ async def reporte(semana: int):
             "eac_hh": round(tot_eac, 2),
             "desvio_hh": round(tot_eac - tot_proyec, 2),
         },
+        "por_otm": _agrupar(filas, "otm_id"),
         "por_fase": _agrupar(filas, "fase"),
         "por_sistema": _agrupar(filas, "sistema"),
         "partidas": filas,
@@ -426,15 +744,17 @@ async def reporte(semana: int):
 
 
 @router.get("/curva")
-async def curva(hasta: int):
-    """Serie semanal para la Curva S y la tendencia de PF (gráficos del ISP)."""
-    partidas, hitos, avances, hh = await _datos_base(hasta)
+async def curva(hasta: int, otm: Optional[str] = None):
+    partidas, hitos, avances, hh, tareo = await _datos_base(hasta, otm)
     semanas_set = sorted(
-        {a["semana"] for a in avances} | {r["semana"] for r in hh} | {hasta}
+        {a["semana"] for a in avances} | {r["semana"] for r in hh}
+        | {s for (_, s) in tareo.keys()} | {hasta}
     )
     serie = []
     for s in semanas_set:
-        filas = _calcular(partidas, hitos, avances, hh, s)
+        if s > hasta:
+            continue
+        filas = _calcular(partidas, hitos, avances, hh, tareo, s)
         g = sum(f["hh_ganadas_acum"] for f in filas)
         c = sum(f["hh_gastadas_acum"] for f in filas)
         gs = sum(f["hh_ganadas_sem"] for f in filas)
@@ -447,3 +767,27 @@ async def curva(hasta: int):
             "pf_sem": round(gs / cs, 3) if cs > 0 else None,
         })
     return serie
+
+
+@router.get("/curva-fase")
+async def curva_fase(hasta: int, otm: Optional[str] = None):
+    """Serie semanal de PF acumulado por fase — gráficos por disciplina."""
+    partidas, hitos, avances, hh, tareo = await _datos_base(hasta, otm)
+    semanas_set = sorted(
+        {a["semana"] for a in avances} | {r["semana"] for r in hh}
+        | {s for (_, s) in tareo.keys()} | {hasta}
+    )
+    fases = sorted({p["fase"] for p in partidas})
+    serie = []
+    for s in semanas_set:
+        if s > hasta:
+            continue
+        filas = _calcular(partidas, hitos, avances, hh, tareo, s)
+        punto: dict = {"semana": s}
+        for fase in fases:
+            ff = [f for f in filas if f["fase"] == fase]
+            g = sum(f["hh_ganadas_acum"] for f in ff)
+            c = sum(f["hh_gastadas_acum"] for f in ff)
+            punto[f"pf_{fase}"] = round(g / c, 3) if c > 0 else None
+        serie.append(punto)
+    return {"fases": fases, "serie": serie}
