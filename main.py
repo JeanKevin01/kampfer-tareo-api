@@ -292,6 +292,41 @@ async def registrar(data: dict):
         "resultados": resultados
     }
 
+
+# ── CUADRILLAS PRE-ESTABLECIDAS ───────────────────────────────
+
+@app.get("/api/cuadrilla/{supervisor_id}")
+async def get_cuadrilla(supervisor_id: str):
+    rows = await database.fetch_all(
+        "SELECT c.trab_id, t.nombre, t.cargo "
+        "FROM cuadrillas c "
+        "JOIN trabajadores t ON t.id = c.trab_id "
+        "WHERE c.supervisor_id = :sup AND t.activo = true "
+        "ORDER BY t.nombre",
+        {"sup": supervisor_id}
+    )
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/cuadrilla/{supervisor_id}/{trab_id}")
+async def agregar_cuadrilla(supervisor_id: str, trab_id: str):
+    await database.execute(
+        "INSERT INTO cuadrillas (supervisor_id, trab_id) "
+        "VALUES (:sup, :tid) ON CONFLICT DO NOTHING",
+        {"sup": supervisor_id, "tid": trab_id.zfill(3)}
+    )
+    return {"ok": True}
+
+
+@app.delete("/api/cuadrilla/{supervisor_id}/{trab_id}")
+async def quitar_cuadrilla(supervisor_id: str, trab_id: str):
+    await database.execute(
+        "DELETE FROM cuadrillas WHERE supervisor_id = :sup AND trab_id = :tid",
+        {"sup": supervisor_id, "tid": trab_id.zfill(3)}
+    )
+    return {"ok": True}
+
+
 # ── REGISTROS DEL DÍA ─────────────────────────────────────────
 @app.get("/api/registros/hoy")
 async def registros_hoy():
