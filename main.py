@@ -4,6 +4,7 @@ from database import database
 from datetime import date, datetime
 from typing import Optional
 from routers.valor_ganado import router as ev_router
+from routers.sesiones import router as ses_router
 
 app = FastAPI(title="Kampfer Tareo API", version="1.2.0")
 
@@ -16,6 +17,7 @@ app.add_middleware(
 )
 
 app.include_router(ev_router)
+app.include_router(ses_router)
 
 @app.on_event("startup")
 async def startup():
