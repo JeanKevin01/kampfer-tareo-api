@@ -140,8 +140,10 @@ async def _fecha_base(con) -> Optional[date]:
     v = await con.fetchval("SELECT valor FROM ev_config WHERE clave='fecha_base'")
     if v:
         return date.fromisoformat(v)
-    # fallback: lunes de la semana del primer registro etiquetado en el tareo
-    f = await con.fetchval("SELECT MIN(fecha) FROM ev_hh_tareo")
+    # Auto: lunes de la semana del primer registro de tareo con HH
+    f = await con.fetchval(
+        "SELECT MIN(fecha) FROM registros WHERE hh IS NOT NULL AND hh > 0"
+    )
     if f:
         return f - timedelta(days=f.weekday())
     return None
@@ -491,14 +493,42 @@ async def semanas():
 
 
 async def _hh_tareo_por_semana(con) -> dict:
-    """{(partida_id, semana): hh} desde la vista del tareo QR."""
+    """{(partida_id, semana): hh} — auto-distribuido desde registros por OTM.
+    Distribuye las HH de cada OTM proporcionalmente al presupuesto de cada partida.
+    Si no hay partidas para un OTM, sus HH no se asignan (no cuentan en EV).
+    """
     base = await _fecha_base(con)
     out: dict = defaultdict(float)
     if not base:
         return out
-    rows = await con.fetch("SELECT partida_id, fecha, hh FROM ev_hh_tareo")
-    for r in rows:
-        out[(r["partida_id"], _semana_de(r["fecha"], base))] += float(r["hh"])
+
+    # HH registradas por OTM por día
+    rows_reg = await con.fetch("""
+        SELECT otm_id, fecha, SUM(hh) AS hh_total
+        FROM registros
+        WHERE hh IS NOT NULL AND hh > 0
+        GROUP BY otm_id, fecha
+    """)
+
+    # Peso de cada partida activa dentro de su OTM (proporcional a hh_presup)
+    rows_peso = await con.fetch("""
+        SELECT id AS partida_id, otm_id,
+               hh_presup::float /
+               NULLIF(SUM(hh_presup) OVER (PARTITION BY otm_id), 0.0) AS peso
+        FROM ev_partidas
+        WHERE activo = true AND hh_presup > 0
+    """)
+
+    otm_pesos: dict = defaultdict(list)
+    for p in rows_peso:
+        otm_pesos[p['otm_id']].append((p['partida_id'], float(p['peso'] or 0)))
+
+    for r in rows_reg:
+        hh      = float(r['hh_total'])
+        semana  = _semana_de(r['fecha'], base)
+        for pid, peso in otm_pesos.get(r['otm_id'], []):
+            out[(pid, semana)] += round(hh * peso, 4)
+
     return out
 
 
@@ -707,6 +737,56 @@ async def _datos_base(semana: int, otm: Optional[str] = None):
         )
         tareo = await _hh_tareo_por_semana(con)
     return partidas, hitos, avances, hh, tareo
+
+
+
+@router.get("/semanas-auto")
+async def semanas_auto():
+    """Semanas reales del proyecto (Lun-Dom) desde el primer registro de tareo.
+    Incluye semanas sin actividad para mostrar la línea de tiempo completa."""
+    pool = await db()
+    async with pool.acquire() as con:
+        base = await _fecha_base(con)
+        if not base:
+            return []
+
+        hh_rows = await con.fetch("""
+            SELECT DATE_TRUNC('week', fecha)::date AS lunes, SUM(hh) AS hh_total
+            FROM registros WHERE hh IS NOT NULL AND hh > 0
+            GROUP BY DATE_TRUNC('week', fecha)::date
+            ORDER BY lunes
+        """)
+        if not hh_rows:
+            return []
+
+        hh_map: dict = {}
+        for r in hh_rows:
+            n = _semana_de(r['lunes'], base)
+            hh_map[n] = float(r['hh_total'])
+
+        today = date.today()
+        current_monday = today - timedelta(days=today.weekday())
+        total = max(_semana_de(current_monday, base), max(hh_map.keys()))
+
+        MESES = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic']
+        def fmt(d: date) -> str:
+            return f"{d.day} {MESES[d.month-1]}"
+
+        result = []
+        for n in range(1, total + 1):
+            lunes  = base + timedelta(weeks=n - 1)
+            domingo = lunes + timedelta(days=6)
+            hh     = hh_map.get(n, 0.0)
+            result.append({
+                "semana": n,
+                "inicio": lunes.isoformat(),
+                "fin":    domingo.isoformat(),
+                "hh":     round(hh, 1),
+                "activa": hh > 0,
+                "label":  f"Sem {n}  ·  {fmt(lunes)} – {fmt(domingo)}"
+                          + ("" if hh > 0 else "  (sin actividad)"),
+            })
+        return result
 
 
 @router.get("/reporte")
