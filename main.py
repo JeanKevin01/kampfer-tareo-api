@@ -4,7 +4,6 @@ from database import database
 from datetime import date, datetime
 from typing import Optional
 from routers.valor_ganado import router as ev_router
-from routers.sesiones import router as ses_router
 
 app = FastAPI(title="Kampfer Tareo API", version="1.2.0")
 
@@ -17,7 +16,6 @@ app.add_middleware(
 )
 
 app.include_router(ev_router)
-app.include_router(ses_router)
 
 @app.on_event("startup")
 async def startup():
@@ -26,6 +24,114 @@ async def startup():
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
+
+
+# ── SESIONES (Session-First model) ───────────────────────────
+
+@app.post("/api/sesion")
+async def crear_sesion(data: dict):
+    supervisor_id = str(data.get("supervisor_id", "")).strip()
+    otm_id        = str(data.get("otm_id", "")).strip()
+    fecha_str     = str(data.get("fecha", date.today().isoformat()))
+    hh_turno      = float(data.get("hh_turno", 9.5))
+    if not supervisor_id or not otm_id:
+        raise HTTPException(400, "supervisor_id y otm_id son requeridos")
+    row = await database.fetch_one(
+        f"INSERT INTO sesiones (supervisor_id, otm_id, fecha, hh_turno) "
+        f"VALUES (:sup, :otm, '{fecha_str}'::date, :hh) RETURNING id",
+        {"sup": supervisor_id, "otm": otm_id, "hh": hh_turno}
+    )
+    return {"id": row["id"], "ok": True}
+
+
+@app.get("/api/sesion/hoy/{supervisor_id}")
+async def sesiones_hoy(supervisor_id: str):
+    fecha_str = date.today().isoformat()
+    sesiones = await database.fetch_all(
+        f"SELECT s.id, s.supervisor_id, s.otm_id, s.estado, "
+        f"       s.hh_turno, s.created_at, "
+        f"       COUNT(st.id) AS total, "
+        f"       COUNT(st.id) FILTER (WHERE st.presente) AS presentes "
+        f"FROM sesiones s "
+        f"LEFT JOIN sesion_trabajadores st ON st.sesion_id = s.id "
+        f"WHERE s.supervisor_id = :sup AND s.fecha = '{fecha_str}'::date "
+        f"GROUP BY s.id ORDER BY s.created_at DESC",
+        {"sup": supervisor_id}
+    )
+    result = []
+    for s in sesiones:
+        d = dict(s)
+        trabs = await database.fetch_all(
+            "SELECT st.trab_id, st.presente, st.hh_override, st.agregado_via, "
+            "       t.nombre, t.cargo "
+            "FROM sesion_trabajadores st "
+            "JOIN trabajadores t ON t.id = st.trab_id "
+            "WHERE st.sesion_id = :sid ORDER BY t.nombre",
+            {"sid": d["id"]}
+        )
+        d["trabajadores"] = [dict(t) for t in trabs]
+        result.append(d)
+    return result
+
+
+@app.post("/api/sesion/{sesion_id}/enviar")
+async def enviar_sesion(sesion_id: int, data: dict):
+    sesion = await database.fetch_one(
+        "SELECT * FROM sesiones WHERE id = :id AND estado = 'borrador'",
+        {"id": sesion_id}
+    )
+    if not sesion:
+        raise HTTPException(404, "Sesión no encontrada o ya enviada")
+    sesion      = dict(sesion)
+    fecha_obj   = sesion["fecha"]
+    fecha_str   = fecha_obj.isoformat() if hasattr(fecha_obj, "isoformat") else str(fecha_obj)
+    hora        = datetime.now().strftime("%H:%M:%S")
+    trabajadores = data.get("trabajadores", [])
+
+    # Limpiar y volver a insertar trabajadores
+    await database.execute(
+        "DELETE FROM sesion_trabajadores WHERE sesion_id = :sid",
+        {"sid": sesion_id}
+    )
+    for t in trabajadores:
+        hh_ov = t.get("hh_override")
+        await database.execute(
+            "INSERT INTO sesion_trabajadores "
+            "(sesion_id, trab_id, presente, hh_override, agregado_via) "
+            "VALUES (:sid, :tid, :pres, :hh, :via) "
+            "ON CONFLICT (sesion_id, trab_id) DO UPDATE "
+            "SET presente = :pres, hh_override = :hh",
+            {"sid": sesion_id, "tid": t["trab_id"],
+             "pres": t.get("presente", True),
+             "hh": hh_ov, "via": t.get("agregado_via", "busqueda")}
+        )
+
+    # Crear registros de tareo para los presentes
+    enviados = 0
+    for t in trabajadores:
+        if not t.get("presente", True):
+            continue
+        hh = t.get("hh_override") or float(sesion["hh_turno"])
+        try:
+            await database.execute(
+                f"INSERT INTO registros "
+                f"(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
+                f"VALUES (:tid, :otm, :sup, '{fecha_str}'::date, '{hora}'::time, :hh) "
+                f"ON CONFLICT (trab_id, otm_id, fecha) "
+                f"DO UPDATE SET hh = :hh, hora = '{hora}'::time",
+                {"tid": t["trab_id"], "otm": sesion["otm_id"],
+                 "sup": sesion["supervisor_id"], "hh": hh}
+            )
+            enviados += 1
+        except Exception as e:
+            print(f"[SESION] Error registro trab={t['trab_id']}: {e}")
+
+    await database.execute(
+        "UPDATE sesiones SET estado = 'enviada', enviada_at = now() WHERE id = :id",
+        {"id": sesion_id}
+    )
+    return {"ok": True, "enviados": enviados}
+
 
 # ── HEALTH ───────────────────────────────────────────────────
 @app.get("/health")
