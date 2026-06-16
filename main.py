@@ -1,9 +1,15 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from database import database
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional
 from routers.valor_ganado import router as ev_router
+
+# Zona horaria de Peru (UTC-5)
+LIMA = timezone(timedelta(hours=-5))
+def ahora_lima(): return datetime.now(LIMA)
+def fecha_lima(): return ahora_lima().date()
+def hora_lima(): return ahora_lima().strftime("%H:%M:%S")
 
 app = FastAPI(title="Kampfer Tareo API", version="1.2.0")
 
@@ -32,7 +38,7 @@ async def shutdown():
 async def crear_sesion(data: dict):
     supervisor_id = str(data.get("supervisor_id", "")).strip()
     otm_id        = str(data.get("otm_id", "")).strip()
-    fecha_str     = str(data.get("fecha", date.today().isoformat()))
+    fecha_str     = str(data.get("fecha", fecha_lima().isoformat()))
     hh_turno      = float(data.get("hh_turno", 9.5))
     if not supervisor_id or not otm_id:
         raise HTTPException(400, "supervisor_id y otm_id son requeridos")
@@ -46,7 +52,7 @@ async def crear_sesion(data: dict):
 
 @app.get("/api/sesion/hoy/{supervisor_id}")
 async def sesiones_hoy(supervisor_id: str):
-    fecha_str = date.today().isoformat()
+    fecha_str = fecha_lima().isoformat()
     sesiones = await database.fetch_all(
         f"SELECT s.id, s.supervisor_id, s.otm_id, s.estado, "
         f"       s.hh_turno, s.created_at, "
@@ -85,7 +91,7 @@ async def enviar_sesion(sesion_id: int, data: dict):
     sesion      = dict(sesion)
     fecha_obj   = sesion["fecha"]
     fecha_str   = fecha_obj.isoformat() if hasattr(fecha_obj, "isoformat") else str(fecha_obj)
-    hora        = datetime.now().strftime("%H:%M:%S")
+    hora        = hora_lima()
     trabajadores = data.get("trabajadores", [])
 
     # Limpiar y volver a insertar trabajadores
@@ -184,7 +190,7 @@ async def buscar(q: str):
 async def registrar(data: dict):
     supervisor_id     = data.get("supervisor_id", "").strip()
     otm_id            = data.get("otm_id", "").strip()
-    fecha_raw         = data.get("fecha", date.today().isoformat())
+    fecha_raw         = data.get("fecha", fecha_lima().isoformat())
     fecha_str         = fecha_raw if isinstance(fecha_raw, str) else fecha_raw.isoformat()
     trabajadores_list = data.get("trabajadores", [])
 
@@ -211,7 +217,7 @@ async def registrar(data: dict):
 
     for t in trabajadores_list:
         trab_id  = str(t.get("trab_id", "")).zfill(3)
-        hora_raw = t.get("hora", datetime.now().strftime("%H:%M:%S"))
+        hora_raw = t.get("hora", hora_lima())
         hora     = hora_raw[:8] if len(hora_raw) >= 8 else hora_raw + ":00"
         nombre   = t.get("nombre", "")
         cargo    = t.get("cargo",  "")
@@ -330,7 +336,7 @@ async def quitar_cuadrilla(supervisor_id: str, trab_id: str):
 # ── REGISTROS DEL DÍA ─────────────────────────────────────────
 @app.get("/api/registros/hoy")
 async def registros_hoy():
-    hoy = date.today().isoformat()
+    hoy = fecha_lima().isoformat()
     rows = await database.fetch_all(
         f"""SELECT r.trab_id, t.nombre, t.cargo,
                    r.otm_id, r.hora::text, r.supervisor_id, r.hh
@@ -357,7 +363,7 @@ async def registros_por_fecha(fecha: str):
 # ── CALCULAR HH DEL DÍA (llamado por n8n a las 5:30pm) ───────
 @app.post("/api/calcular-hh")
 async def calcular_hh(data: dict = {}):
-    fecha_str = data.get("fecha", date.today().isoformat())
+    fecha_str = data.get("fecha", fecha_lima().isoformat())
 
     # HH totales según día de semana
     fecha_obj = date.fromisoformat(fecha_str)
