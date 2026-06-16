@@ -87,16 +87,18 @@ class PlantillaIn(BaseModel):
 class ImpPartida(BaseModel):
     codigo: str
     otm_id: Optional[str] = None
-    fase: str
+    fase: Optional[str] = None           # None para nodos padre del WBS
     sub_fase: Optional[str] = None
     descripcion: str
-    unidad: str
+    unidad: Optional[str] = None         # None para nodos padre
     sistema: Optional[str] = None
     metrado_presup: float = 0
     metrado_proyec: Optional[float] = None
     hh_presup: float = 0
-    tipo_actividad: Optional[str] = None      # busca hitos en el catálogo
-    hitos: Optional[list[HitoIn]] = None      # o hitos explícitos
+    tipo_actividad: Optional[str] = None
+    hitos: Optional[list[HitoIn]] = None
+    nivel: Optional[int] = None          # profundidad en el WBS (calculado si None)
+    parent_codigo: Optional[str] = None  # código del nodo padre (calculado si None)
 
 
 class ImpAvance(BaseModel):
@@ -323,29 +325,41 @@ async def importar(body: ImportarIn):
             codigo_a_id: dict[str, int] = {}
 
             for i, p in enumerate(body.partidas, start=1):
-                # Resolver hitos: explícitos > plantilla > GENERICO
-                if p.hitos:
-                    hitos_raw = [h.model_dump() for h in p.hitos]
+                # Calcular nivel y parent_codigo si no vienen en el payload
+                sep = '.' if '.' in p.codigo else ','
+                nivel = p.nivel or len(p.codigo.split(sep))
+                parent_codigo = p.parent_codigo
+                if parent_codigo is None and nivel > 1:
+                    parent_codigo = sep.join(p.codigo.split(sep)[:-1])
+
+                # Resolver hitos según tipo de nodo
+                if p.fase is None:
+                    # Nodo PADRE del WBS: sin hitos (rollup calculado desde hijos)
+                    hitos = []
+                elif p.hitos:
+                    try:
+                        hitos = [HitoIn(**h.model_dump()) for h in p.hitos]
+                        _validar_pesos(hitos)
+                    except HTTPException as e:
+                        errores.append(f"Fila {i} ({p.codigo}): {e.detail}"); continue
                 elif p.tipo_actividad:
                     hitos_raw = plantillas.get(p.tipo_actividad.strip().upper())
                     if hitos_raw is None:
                         errores.append(
-                            f"Fila {i} ({p.codigo}): tipo_actividad '{p.tipo_actividad}' no existe en el catálogo"
-                        )
-                        continue
+                            f"Fila {i} ({p.codigo}): tipo_actividad '{p.tipo_actividad}' no existe"
+                        ); continue
+                    try:
+                        hitos = [HitoIn(**h) for h in hitos_raw]; _validar_pesos(hitos)
+                    except Exception as e:
+                        errores.append(f"Fila {i} ({p.codigo}): hitos inválidos ({e})"); continue
                 else:
                     hitos_raw = plantillas.get("GENERICO", [
                         {"numero": 1, "descripcion": "Ejecución", "peso": 1.0, "es_principal": True}
                     ])
-                try:
-                    hitos = [HitoIn(**h) for h in hitos_raw]
-                    _validar_pesos(hitos)
-                except HTTPException as e:
-                    errores.append(f"Fila {i} ({p.codigo}): {e.detail}")
-                    continue
-                except Exception as e:
-                    errores.append(f"Fila {i} ({p.codigo}): hitos inválidos ({e})")
-                    continue
+                    try:
+                        hitos = [HitoIn(**h) for h in hitos_raw]; _validar_pesos(hitos)
+                    except Exception as e:
+                        errores.append(f"Fila {i} ({p.codigo}): {e}"); continue
 
                 existente = await con.fetchval(
                     "SELECT id FROM ev_partidas WHERE codigo=$1", p.codigo
@@ -354,21 +368,22 @@ async def importar(body: ImportarIn):
                     await con.execute(
                         """UPDATE ev_partidas SET otm_id=$2, fase=$3, sub_fase=$4, descripcion=$5,
                            unidad=$6, sistema=$7, metrado_presup=$8, metrado_proyec=$9,
-                           hh_presup=$10, activo=TRUE WHERE id=$1""",
+                           hh_presup=$10, nivel=$11, parent_codigo=$12, activo=TRUE WHERE id=$1""",
                         existente, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
                         p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
+                        nivel, parent_codigo,
                     )
                     await con.execute("DELETE FROM ev_hitos WHERE partida_id=$1", existente)
-                    pid = existente
-                    actualizadas += 1
+                    pid = existente; actualizadas += 1
                 else:
                     pid = await con.fetchval(
                         """INSERT INTO ev_partidas
                            (codigo, otm_id, fase, sub_fase, descripcion, unidad, sistema,
-                            metrado_presup, metrado_proyec, hh_presup)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id""",
+                            metrado_presup, metrado_proyec, hh_presup, nivel, parent_codigo)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id""",
                         p.codigo, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
                         p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
+                        nivel, parent_codigo,
                     )
                     creadas += 1
                 codigo_a_id[p.codigo] = pid
@@ -512,11 +527,22 @@ async def _hh_tareo_por_semana(con) -> dict:
 
     # Peso de cada partida activa dentro de su OTM (proporcional a hh_presup)
     rows_peso = await con.fetch("""
+        WITH hoja AS (
+            -- Solo nodos hoja: su codigo NO aparece como parent_codigo de nadie
+            SELECT id, otm_id, hh_presup
+            FROM ev_partidas p
+            WHERE activo = true AND hh_presup > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM ev_partidas ch
+                  WHERE ch.parent_codigo = p.codigo
+                    AND ch.otm_id = p.otm_id
+                    AND ch.activo = true
+              )
+        )
         SELECT id AS partida_id, otm_id,
                hh_presup::float /
                NULLIF(SUM(hh_presup) OVER (PARTITION BY otm_id), 0.0) AS peso
-        FROM ev_partidas
-        WHERE activo = true AND hh_presup > 0
+        FROM hoja
     """)
 
     otm_pesos: dict = defaultdict(list)
@@ -787,6 +813,53 @@ async def semanas_auto():
                           + ("" if hh > 0 else "  (sin actividad)"),
             })
         return result
+
+
+
+@router.get("/arbol")
+async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
+    """Árbol WBS completo (padre + hoja) con valores EV calculados.
+    Nodos padre tienen hh_ganadas/gastadas = 0 — el rollup lo hace el frontend."""
+    pool = await db()
+    async with pool.acquire() as con:
+        if otm:
+            partidas = await con.fetch(
+                "SELECT * FROM ev_partidas WHERE activo AND otm_id=$1 ORDER BY codigo", otm
+            )
+        else:
+            partidas = await con.fetch(
+                "SELECT * FROM ev_partidas WHERE activo ORDER BY codigo"
+            )
+        hitos   = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
+        avances = await con.fetch(
+            "SELECT hito_id, semana, cantidad_acum FROM ev_avances WHERE semana <= $1", semana
+        )
+        tareo   = await _hh_tareo_por_semana(con)
+
+    filas_ev = _calcular(list(partidas), list(hitos), list(avances), [], tareo, semana)
+    ev_por_id = {f["partida_id"]: f for f in filas_ev}
+
+    result = []
+    for p in partidas:
+        ev = ev_por_id.get(p["id"], {})
+        result.append({
+            "id":              p["id"],
+            "codigo":          p["codigo"],
+            "otm_id":          p["otm_id"],
+            "fase":            p["fase"],
+            "sub_fase":        p["sub_fase"],
+            "descripcion":     p["descripcion"],
+            "unidad":          p["unidad"],
+            "hh_presup":       float(p["hh_presup"] or 0),
+            "nivel":           int(p["nivel"] or 1),
+            "parent_codigo":   p["parent_codigo"],
+            "es_hoja":         p["fase"] is not None,
+            "hh_ganadas_acum": ev.get("hh_ganadas_acum", 0.0),
+            "hh_gastadas_acum":ev.get("hh_gastadas_acum", 0.0),
+            "pct_avance":      ev.get("pct_avance", 0.0),
+            "pf_acum":         ev.get("pf_acum", 0.0),
+        })
+    return {"semana": semana, "otm": otm, "filas": result}
 
 
 @router.get("/reporte")
