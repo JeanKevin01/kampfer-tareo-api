@@ -154,12 +154,10 @@ async def get_supervisores():
 
 # ── OTMs ─────────────────────────────────────────────────────
 @app.get("/api/otms")
-async def get_otms():
+async def get_otms(activas: bool = False):
+    where = "WHERE estado = 'EJECUCION'" if activas else "WHERE estado IN ('EJECUCION','POR INICIAR','TERMINADO')"
     rows = await database.fetch_all(
-        """SELECT id, descripcion, area, estado, centro_costo
-           FROM otms
-           WHERE estado IN ('EJECUCION', 'POR INICIAR')
-           ORDER BY id"""
+        f"SELECT id, descripcion, area, estado, centro_costo FROM otms {where} ORDER BY id"
     )
     return [dict(r) for r in rows]
 
@@ -418,6 +416,7 @@ async def calcular_hh(data: dict = {}):
         f"""SELECT trab_id, otm_id, hora::text as hora
             FROM registros
             WHERE fecha = '{fecha_str}'::date
+              AND hh IS NULL
             ORDER BY trab_id, hora"""
     )
 
