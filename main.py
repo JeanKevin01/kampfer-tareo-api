@@ -299,6 +299,49 @@ async def registrar(data: dict):
     }
 
 
+
+@app.post("/api/sesion/enviar-directo")
+async def enviar_directo(data: dict):
+    """Crea la sesión y crea los registros en un solo paso (sin borrador)."""
+    supervisor_id = str(data.get("supervisor_id", "")).strip()
+    otm_id        = str(data.get("otm_id", "")).strip()
+    fecha_str     = str(data.get("fecha", fecha_lima().isoformat()))
+    hh_turno      = float(data.get("hh_turno", 9.5))
+    trabajadores  = data.get("trabajadores", [])
+    if not supervisor_id or not otm_id:
+        raise HTTPException(400, "supervisor_id y otm_id son requeridos")
+    if not trabajadores:
+        raise HTTPException(400, "La lista de trabajadores está vacía")
+    hora = hora_lima()
+    row = await database.fetch_one(
+        f"INSERT INTO sesiones "
+        f"(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
+        f"VALUES (:sup, :otm, '{fecha_str}'::date, :hh, 'enviada', now()) RETURNING id",
+        {"sup": supervisor_id, "otm": otm_id, "hh": hh_turno}
+    )
+    sesion_id = row["id"]
+    enviados = 0
+    for t in trabajadores:
+        trab_id = str(t.get("trab_id", "")).zfill(3)
+        hh_ov   = t.get("hh_override")
+        via     = t.get("agregado_via", "busqueda")
+        await database.execute(
+            "INSERT INTO sesion_trabajadores "
+            "(sesion_id, trab_id, presente, hh_override, agregado_via) "
+            "VALUES (:sid, :tid, true, :hh, :via)",
+            {"sid": sesion_id, "tid": trab_id, "hh": hh_ov, "via": via}
+        )
+        hh_real = float(hh_ov) if hh_ov is not None else hh_turno
+        await database.execute(
+            f"INSERT INTO registros "
+            f"(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
+            f"VALUES (:tid, :otm, :sup, '{fecha_str}'::date, '{hora}'::time, :hh) "
+            f"ON CONFLICT (trab_id, otm_id, fecha) DO UPDATE SET hh=:hh, hora='{hora}'::time",
+            {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_real}
+        )
+        enviados += 1
+    return {"ok": True, "enviados": enviados, "sesion_id": sesion_id}
+
 # ── CUADRILLAS PRE-ESTABLECIDAS ───────────────────────────────
 
 @app.get("/api/cuadrilla/{supervisor_id}")
