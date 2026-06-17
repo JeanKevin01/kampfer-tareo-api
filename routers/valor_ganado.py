@@ -654,16 +654,21 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int):
     acum_prev = _acum_a_semana(avances, semana - 1)
 
     hh_acum, hh_sem = defaultdict(float), defaultdict(float)
+    # Claves (partida_id, semana) con entrada manual — evita doble-conteo con tareo auto
+    manual_keys: set = set()
     for r in hh_rows:
         if r["semana"] <= semana:
             hh_acum[r["partida_id"]] += float(r["hh"])
+            manual_keys.add((r["partida_id"], r["semana"]))
         if r["semana"] == semana:
             hh_sem[r["partida_id"]] += float(r["hh"])
+    # Solo agregar tareo automático cuando NO existe entrada manual para esa partida/semana
     for (pid, s), v in tareo.items():
-        if s <= semana:
-            hh_acum[pid] += v
-        if s == semana:
-            hh_sem[pid] += v
+        if (pid, s) not in manual_keys:
+            if s <= semana:
+                hh_acum[pid] += v
+            if s == semana:
+                hh_sem[pid] += v
 
     filas = []
     for p in partidas:
@@ -860,6 +865,130 @@ async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
             "pf_acum":         ev.get("pf_acum", 0.0),
         })
     return {"semana": semana, "otm": otm, "filas": result}
+
+
+
+@router.post("/distribuir-hh")
+async def distribuir_hh(body: dict):
+    """Distribuye las HH de un OTM/fecha entre múltiples partidas.
+    Reemplaza la distribución automática proporcional para ese OTM/fecha/semana.
+    
+    Body: {otm_id, fecha, distribuciones: [{partida_id, hh}]}
+    """
+    otm_id       = str(body.get("otm_id", "")).strip()
+    fecha_str    = str(body.get("fecha", fecha_lima().isoformat()))
+    distribs     = body.get("distribuciones", [])
+    if not otm_id or not distribs:
+        raise HTTPException(400, "otm_id y distribuciones son requeridos")
+
+    pool = await db()
+    async with pool.acquire() as con:
+        base = await _fecha_base(con)
+        if not base:
+            raise HTTPException(400, "No hay semanas configuradas")
+        from datetime import date
+        fecha = date.fromisoformat(fecha_str)
+        semana = _semana_de(fecha, base)
+
+        asignados = 0
+        for d in distribs:
+            pid = int(d.get("partida_id", 0))
+            hh  = float(d.get("hh", 0))
+            if pid <= 0 or hh <= 0:
+                continue
+            await con.execute(
+                """INSERT INTO ev_hh_gastadas (partida_id, semana, hh, fuente)
+                   VALUES ($1, $2, $3, 'distribucion')
+                   ON CONFLICT (partida_id, semana) DO UPDATE SET hh=$3, fuente='distribucion'""",
+                pid, semana, hh
+            )
+            asignados += 1
+
+    return {"ok": True, "semana": semana, "asignados": asignados}
+
+
+
+@router.get("/isp")
+async def isp_reporte(otm: Optional[str] = None):
+    """ISP completo estilo Fluor: ResPorSubFase + Productividades + Resumen.
+    Devuelve datos por partida × semana para el periodo completo del proyecto."""
+    pool = await db()
+    async with pool.acquire() as con:
+        base = await _fecha_base(con)
+        if not base:
+            return {"semanas": [], "partidas": []}
+        today = date.today()
+        total = max(_semana_de(today, base), 1)
+
+        if otm:
+            partidas = await con.fetch(
+                "SELECT * FROM ev_partidas WHERE activo AND otm_id=$1 ORDER BY codigo", otm
+            )
+        else:
+            partidas = await con.fetch(
+                "SELECT * FROM ev_partidas WHERE activo ORDER BY codigo"
+            )
+        hitos   = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
+        avances = await con.fetch("SELECT * FROM ev_avances ORDER BY semana")
+        hh_rows = await con.fetch("SELECT * FROM ev_hh_gastadas ORDER BY semana")
+        tareo   = await _hh_tareo_por_semana(con)
+
+    # Calcular EV para cada semana (una llamada por semana, datos cargados en memoria)
+    result_por_partida: dict = {}
+    for p in partidas:
+        pid = p["id"]
+        mp  = float(p["metrado_proyec"] or p["metrado_presup"] or 0)
+        hp  = float(p["hh_presup"] or 0)
+        fc  = round(hp / mp, 4) if mp > 0 else 0.0
+        result_por_partida[pid] = {
+            "partida_id":   pid,
+            "codigo":       p["codigo"],
+            "otm_id":       p["otm_id"],
+            "descripcion":  p["descripcion"],
+            "unidad":       p["unidad"],
+            "fase":         p["fase"],
+            "hh_presup":    hp,
+            "metrado_presup": float(p["metrado_presup"] or 0),
+            "metrado_proyec": mp,
+            "factor_conv":  fc,
+            "es_hoja":      p["fase"] is not None,
+            "semanas":      {},
+        }
+
+    for s in range(1, total + 1):
+        filas = _calcular(list(partidas), list(hitos), list(avances), list(hh_rows), tareo, s)
+        for f in filas:
+            pid = f["partida_id"]
+            if pid in result_por_partida:
+                result_por_partida[pid]["semanas"][s] = {
+                    "hh_gan_acum":  round(f["hh_ganadas_acum"],   2),
+                    "hh_gan_sem":   round(f["hh_ganadas_sem"],    2),
+                    "hh_gast_acum": round(f["hh_gastadas_acum"],  2),
+                    "hh_gast_sem":  round(f["hh_gastadas_sem"],   2),
+                    "pf_acum":      round(f["pf_acum"],           4),
+                    "pf_sem":       round(f["pf_sem"],            4),
+                    "pct_avance":   round(f["pct_avance"],        4),
+                    "cant_acum":    round(
+                        f["hh_ganadas_acum"] / (result_por_partida[pid]["factor_conv"] or 1), 2
+                    ) if result_por_partida[pid]["factor_conv"] > 0 else 0,
+                }
+
+    # Semanas con labels
+    MESES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
+    def fmt(d: date) -> str: return f"{d.day} {MESES[d.month-1]}"
+    semanas_out = []
+    for n in range(1, total + 1):
+        lunes  = base + timedelta(weeks=n-1)
+        domingo = lunes + timedelta(days=6)
+        semanas_out.append({
+            "semana": n,
+            "label": f"Sem {n}",
+            "inicio": lunes.isoformat(),
+            "fin": domingo.isoformat(),
+            "label_full": f"Sem {n} · {fmt(lunes)}–{fmt(domingo)}",
+        })
+
+    return {"semanas": semanas_out, "partidas": list(result_por_partida.values())}
 
 
 @router.get("/reporte")
