@@ -763,21 +763,21 @@ async def eliminar_cuadrilla_grupo(grupo_id: int):
 @app.post("/api/sesion/enviar-con-partidas")
 async def enviar_con_partidas(data: dict):
     """
-    Flujo nuevo: cada trabajador ya llega con su partida asignada.
-    Crea sesión + registros (tareo HH) + tareo_partida (asignación).
-    HH calculadas automáticamente desde ev_config_jornada.
+    Flujo nuevo: cada trabajador tiene 1+ asignaciones a partidas con HH.
+    Soporta ambos formatos:
+      - Nuevo: {trab_id, asignaciones:[{partida_id, hh}], via}
+      - Viejo: {trab_id, partida_id, via}  (compat)
     """
     supervisor_id = str(data.get("supervisor_id", "")).strip()
     otm_id        = str(data.get("otm_id", "")).strip()
     fecha_str     = str(data.get("fecha", fecha_lima().isoformat()))
-    trabajadores  = data.get("trabajadores", [])  # [{trab_id, partida_id, via}]
+    trabajadores  = data.get("trabajadores", [])
 
     if not supervisor_id or not otm_id:
         raise HTTPException(400, "supervisor_id y otm_id son requeridos")
     if not trabajadores:
         raise HTTPException(400, "Lista de trabajadores vacía")
 
-    # HH del día desde configuración
     fecha_obj = date.fromisoformat(fecha_str)
     jornada = await database.fetch_one(
         "SELECT hh_dia FROM ev_config_jornada WHERE dia_semana = :dow AND activo = true",
@@ -785,7 +785,6 @@ async def enviar_con_partidas(data: dict):
     )
     hh_dia = float(jornada["hh_dia"]) if jornada else 9.5
 
-    # Semana desde fecha_base
     cfg = await database.fetch_one("SELECT fecha_base FROM ev_config WHERE id = 1")
     semana = 1
     if cfg and cfg["fecha_base"]:
@@ -795,7 +794,6 @@ async def enviar_con_partidas(data: dict):
 
     hora = hora_lima()
 
-    # Crear sesión
     row = await database.fetch_one(
         f"INSERT INTO sesiones "
         f"(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
@@ -806,9 +804,19 @@ async def enviar_con_partidas(data: dict):
     enviados  = 0
 
     for t in trabajadores:
-        trab_id    = str(t.get("trab_id", "")).zfill(3)
-        partida_id = t.get("partida_id")
-        via        = t.get("via", "app")
+        trab_id = str(t.get("trab_id", "")).zfill(3)
+        via     = t.get("via", "app")
+
+        # Normalizar asignaciones — soportar ambos formatos
+        asignaciones = t.get("asignaciones")
+        if asignaciones is None:
+            pid_old = t.get("partida_id")
+            asignaciones = [{"partida_id": pid_old, "hh": hh_dia}] if pid_old else []
+
+        # HH total del trabajador = suma de asignaciones (o hh_dia si no hay partidas)
+        hh_total = sum(float(a.get("hh", 0)) for a in asignaciones) if asignaciones else hh_dia
+        if hh_total <= 0:
+            hh_total = hh_dia
 
         # sesion_trabajadores
         await database.execute(
@@ -818,18 +826,22 @@ async def enviar_con_partidas(data: dict):
             {"sid": sesion_id, "tid": trab_id, "via": via}
         )
 
-        # registros (tareo clásico — backward compat con EV automático)
+        # registros (backward compat)
         await database.execute(
             f"INSERT INTO registros "
             f"(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
             f"VALUES (:tid, :otm, :sup, '{fecha_str}'::date, '{hora}'::time, :hh) "
             f"ON CONFLICT (trab_id, otm_id, fecha) "
             f"DO UPDATE SET hh=:hh, hora='{hora}'::time",
-            {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_dia}
+            {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_total}
         )
 
-        # tareo_partida (asignación directa a partida — nuevo)
-        if partida_id:
+        # tareo_partida — una fila por cada asignación a partida
+        for asig in asignaciones:
+            pid = asig.get("partida_id")
+            hh  = float(asig.get("hh", hh_dia))
+            if not pid or hh <= 0:
+                continue
             try:
                 await database.execute(
                     f"INSERT INTO tareo_partida "
@@ -837,12 +849,12 @@ async def enviar_con_partidas(data: dict):
                     f" hora_registro, hh, supervisor_id, sesion_id, fuente) "
                     f"VALUES (:tid, :pid, :otm, '{fecha_str}'::date, :sem, "
                     f"        NOW(), :hh, :sup, :sid, 'tareo')",
-                    {"tid": trab_id, "pid": partida_id, "otm": otm_id,
-                     "sem": semana, "hh": hh_dia,
+                    {"tid": trab_id, "pid": pid, "otm": otm_id,
+                     "sem": semana, "hh": hh,
                      "sup": supervisor_id, "sid": sesion_id}
                 )
             except Exception as e:
-                print(f"[tareo_partida] trab={trab_id} partida={partida_id}: {e}")
+                print(f"[tareo_partida] trab={trab_id} pid={pid}: {e}")
 
         enviados += 1
 
