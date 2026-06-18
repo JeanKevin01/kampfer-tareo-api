@@ -638,3 +638,252 @@ async def editar_trabajador(trab_id: str, data: dict):
         {"id": trab_id}
     )
     return dict(updated)
+
+
+# ═══════════════════════════════════════════════════════════════
+# SPRINT 2: Control diario por partida
+# ═══════════════════════════════════════════════════════════════
+
+# ── PARTIDAS POR OTM (para la app móvil) ─────────────────────
+
+@app.get("/api/partidas-otm/{otm_id}")
+async def get_partidas_otm(otm_id: str):
+    """Devuelve las partidas hoja (con fase asignada) de una OTM."""
+    rows = await database.fetch_all(
+        """SELECT p.id, p.codigo, p.descripcion, p.fase, p.sub_fase,
+                  p.unidad, p.hh_presup, p.metrado_presup
+           FROM ev_partidas p
+           WHERE p.otm_id = :otm AND p.activo = true AND p.fase IS NOT NULL
+           ORDER BY p.codigo""",
+        {"otm": otm_id}
+    )
+    return [dict(r) for r in rows]
+
+
+# ── CUADRILLA GRUPOS (múltiples por supervisor) ───────────────
+
+@app.get("/api/cuadrillas/{supervisor_id}")
+async def listar_cuadrilla_grupos(supervisor_id: str):
+    """Lista todos los grupos de cuadrilla del supervisor con sus miembros."""
+    grupos = await database.fetch_all(
+        """SELECT g.id, g.nombre, g.activo, g.creado_en,
+                  COUNT(m.trab_id) AS total
+           FROM cuadrilla_grupos g
+           LEFT JOIN cuadrilla_grupo_miembros m ON m.grupo_id = g.id
+           WHERE g.supervisor_id = :sup AND g.activo = true
+           GROUP BY g.id ORDER BY g.creado_en""",
+        {"sup": supervisor_id}
+    )
+    result = []
+    for g in grupos:
+        gd = dict(g)
+        miembros = await database.fetch_all(
+            """SELECT m.trab_id, t.nombre, t.cargo
+               FROM cuadrilla_grupo_miembros m
+               JOIN trabajadores t ON t.id = m.trab_id AND t.activo = true
+               WHERE m.grupo_id = :gid ORDER BY t.nombre""",
+            {"gid": gd["id"]}
+        )
+        gd["miembros"] = [dict(m) for m in miembros]
+        gd["total"]    = int(gd["total"])
+        result.append(gd)
+    return result
+
+
+@app.post("/api/cuadrillas/{supervisor_id}")
+async def crear_cuadrilla_grupo(supervisor_id: str, data: dict):
+    """Crea un nuevo grupo de cuadrilla con su lista de miembros."""
+    nombre   = data.get("nombre", "").strip()
+    trab_ids = data.get("trab_ids", [])
+    if not nombre:
+        raise HTTPException(400, "El nombre es requerido")
+    row = await database.fetch_one(
+        "INSERT INTO cuadrilla_grupos (supervisor_id, nombre) "
+        "VALUES (:sup, :nombre) ON CONFLICT (supervisor_id, nombre) "
+        "DO UPDATE SET activo = true RETURNING id",
+        {"sup": supervisor_id, "nombre": nombre}
+    )
+    grupo_id = row["id"]
+    for tid in trab_ids:
+        await database.execute(
+            "INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id) "
+            "VALUES (:gid, :tid) ON CONFLICT DO NOTHING",
+            {"gid": grupo_id, "tid": str(tid).zfill(3)}
+        )
+    return {"ok": True, "id": grupo_id, "nombre": nombre}
+
+
+@app.put("/api/cuadrilla-grupo/{grupo_id}/miembros")
+async def reemplazar_miembros_grupo(grupo_id: int, data: dict):
+    """Reemplaza la lista completa de miembros del grupo."""
+    trab_ids = data.get("trab_ids", [])
+    await database.execute(
+        "DELETE FROM cuadrilla_grupo_miembros WHERE grupo_id = :gid",
+        {"gid": grupo_id}
+    )
+    for tid in trab_ids:
+        await database.execute(
+            "INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id) "
+            "VALUES (:gid, :tid) ON CONFLICT DO NOTHING",
+            {"gid": grupo_id, "tid": str(tid).zfill(3)}
+        )
+    return {"ok": True, "total": len(trab_ids)}
+
+
+@app.post("/api/cuadrilla-grupo/{grupo_id}/miembro/{trab_id}")
+async def agregar_miembro_grupo(grupo_id: int, trab_id: str):
+    await database.execute(
+        "INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id) "
+        "VALUES (:gid, :tid) ON CONFLICT DO NOTHING",
+        {"gid": grupo_id, "tid": trab_id.zfill(3)}
+    )
+    return {"ok": True}
+
+
+@app.delete("/api/cuadrilla-grupo/{grupo_id}/miembro/{trab_id}")
+async def quitar_miembro_grupo(grupo_id: int, trab_id: str):
+    await database.execute(
+        "DELETE FROM cuadrilla_grupo_miembros WHERE grupo_id = :gid AND trab_id = :tid",
+        {"gid": grupo_id, "tid": trab_id.zfill(3)}
+    )
+    return {"ok": True}
+
+
+@app.delete("/api/cuadrilla-grupo/{grupo_id}")
+async def eliminar_cuadrilla_grupo(grupo_id: int):
+    await database.execute(
+        "UPDATE cuadrilla_grupos SET activo = false WHERE id = :gid",
+        {"gid": grupo_id}
+    )
+    return {"ok": True}
+
+
+# ── ENVIAR CON PARTIDAS (nuevo flujo) ─────────────────────────
+
+@app.post("/api/sesion/enviar-con-partidas")
+async def enviar_con_partidas(data: dict):
+    """
+    Flujo nuevo: cada trabajador ya llega con su partida asignada.
+    Crea sesión + registros (tareo HH) + tareo_partida (asignación).
+    HH calculadas automáticamente desde ev_config_jornada.
+    """
+    supervisor_id = str(data.get("supervisor_id", "")).strip()
+    otm_id        = str(data.get("otm_id", "")).strip()
+    fecha_str     = str(data.get("fecha", fecha_lima().isoformat()))
+    trabajadores  = data.get("trabajadores", [])  # [{trab_id, partida_id, via}]
+
+    if not supervisor_id or not otm_id:
+        raise HTTPException(400, "supervisor_id y otm_id son requeridos")
+    if not trabajadores:
+        raise HTTPException(400, "Lista de trabajadores vacía")
+
+    # HH del día desde configuración
+    fecha_obj = date.fromisoformat(fecha_str)
+    jornada = await database.fetch_one(
+        "SELECT hh_dia FROM ev_config_jornada WHERE dia_semana = :dow AND activo = true",
+        {"dow": fecha_obj.weekday()}
+    )
+    hh_dia = float(jornada["hh_dia"]) if jornada else 9.5
+
+    # Semana desde fecha_base
+    cfg = await database.fetch_one("SELECT fecha_base FROM ev_config WHERE id = 1")
+    semana = 1
+    if cfg and cfg["fecha_base"]:
+        base = cfg["fecha_base"]
+        base = base if hasattr(base, "toordinal") else date.fromisoformat(str(base))
+        semana = max(1, (fecha_obj - base).days // 7 + 1)
+
+    hora = hora_lima()
+
+    # Crear sesión
+    row = await database.fetch_one(
+        f"INSERT INTO sesiones "
+        f"(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
+        f"VALUES (:sup, :otm, '{fecha_str}'::date, :hh, 'enviada', now()) RETURNING id",
+        {"sup": supervisor_id, "otm": otm_id, "hh": hh_dia}
+    )
+    sesion_id = row["id"]
+    enviados  = 0
+
+    for t in trabajadores:
+        trab_id    = str(t.get("trab_id", "")).zfill(3)
+        partida_id = t.get("partida_id")
+        via        = t.get("via", "app")
+
+        # sesion_trabajadores
+        await database.execute(
+            "INSERT INTO sesion_trabajadores "
+            "(sesion_id, trab_id, presente, hh_override, agregado_via) "
+            "VALUES (:sid, :tid, true, null, :via)",
+            {"sid": sesion_id, "tid": trab_id, "via": via}
+        )
+
+        # registros (tareo clásico — backward compat con EV automático)
+        await database.execute(
+            f"INSERT INTO registros "
+            f"(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
+            f"VALUES (:tid, :otm, :sup, '{fecha_str}'::date, '{hora}'::time, :hh) "
+            f"ON CONFLICT (trab_id, otm_id, fecha) "
+            f"DO UPDATE SET hh=:hh, hora='{hora}'::time",
+            {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_dia}
+        )
+
+        # tareo_partida (asignación directa a partida — nuevo)
+        if partida_id:
+            try:
+                await database.execute(
+                    f"INSERT INTO tareo_partida "
+                    f"(trabajador_id, partida_id, otm_id, fecha, semana, "
+                    f" hora_registro, hh, supervisor_id, sesion_id, fuente) "
+                    f"VALUES (:tid, :pid, :otm, '{fecha_str}'::date, :sem, "
+                    f"        NOW(), :hh, :sup, :sid, 'tareo')",
+                    {"tid": trab_id, "pid": partida_id, "otm": otm_id,
+                     "sem": semana, "hh": hh_dia,
+                     "sup": supervisor_id, "sid": sesion_id}
+                )
+            except Exception as e:
+                print(f"[tareo_partida] trab={trab_id} partida={partida_id}: {e}")
+
+        enviados += 1
+
+    return {"ok": True, "enviados": enviados, "sesion_id": sesion_id, "hh_dia": hh_dia}
+
+
+@app.post("/api/tareo-partida/cambio")
+async def cambio_partida_dia(data: dict):
+    """
+    Registra un cambio de partida a mitad del día.
+    La hora queda como el timestamp del request.
+    El cron recalculará las HH al cierre del día.
+    """
+    trabajador_ids = data.get("trabajador_ids", [])
+    partida_id     = data.get("partida_id")
+    otm_id         = str(data.get("otm_id", "")).strip()
+    supervisor_id  = str(data.get("supervisor_id", "")).strip()
+    fecha_str      = str(data.get("fecha", fecha_lima().isoformat()))
+
+    if not trabajador_ids or not partida_id:
+        raise HTTPException(400, "trabajador_ids y partida_id son requeridos")
+
+    cfg = await database.fetch_one("SELECT fecha_base FROM ev_config WHERE id = 1")
+    semana = 1
+    if cfg and cfg["fecha_base"]:
+        base = cfg["fecha_base"]
+        base = base if hasattr(base, "toordinal") else date.fromisoformat(str(base))
+        semana = max(1, (date.fromisoformat(fecha_str) - base).days // 7 + 1)
+
+    creados = 0
+    for tid in trabajador_ids:
+        trab_id = str(tid).zfill(3)
+        await database.execute(
+            f"INSERT INTO tareo_partida "
+            f"(trabajador_id, partida_id, otm_id, fecha, semana, "
+            f" hora_registro, supervisor_id, fuente) "
+            f"VALUES (:tid, :pid, :otm, '{fecha_str}'::date, :sem, "
+            f"        NOW(), :sup, 'cambio')",
+            {"tid": trab_id, "pid": partida_id, "otm": otm_id,
+             "sem": semana, "sup": supervisor_id}
+        )
+        creados += 1
+
+    return {"ok": True, "creados": creados}
