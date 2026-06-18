@@ -1073,3 +1073,319 @@ async def curva_fase(hasta: int, otm: Optional[str] = None):
             punto[f"pf_{fase}"] = round(g / c, 3) if c > 0 else None
         serie.append(punto)
     return {"fases": fases, "serie": serie}
+
+
+# ═══════════════════════════════════════════════════════════════
+# SPRINT 2: Control diario por partida
+# ═══════════════════════════════════════════════════════════════
+
+@router.get("/semana-grid")
+async def semana_grid(semana: int, otm: Optional[str] = None):
+    """
+    Grilla semanal: partidas × días (Lun-Dom).
+    Devuelve HH del tareo (automáticas) + cant_ejecutada (manual, null si no ingresada).
+    """
+    pool = await db()
+    async with pool.acquire() as con:
+        cfg = await con.fetchrow(
+            "SELECT fecha_base FROM ev_config ORDER BY id LIMIT 1"
+        )
+        if not cfg or not cfg["fecha_base"]:
+            raise HTTPException(400, "Fecha base no configurada en ev_config")
+
+        lunes = cfg["fecha_base"] + timedelta(weeks=semana - 1)
+        fechas = [lunes + timedelta(days=i) for i in range(7)]
+
+        q = """
+            SELECT p.id, p.codigo, p.descripcion, p.fase, p.sub_fase,
+                   p.unidad, p.hh_presup, p.metrado_presup,
+                   CASE WHEN p.metrado_presup > 0
+                        THEN p.hh_presup / p.metrado_presup
+                        ELSE 0 END AS factor_conv
+            FROM ev_partidas p
+            WHERE p.activo = true AND p.fase IS NOT NULL
+        """
+        args: list = []
+        if otm:
+            args.append(otm)
+            q += f" AND p.otm_id = ${len(args)}"
+        q += " ORDER BY p.codigo"
+
+        partidas = await con.fetch(q, *args)
+        if not partidas:
+            return {
+                "semana": semana, "otm": otm,
+                "lunes": lunes.isoformat(),
+                "fechas": [f.isoformat() for f in fechas],
+                "partidas": []
+            }
+
+        p_ids = [p["id"] for p in partidas]
+        fechas_str = [f.isoformat() for f in fechas]
+
+        # HH del tareo agrupadas por (partida_id, fecha)
+        hh_rows = await con.fetch(
+            """SELECT partida_id, fecha::text AS f, SUM(hh) AS hh_total
+               FROM tareo_partida
+               WHERE partida_id = ANY($1) AND fecha = ANY($2::date[])
+                 AND hh IS NOT NULL
+               GROUP BY partida_id, fecha""",
+            p_ids, fechas_str
+        )
+        hh_map = {(r["partida_id"], r["f"]): float(r["hh_total"] or 0)
+                  for r in hh_rows}
+
+        # Avances diarios (pueden no existir aún → None)
+        cant_rows = await con.fetch(
+            """SELECT partida_id, fecha::text AS f, cantidad_dia
+               FROM ev_avances_diarios
+               WHERE partida_id = ANY($1) AND fecha = ANY($2::date[])""",
+            p_ids, fechas_str
+        )
+        cant_map = {(r["partida_id"], r["f"]): float(r["cantidad_dia"] or 0)
+                    for r in cant_rows}
+        cant_exist = {(r["partida_id"], r["f"]) for r in cant_rows}
+
+        result = []
+        for p in partidas:
+            pid    = p["id"]
+            factor = float(p["factor_conv"] or 0)
+            dias   = {}
+            for fecha in fechas:
+                fs  = fecha.isoformat()
+                hh  = hh_map.get((pid, fs), 0)
+                key = (pid, fs)
+                cant       = cant_map.get(key, None) if key in cant_exist else None
+                hh_ganadas = round(cant * factor, 4) if cant is not None and factor > 0 else None
+                pf         = round(hh_ganadas / hh, 3) if hh_ganadas and hh > 0 else None
+
+                if hh > 0 or key in cant_exist:
+                    dias[fs] = {
+                        "hh_gastadas":   round(hh, 2),
+                        "cant_ejecutada": cant,
+                        "hh_ganadas":     hh_ganadas,
+                        "pf":             pf,
+                    }
+
+            result.append({
+                "id":            pid,
+                "codigo":        p["codigo"],
+                "descripcion":   p["descripcion"],
+                "fase":          p["fase"],
+                "sub_fase":      p["sub_fase"],
+                "unidad":        p["unidad"],
+                "factor_conv":   round(factor, 4),
+                "hh_presup":     float(p["hh_presup"] or 0),
+                "metrado_presup": float(p["metrado_presup"] or 0),
+                "dias":          dias,
+            })
+
+        return {
+            "semana":  semana,
+            "otm":     otm,
+            "lunes":   lunes.isoformat(),
+            "fechas":  fechas_str,
+            "partidas": result,
+        }
+
+
+@router.post("/avance-diario")
+async def guardar_avance_diario(data: dict):
+    """Guarda o actualiza la cantidad ejecutada de una partida en un día."""
+    partida_id   = data.get("partida_id")
+    fecha_str    = data.get("fecha")
+    cantidad_dia = data.get("cantidad_dia")  # puede ser None para borrar
+    notas        = data.get("notas")
+    if not partida_id or not fecha_str:
+        raise HTTPException(400, "partida_id y fecha son requeridos")
+
+    pool = await db()
+    async with pool.acquire() as con:
+        cfg = await con.fetchrow(
+            "SELECT fecha_base FROM ev_config ORDER BY id LIMIT 1"
+        )
+        semana = 1
+        if cfg and cfg["fecha_base"]:
+            delta  = (date.fromisoformat(fecha_str) - cfg["fecha_base"]).days
+            semana = max(1, delta // 7 + 1)
+
+        await con.execute(
+            """INSERT INTO ev_avances_diarios
+                 (partida_id, fecha, semana, cantidad_dia, notas, registrado_en)
+               VALUES ($1, $2::date, $3, $4, $5, NOW())
+               ON CONFLICT (partida_id, fecha)
+               DO UPDATE SET cantidad_dia=$4, notas=$5, registrado_en=NOW()""",
+            partida_id, fecha_str, semana, cantidad_dia, notas
+        )
+    return {"ok": True}
+
+
+@router.get("/rendimiento-trabajador")
+async def rendimiento_trabajador(
+    trabajador_id: str,
+    desde: Optional[str] = None,
+    hasta: Optional[str] = None,
+):
+    """HH y PF de un trabajador desglosado por partida."""
+    pool = await db()
+    async with pool.acquire() as con:
+        conds = ["tp.trabajador_id = $1"]
+        args: list = [trabajador_id]
+        if desde:
+            args.append(desde)
+            conds.append(f"tp.fecha >= ${len(args)}::date")
+        if hasta:
+            args.append(hasta)
+            conds.append(f"tp.fecha <= ${len(args)}::date")
+        where = " AND ".join(conds)
+
+        # Info del trabajador
+        trab = await con.fetchrow(
+            "SELECT nombre, cargo FROM trabajadores WHERE id = $1", trabajador_id
+        )
+
+        rows = await con.fetch(
+            f"""SELECT p.id AS partida_id, p.codigo, p.descripcion,
+                       p.fase, p.unidad,
+                       CASE WHEN p.metrado_presup > 0
+                            THEN p.hh_presup / p.metrado_presup ELSE 0
+                       END AS factor_presup,
+                       SUM(tp.hh)              AS hh_total,
+                       COUNT(DISTINCT tp.fecha) AS dias_trabajados
+                FROM tareo_partida tp
+                JOIN ev_partidas p ON p.id = tp.partida_id
+                WHERE {where} AND tp.hh IS NOT NULL
+                GROUP BY p.id, p.codigo, p.descripcion, p.fase, p.unidad,
+                         p.hh_presup, p.metrado_presup
+                ORDER BY hh_total DESC""",
+            *args
+        )
+
+        # Cant ejecutada acumulada por partida en el mismo rango de fechas
+        cant_rows = await con.fetch(
+            f"""SELECT tp.partida_id,
+                       SUM(COALESCE(ad.cantidad_dia, 0)) AS cant_acum
+                FROM tareo_partida tp
+                LEFT JOIN ev_avances_diarios ad
+                  ON ad.partida_id = tp.partida_id AND ad.fecha = tp.fecha
+                WHERE {where}
+                GROUP BY tp.partida_id""",
+            *args
+        )
+        cant_by_pid = {r["partida_id"]: float(r["cant_acum"] or 0)
+                       for r in cant_rows}
+
+        partidas = []
+        for r in rows:
+            hh      = float(r["hh_total"] or 0)
+            factor  = float(r["factor_presup"] or 0)
+            cant    = cant_by_pid.get(r["partida_id"], 0)
+            hh_gan  = round(cant * factor, 2) if factor > 0 else None
+            pf      = round(hh_gan / hh, 3) if hh_gan and hh > 0 else None
+            partidas.append({
+                "partida_id":     r["partida_id"],
+                "codigo":         r["codigo"],
+                "descripcion":    r["descripcion"],
+                "fase":           r["fase"],
+                "unidad":         r["unidad"],
+                "factor_presup":  round(factor, 4),
+                "hh_total":       round(hh, 2),
+                "cant_acum":      round(cant, 2),
+                "hh_ganadas":     hh_gan,
+                "pf_promedio":    pf,
+                "dias_trabajados": int(r["dias_trabajados"]),
+            })
+
+        return {
+            "trabajador_id": trabajador_id,
+            "nombre":  trab["nombre"] if trab else "—",
+            "cargo":   trab["cargo"]  if trab else "—",
+            "partidas": partidas,
+            "hh_total_global": round(sum(p["hh_total"] for p in partidas), 2),
+        }
+
+
+@router.get("/rendimiento-cuadrillas")
+async def rendimiento_cuadrillas(
+    semana:        Optional[int] = None,
+    supervisor_id: Optional[str] = None,
+):
+    """Comparativa de PF por cuadrilla (supervisor) y partida."""
+    pool = await db()
+    async with pool.acquire() as con:
+        conds = ["tp.hh IS NOT NULL"]
+        args: list = []
+        if semana:
+            args.append(semana)
+            conds.append(f"tp.semana = ${len(args)}")
+        if supervisor_id:
+            args.append(supervisor_id)
+            conds.append(f"tp.supervisor_id = ${len(args)}")
+        where = " AND ".join(conds)
+
+        rows = await con.fetch(
+            f"""SELECT tp.supervisor_id,
+                       s.nombre AS supervisor_nombre,
+                       p.id AS partida_id, p.codigo, p.descripcion,
+                       p.fase, p.unidad,
+                       CASE WHEN p.metrado_presup > 0
+                            THEN p.hh_presup / p.metrado_presup ELSE 0
+                       END AS factor_presup,
+                       SUM(tp.hh) AS hh_total,
+                       COUNT(DISTINCT tp.trabajador_id) AS n_trabajadores,
+                       COUNT(DISTINCT tp.fecha) AS dias
+                FROM tareo_partida tp
+                JOIN ev_partidas p  ON p.id  = tp.partida_id
+                JOIN supervisores s ON s.id  = tp.supervisor_id
+                WHERE {where}
+                GROUP BY tp.supervisor_id, s.nombre, p.id, p.codigo,
+                         p.descripcion, p.fase, p.unidad,
+                         p.hh_presup, p.metrado_presup
+                ORDER BY tp.supervisor_id, p.codigo""",
+            *args
+        )
+
+        # Cant ejecutada por (supervisor, partida, semana-rango)
+        cant_args = list(args)
+        cant_conds = list(conds)
+        cant_rows = await con.fetch(
+            f"""SELECT tp.supervisor_id, tp.partida_id,
+                       SUM(COALESCE(ad.cantidad_dia, 0)) AS cant_acum
+                FROM tareo_partida tp
+                LEFT JOIN ev_avances_diarios ad
+                  ON ad.partida_id = tp.partida_id AND ad.fecha = tp.fecha
+                WHERE {where}
+                GROUP BY tp.supervisor_id, tp.partida_id""",
+            *cant_args
+        )
+        cant_map = {(r["supervisor_id"], r["partida_id"]): float(r["cant_acum"] or 0)
+                    for r in cant_rows}
+
+        # Agrupar por supervisor
+        por_sup: dict = {}
+        for r in rows:
+            sid = r["supervisor_id"]
+            if sid not in por_sup:
+                por_sup[sid] = {"supervisor_id": sid,
+                                "nombre": r["supervisor_nombre"],
+                                "partidas": []}
+            hh     = float(r["hh_total"] or 0)
+            factor = float(r["factor_presup"] or 0)
+            cant   = cant_map.get((sid, r["partida_id"]), 0)
+            hh_gan = round(cant * factor, 2) if factor > 0 else None
+            pf     = round(hh_gan / hh, 3) if hh_gan and hh > 0 else None
+            por_sup[sid]["partidas"].append({
+                "partida_id":    r["partida_id"],
+                "codigo":        r["codigo"],
+                "descripcion":   r["descripcion"],
+                "fase":          r["fase"],
+                "unidad":        r["unidad"],
+                "hh_total":      round(hh, 2),
+                "cant_acum":     round(cant, 2),
+                "hh_ganadas":    hh_gan,
+                "pf":            pf,
+                "n_trabajadores": int(r["n_trabajadores"]),
+                "dias":          int(r["dias"]),
+            })
+
+        return list(por_sup.values())
