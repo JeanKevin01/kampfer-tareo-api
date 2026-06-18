@@ -788,7 +788,15 @@ async def semanas_auto():
             ORDER BY lunes
         """)
         if not hh_rows:
-            return []
+            # Sin registros aún — devolver semana 1 para que el panel no quede colgado
+            lunes0  = base
+            dom0    = lunes0 + timedelta(days=6)
+            def _fm(d): return f"{d.day} {['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'][d.month-1]}"
+            return [{
+                "semana": 1, "inicio": lunes0.isoformat(), "fin": dom0.isoformat(),
+                "hh": 0.0, "activa": False,
+                "label": f"Sem 1  ·  {_fm(lunes0)} – {_fm(dom0)}  (sin actividad aún)"
+            }]
 
         hh_map: dict = {}
         for r in hh_rows:
