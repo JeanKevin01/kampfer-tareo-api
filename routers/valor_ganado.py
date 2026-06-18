@@ -1080,22 +1080,37 @@ async def curva_fase(hasta: int, otm: Optional[str] = None):
 # ═══════════════════════════════════════════════════════════════
 
 @router.get("/semana-grid")
-async def semana_grid(semana: int, otm: Optional[str] = None):
+async def semana_grid(
+    semana: int,
+    otm: Optional[str] = None,
+    lunes: Optional[str] = None,   # ISO date del lunes — override de fecha_base
+):
     """
     Grilla semanal: partidas × días (Lun-Dom).
-    Devuelve HH del tareo (automáticas) + cant_ejecutada (manual, null si no ingresada).
+    Incluye HH reales (tareo_partida), HH estimadas (registros histórico)
+    y cant_ejecutada (ev_avances_diarios).
     """
     pool = await db()
     async with pool.acquire() as con:
-        cfg = await con.fetchrow(
-            "SELECT fecha_base FROM ev_config ORDER BY id LIMIT 1"
-        )
-        if not cfg or not cfg["fecha_base"]:
-            raise HTTPException(400, "Fecha base no configurada en ev_config")
+        # ── Fechas del período ───────────────────────────────
+        if lunes:
+            lunes_date = date.fromisoformat(lunes)
+        else:
+            cfg = await con.fetchrow(
+                "SELECT fecha_base FROM ev_config ORDER BY id LIMIT 1"
+            )
+            if not cfg or not cfg["fecha_base"]:
+                raise HTTPException(
+                    400,
+                    "Fecha base no configurada. Pasa ?lunes=YYYY-MM-DD como parámetro."
+                )
+            lunes_date = cfg["fecha_base"] + timedelta(weeks=semana - 1)
 
-        lunes = cfg["fecha_base"] + timedelta(weeks=semana - 1)
-        fechas = [lunes + timedelta(days=i) for i in range(7)]
+        domingo_date = lunes_date + timedelta(days=6)
+        fechas = [lunes_date + timedelta(days=i) for i in range(7)]
+        fechas_str = [f.isoformat() for f in fechas]
 
+        # ── Partidas hoja de la OTM ──────────────────────────
         q = """
             SELECT p.id, p.codigo, p.descripcion, p.fase, p.sub_fase,
                    p.unidad, p.hh_presup, p.metrado_presup,
@@ -1114,77 +1129,118 @@ async def semana_grid(semana: int, otm: Optional[str] = None):
         partidas = await con.fetch(q, *args)
         if not partidas:
             return {
-                "semana": semana, "otm": otm,
-                "lunes": lunes.isoformat(),
-                "fechas": [f.isoformat() for f in fechas],
-                "partidas": []
+                "semana":   semana,
+                "otm":      otm,
+                "lunes":    lunes_date.isoformat(),
+                "fechas":   fechas_str,
+                "partidas": [],
             }
 
-        p_ids = [p["id"] for p in partidas]
-        fechas_str = [f.isoformat() for f in fechas]
+        p_ids         = [p["id"] for p in partidas]
+        total_hh_pres = sum(float(p["hh_presup"] or 0) for p in partidas)
 
-        # HH del tareo agrupadas por (partida_id, fecha)
+        # ── HH exactas: tareo_partida (nuevo flujo) ──────────
         hh_rows = await con.fetch(
             """SELECT partida_id, fecha::text AS f, SUM(hh) AS hh_total
                FROM tareo_partida
-               WHERE partida_id = ANY($1) AND fecha = ANY($2::date[])
+               WHERE partida_id = ANY($1)
+                 AND fecha >= $2::date AND fecha <= $3::date
                  AND hh IS NOT NULL
                GROUP BY partida_id, fecha""",
-            p_ids, fechas_str
+            p_ids,
+            lunes_date.isoformat(),
+            domingo_date.isoformat(),
         )
-        hh_map = {(r["partida_id"], r["f"]): float(r["hh_total"] or 0)
-                  for r in hh_rows}
+        hh_map = {
+            (r["partida_id"], r["f"]): float(r["hh_total"] or 0)
+            for r in hh_rows
+        }
 
-        # Avances diarios (pueden no existir aún → None)
+        # ── HH estimadas: registros histórico (fallback) ─────
+        # Total HH del OTM por día (tareo viejo, sin asignación a partida)
+        fallback_by_date: dict = {}
+        if otm and total_hh_pres > 0:
+            fb = await con.fetch(
+                """SELECT fecha::text AS f, SUM(hh) AS hh_dia
+                   FROM registros
+                   WHERE otm_id = $1
+                     AND fecha >= $2::date AND fecha <= $3::date
+                     AND hh IS NOT NULL AND hh > 0
+                   GROUP BY fecha""",
+                otm,
+                lunes_date.isoformat(),
+                domingo_date.isoformat(),
+            )
+            fallback_by_date = {r["f"]: float(r["hh_dia"] or 0) for r in fb}
+
+        # ── Avances diarios (cant_ejecutada) ─────────────────
         cant_rows = await con.fetch(
             """SELECT partida_id, fecha::text AS f, cantidad_dia
                FROM ev_avances_diarios
-               WHERE partida_id = ANY($1) AND fecha = ANY($2::date[])""",
-            p_ids, fechas_str
+               WHERE partida_id = ANY($1)
+                 AND fecha >= $2::date AND fecha <= $3::date""",
+            p_ids,
+            lunes_date.isoformat(),
+            domingo_date.isoformat(),
         )
-        cant_map = {(r["partida_id"], r["f"]): float(r["cantidad_dia"] or 0)
-                    for r in cant_rows}
+        cant_map   = {(r["partida_id"], r["f"]): float(r["cantidad_dia"] or 0) for r in cant_rows}
         cant_exist = {(r["partida_id"], r["f"]) for r in cant_rows}
 
+        # ── Construir resultado ───────────────────────────────
         result = []
         for p in partidas:
             pid    = p["id"]
             factor = float(p["factor_conv"] or 0)
+            hh_p   = float(p["hh_presup"]  or 0)
             dias   = {}
+
             for fecha in fechas:
                 fs  = fecha.isoformat()
-                hh  = hh_map.get((pid, fs), 0)
                 key = (pid, fs)
-                cant       = cant_map.get(key, None) if key in cant_exist else None
-                hh_ganadas = round(cant * factor, 4) if cant is not None and factor > 0 else None
-                pf         = round(hh_ganadas / hh, 3) if hh_ganadas and hh > 0 else None
 
-                if hh > 0 or key in cant_exist:
+                # HH real (nuevo tareo)
+                hh_real = hh_map.get(key, 0)
+
+                # HH estimada (tareo viejo proporcional)
+                hh_est = 0.0
+                if hh_real == 0 and hh_p > 0 and total_hh_pres > 0:
+                    hh_dia_otm = fallback_by_date.get(fs, 0)
+                    if hh_dia_otm > 0:
+                        hh_est = round(hh_p / total_hh_pres * hh_dia_otm, 2)
+
+                # Cant ejecutada
+                cant       = cant_map.get(key, None) if key in cant_exist else None
+                hh_activa  = hh_real if hh_real > 0 else hh_est
+                hh_ganadas = round(cant * factor, 4) if cant is not None and factor > 0 else None
+                pf         = round(hh_ganadas / hh_activa, 3) if hh_ganadas and hh_activa > 0 else None
+
+                if hh_real > 0 or hh_est > 0 or key in cant_exist:
                     dias[fs] = {
-                        "hh_gastadas":   round(hh, 2),
-                        "cant_ejecutada": cant,
+                        "hh_gastadas":    round(hh_real, 2),   # nuevo tareo (exacto)
+                        "hh_estimada":    hh_est,               # tareo viejo (proporcional)
+                        "cant_ejecutada": cant,                  # None = no ingresada aún
                         "hh_ganadas":     hh_ganadas,
                         "pf":             pf,
                     }
 
             result.append({
-                "id":            pid,
-                "codigo":        p["codigo"],
-                "descripcion":   p["descripcion"],
-                "fase":          p["fase"],
-                "sub_fase":      p["sub_fase"],
-                "unidad":        p["unidad"],
-                "factor_conv":   round(factor, 4),
-                "hh_presup":     float(p["hh_presup"] or 0),
+                "id":             pid,
+                "codigo":         p["codigo"],
+                "descripcion":    p["descripcion"],
+                "fase":           p["fase"],
+                "sub_fase":       p["sub_fase"],
+                "unidad":         p["unidad"],
+                "factor_conv":    round(factor, 4),
+                "hh_presup":      float(p["hh_presup"]      or 0),
                 "metrado_presup": float(p["metrado_presup"] or 0),
-                "dias":          dias,
+                "dias":           dias,
             })
 
         return {
-            "semana":  semana,
-            "otm":     otm,
-            "lunes":   lunes.isoformat(),
-            "fechas":  fechas_str,
+            "semana":   semana,
+            "otm":      otm,
+            "lunes":    lunes_date.isoformat(),
+            "fechas":   fechas_str,
             "partidas": result,
         }
 
@@ -1219,6 +1275,72 @@ async def guardar_avance_diario(data: dict):
         )
     return {"ok": True}
 
+
+
+
+@router.post("/volcar-diario-a-isp")
+async def volcar_diario_a_isp(data: dict):
+    """
+    Agrega las HH del control diario (tareo_partida) hacia ev_hh_gastadas,
+    que es la tabla que alimenta el ISP semanal y el PF.
+    Solo vuelca si hay datos reales en tareo_partida (no estimaciones).
+    Devuelve cuántas partidas fueron volcadas.
+    """
+    semana = data.get("semana")
+    otm    = data.get("otm")
+    lunes  = data.get("lunes")  # solo para validar rango de fechas alternativo
+
+    if not semana:
+        raise HTTPException(400, "semana es requerido")
+
+    pool = await db()
+    async with pool.acquire() as con:
+        # Sumar HH por partida para la semana
+        if otm:
+            rows = await con.fetch(
+                """SELECT partida_id, SUM(hh) AS hh_total
+                   FROM tareo_partida
+                   WHERE semana = $1 AND otm_id = $2 AND hh IS NOT NULL
+                   GROUP BY partida_id""",
+                semana, otm
+            )
+        else:
+            rows = await con.fetch(
+                """SELECT partida_id, SUM(hh) AS hh_total
+                   FROM tareo_partida
+                   WHERE semana = $1 AND hh IS NOT NULL
+                   GROUP BY partida_id""",
+                semana
+            )
+
+        if not rows:
+            raise HTTPException(
+                404,
+                f"Sin datos de tareo_partida para semana {semana}"
+                + (f" / {otm}" if otm else "")
+                + ". ¿El nuevo flujo de la app ya está en uso?"
+            )
+
+        volcados = 0
+        async with con.transaction():
+            for r in rows:
+                await con.execute(
+                    """INSERT INTO ev_hh_gastadas (partida_id, semana, hh, fuente)
+                       VALUES ($1, $2, $3, 'diario')
+                       ON CONFLICT (partida_id, semana)
+                       DO UPDATE SET hh = $3, fuente = 'diario'""",
+                    r["partida_id"], semana, round(float(r["hh_total"]), 2)
+                )
+                volcados += 1
+
+        return {
+            "ok":              True,
+            "semana":          semana,
+            "otm":             otm,
+            "partidas_volcadas": volcados,
+            "mensaje": f"{volcados} partidas volcadas al ISP semana {semana}. "
+                       "Los valores del ISP se actualizarán en el siguiente cálculo."
+        }
 
 @router.get("/rendimiento-trabajador")
 async def rendimiento_trabajador(
@@ -1389,3 +1511,409 @@ async def rendimiento_cuadrillas(
             })
 
         return list(por_sup.values())
+
+
+# ═══════════════════════════════════════════════════════════════
+# FASE 1 — Control Maestro: Cuadrillas + Asignación + Histórico
+# ═══════════════════════════════════════════════════════════════
+
+# ── Cuadrillas típicas por OTM ────────────────────────────────
+
+@router.get("/cuadrillas-plantilla")
+async def listar_cuadrillas_plantilla(
+    supervisor_id: str,
+    otm_id: str,
+):
+    """Devuelve las cuadrillas típicas del supervisor para esa OTM."""
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            """SELECT c.trabajador_id, t.nombre, t.cargo,
+                      COALESCE(t.tipo,'DIRECTO') AS tipo,
+                      c.nombre AS plantilla, c.orden
+               FROM cuadrilla_otm c
+               JOIN trabajadores t ON t.id = c.trabajador_id
+               WHERE c.supervisor_id = $1 AND c.otm_id = $2 AND c.activo = TRUE
+               ORDER BY c.nombre, c.orden""",
+            supervisor_id, otm_id
+        )
+        plantillas: dict = {}
+        for r in rows:
+            n = r["plantilla"]
+            if n not in plantillas:
+                plantillas[n] = []
+            plantillas[n].append({
+                "trabajador_id": r["trabajador_id"],
+                "nombre":        r["nombre"],
+                "cargo":         r["cargo"],
+                "tipo":          r["tipo"],
+                "orden":         r["orden"],
+            })
+        return plantillas
+
+
+@router.post("/cuadrillas-plantilla")
+async def guardar_cuadrilla_plantilla(data: dict):
+    """Crea o reemplaza una cuadrilla típica para supervisor+OTM."""
+    supervisor_id = data.get("supervisor_id")
+    otm_id        = data.get("otm_id")
+    nombre        = data.get("nombre", "Principal")
+    trabajadores  = data.get("trabajadores", [])
+
+    if not supervisor_id or not otm_id:
+        raise HTTPException(400, "supervisor_id y otm_id son requeridos")
+
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            await con.execute(
+                "DELETE FROM cuadrilla_otm WHERE supervisor_id=$1 AND otm_id=$2 AND nombre=$3",
+                supervisor_id, otm_id, nombre
+            )
+            for idx, tid in enumerate(trabajadores):
+                await con.execute(
+                    """INSERT INTO cuadrilla_otm
+                         (supervisor_id, otm_id, nombre, trabajador_id, orden)
+                       VALUES ($1,$2,$3,$4,$5)""",
+                    supervisor_id, otm_id, nombre, str(tid), idx
+                )
+    return {"ok": True, "nombre": nombre, "total": len(trabajadores)}
+
+
+# ── Sesiones del día para asignación a partidas ───────────────
+
+@router.get("/sesiones-sin-asignar")
+async def sesiones_sin_asignar(
+    fecha:  Optional[str] = None,
+    otm_id: Optional[str] = None,
+):
+    """Sesiones enviadas del día con detalle de trabajadores y partidas."""
+    pool = await db()
+    async with pool.acquire() as con:
+        if not fecha:
+            from datetime import datetime
+            import pytz
+            lima = pytz.timezone("America/Lima")
+            fecha = datetime.now(lima).date().isoformat()
+
+        conds = ["s.estado = 'enviada'", "s.fecha = $1"]
+        args: list = [fecha]
+        if otm_id:
+            args.append(otm_id)
+            conds.append(f"s.otm_id = ${len(args)}")
+        where = " AND ".join(conds)
+
+        rows = await con.fetch(
+            f"""SELECT s.id AS sesion_id, s.supervisor_id,
+                       sup.nombre AS supervisor,
+                       s.otm_id, s.fecha::text,
+                       s.hh_turno,
+                       COUNT(st.id)  AS n_trabajadores,
+                       s.hh_turno * COUNT(st.id) AS hh_total,
+                       COALESCE(SUM(stp.hh), 0)  AS hh_asignadas
+                FROM sesiones s
+                JOIN supervisores sup ON sup.id = s.supervisor_id
+                LEFT JOIN sesion_trabajadores st  ON st.sesion_id = s.id
+                LEFT JOIN sesion_trabajador_partidas stp ON stp.sesion_id = s.id
+                WHERE {where}
+                GROUP BY s.id, s.supervisor_id, sup.nombre,
+                         s.otm_id, s.fecha, s.hh_turno
+                ORDER BY s.id DESC""",
+            *args
+        )
+
+        result = []
+        for r in rows:
+            hh_total = float(r["hh_total"] or 0)
+            hh_asig  = float(r["hh_asignadas"] or 0)
+
+            # Trabajadores con HH ya asignadas
+            trab_rows = await con.fetch(
+                """SELECT st.trab_id AS trabajador_id,
+                          t.nombre, t.cargo,
+                          COALESCE(t.tipo,'DIRECTO') AS tipo,
+                          COALESCE(st.hh_override, s.hh_turno, 9.5) AS hh_registradas,
+                          COALESCE(SUM(stp.hh), 0) AS hh_asignadas
+                   FROM sesion_trabajadores st
+                   JOIN sesiones s    ON s.id  = st.sesion_id
+                   JOIN trabajadores t ON t.id = st.trab_id
+                   LEFT JOIN sesion_trabajador_partidas stp
+                     ON stp.sesion_id     = st.sesion_id
+                    AND stp.trabajador_id = st.trab_id
+                   WHERE st.sesion_id = $1
+                   GROUP BY st.trab_id, t.nombre, t.cargo, t.tipo,
+                            st.hh_override, s.hh_turno
+                   ORDER BY t.nombre""",
+                r["sesion_id"]
+            )
+
+            # Partidas hoja de la OTM
+            part_rows = await con.fetch(
+                """SELECT id, codigo, descripcion, fase, unidad,
+                          hh_presup, metrado_presup
+                   FROM ev_partidas
+                   WHERE otm_id = $1 AND fase IS NOT NULL AND activo = TRUE
+                   ORDER BY codigo""",
+                r["otm_id"]
+            )
+
+            trabajadores = []
+            for t in trab_rows:
+                hh_reg  = float(t["hh_registradas"] or 9.5)
+                hh_asig_t = float(t["hh_asignadas"] or 0)
+                trabajadores.append({
+                    "trabajador_id": t["trabajador_id"],
+                    "nombre":        t["nombre"],
+                    "cargo":         t["cargo"],
+                    "tipo":          t["tipo"],
+                    "hh_registradas": round(hh_reg, 2),
+                    "hh_asignadas":   round(hh_asig_t, 2),
+                    "hh_pendientes":  round(hh_reg - hh_asig_t, 2),
+                })
+
+            result.append({
+                "sesion_id":   r["sesion_id"],
+                "supervisor":  r["supervisor"],
+                "supervisor_id": r["supervisor_id"],
+                "otm_id":      r["otm_id"],
+                "fecha":       r["fecha"],
+                "hh_turno":    float(r["hh_turno"] or 9.5),
+                "hh_total":    round(hh_total, 2),
+                "hh_asignadas": round(hh_asig, 2),
+                "hh_pendientes": round(hh_total - hh_asig, 2),
+                "trabajadores": trabajadores,
+                "partidas":     [dict(p) for p in part_rows],
+            })
+
+        return result
+
+
+@router.post("/asignar-sesion-partidas")
+async def asignar_sesion_partidas(data: dict):
+    """Guarda la asignación de HH de una sesión → partidas específicas."""
+    sesion_id    = data.get("sesion_id")
+    asignaciones = data.get("asignaciones", [])  # [{trabajador_id, partida_id, hh}]
+
+    if not sesion_id:
+        raise HTTPException(400, "sesion_id es requerido")
+
+    pool = await db()
+    async with pool.acquire() as con:
+        ses = await con.fetchrow(
+            "SELECT id, fecha, supervisor_id, otm_id FROM sesiones WHERE id=$1",
+            sesion_id
+        )
+        if not ses:
+            raise HTTPException(404, "Sesión no encontrada")
+
+        async with con.transaction():
+            # Borrar asignaciones previas
+            await con.execute(
+                "DELETE FROM sesion_trabajador_partidas WHERE sesion_id=$1",
+                sesion_id
+            )
+            for a in asignaciones:
+                hh = float(a.get("hh", 0))
+                if hh <= 0:
+                    continue
+                await con.execute(
+                    """INSERT INTO sesion_trabajador_partidas
+                         (sesion_id, trabajador_id, partida_id, hh,
+                          fecha, supervisor_id, otm_id)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7)""",
+                    sesion_id,
+                    str(a["trabajador_id"]),
+                    a.get("partida_id"),
+                    hh,
+                    ses["fecha"],
+                    ses["supervisor_id"],
+                    ses["otm_id"],
+                )
+
+            # Detectar conflictos de HH duplicadas
+            for a in asignaciones:
+                tid   = str(a["trabajador_id"])
+                total = await con.fetchval(
+                    """SELECT COALESCE(SUM(hh),0)
+                       FROM sesion_trabajador_partidas
+                       WHERE trabajador_id=$1 AND fecha=$2""",
+                    tid, ses["fecha"]
+                )
+                if float(total or 0) > 11:   # umbral razonable
+                    otras = await con.fetch(
+                        """SELECT DISTINCT s.supervisor_id
+                           FROM sesion_trabajador_partidas stp
+                           JOIN sesiones s ON s.id = stp.sesion_id
+                           WHERE stp.trabajador_id=$1 AND stp.fecha=$2
+                             AND stp.sesion_id != $3 LIMIT 1""",
+                        tid, ses["fecha"], sesion_id
+                    )
+                    if otras:
+                        await con.execute(
+                            """INSERT INTO hh_conflictos
+                                 (trabajador_id, fecha,
+                                  supervisor_id_1, supervisor_id_2, hh_1, hh_2)
+                               VALUES ($1,$2,$3,$4,$5,$6)
+                               ON CONFLICT DO NOTHING""",
+                            tid, ses["fecha"],
+                            otras[0]["supervisor_id"], ses["supervisor_id"],
+                            9.5, float(total or 0) - 9.5
+                        )
+
+    return {"ok": True, "sesion_id": sesion_id, "asignados": len(asignaciones)}
+
+
+# ── Validación HH duplicadas ──────────────────────────────────
+
+@router.get("/hh-trabajador-dia")
+async def hh_trabajador_dia(trabajador_id: str, fecha: str):
+    """HH registradas para un trabajador en un día específico."""
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            """SELECT s.id AS sesion_id, s.supervisor_id,
+                      sup.nombre AS supervisor,
+                      s.otm_id, stp.partida_id, p.codigo, p.descripcion,
+                      stp.hh
+               FROM sesion_trabajador_partidas stp
+               JOIN sesiones s    ON s.id  = stp.sesion_id
+               JOIN supervisores sup ON sup.id = s.supervisor_id
+               LEFT JOIN ev_partidas p ON p.id = stp.partida_id
+               WHERE stp.trabajador_id=$1 AND stp.fecha=$2::date
+               ORDER BY s.id""",
+            trabajador_id, fecha
+        )
+        total = sum(float(r["hh"] or 0) for r in rows)
+        return {
+            "trabajador_id": trabajador_id,
+            "fecha":  fecha,
+            "hh_total": round(total, 2),
+            "alerta": total > 11,
+            "detalle": [dict(r) for r in rows],
+        }
+
+
+# ── Carga histórica manual ────────────────────────────────────
+
+@router.post("/historico/cargar")
+async def cargar_historico(data: dict):
+    """
+    Carga acumulados históricos de HH y cantidades para una OTM/semana.
+    Popula ev_hh_gastadas (fuente='historico') y ev_avances (hito principal).
+    """
+    otm_id = data.get("otm_id")
+    semana = data.get("semana")
+    filas  = data.get("filas", [])   # [{partida_id, hh_gastadas_acum, cantidad_ejecutada_acum}]
+
+    if not otm_id or not semana:
+        raise HTTPException(400, "otm_id y semana son requeridos")
+
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            for fila in filas:
+                pid  = fila["partida_id"]
+                hh   = float(fila.get("hh_gastadas_acum", 0))
+                cant = float(fila.get("cantidad_ejecutada_acum", 0))
+
+                # ev_historico_carga (trazabilidad)
+                await con.execute(
+                    """INSERT INTO ev_historico_carga
+                         (otm_id, partida_id, semana,
+                          hh_gastadas_acum, cantidad_ejecutada_acum)
+                       VALUES ($1,$2,$3,$4,$5)
+                       ON CONFLICT (otm_id, partida_id, semana)
+                       DO UPDATE SET
+                         hh_gastadas_acum        = EXCLUDED.hh_gastadas_acum,
+                         cantidad_ejecutada_acum = EXCLUDED.cantidad_ejecutada_acum,
+                         fecha_carga             = NOW()""",
+                    otm_id, pid, semana, hh, cant
+                )
+
+                # ev_hh_gastadas (fuente='historico' — puede ser sobreescrito por manual)
+                await con.execute(
+                    """INSERT INTO ev_hh_gastadas (partida_id, semana, hh, fuente)
+                       VALUES ($1,$2,$3,'historico')
+                       ON CONFLICT (partida_id, semana)
+                       DO UPDATE SET hh=$3, fuente='historico'
+                       WHERE ev_hh_gastadas.fuente NOT IN ('manual')""",
+                    pid, semana, hh
+                )
+
+                # ev_avances con el hito principal (para cálculo de % avance)
+                hito = await con.fetchrow(
+                    """SELECT id FROM ev_hitos
+                       WHERE partida_id=$1
+                       ORDER BY peso DESC NULLS LAST, id
+                       LIMIT 1""",
+                    pid
+                )
+                if hito and cant > 0:
+                    await con.execute(
+                        """INSERT INTO ev_avances (hito_id, semana, cantidad_acum)
+                           VALUES ($1,$2,$3)
+                           ON CONFLICT (hito_id, semana)
+                           DO UPDATE SET cantidad_acum=$3""",
+                        hito["id"], semana, cant
+                    )
+
+    return {"ok": True, "otm_id": otm_id, "semana": semana, "partidas": len(filas)}
+
+
+@router.get("/historico/lista")
+async def listar_historico(otm_id: str, semana: int):
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            """SELECT h.*, p.codigo, p.descripcion, p.fase, p.unidad
+               FROM ev_historico_carga h
+               JOIN ev_partidas p ON p.id = h.partida_id
+               WHERE h.otm_id=$1 AND h.semana=$2
+               ORDER BY p.codigo""",
+            otm_id, semana
+        )
+        return [dict(r) for r in rows]
+
+
+# ── Conflictos HH duplicadas ──────────────────────────────────
+
+@router.get("/conflictos")
+async def listar_conflictos(
+    estado: Optional[str] = None,
+    fecha:  Optional[str] = None,
+):
+    pool = await db()
+    async with pool.acquire() as con:
+        conds, args = ["1=1"], []
+        if estado:
+            args.append(estado);  conds.append(f"c.estado = ${len(args)}")
+        if fecha:
+            args.append(fecha);   conds.append(f"c.fecha  = ${len(args)}::date")
+        where = " AND ".join(conds)
+        rows = await con.fetch(
+            f"""SELECT c.*,
+                       t.nombre   AS trabajador_nombre,
+                       s1.nombre  AS sup1_nombre,
+                       s2.nombre  AS sup2_nombre
+                FROM hh_conflictos c
+                JOIN trabajadores t   ON t.id  = c.trabajador_id
+                LEFT JOIN supervisores s1 ON s1.id = c.supervisor_id_1
+                LEFT JOIN supervisores s2 ON s2.id = c.supervisor_id_2
+                WHERE {where}
+                ORDER BY c.fecha DESC, c.created_at DESC""",
+            *args
+        )
+        return [dict(r) for r in rows]
+
+
+@router.post("/conflictos/resolver")
+async def resolver_conflicto(data: dict):
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            """UPDATE hh_conflictos
+               SET estado='RESUELTO', resolucion=$1, notas=$2
+               WHERE id=$3""",
+            data.get("resolucion"), data.get("notas"), data.get("conflicto_id")
+        )
+    return {"ok": True}
