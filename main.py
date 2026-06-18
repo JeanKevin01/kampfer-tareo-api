@@ -785,11 +785,10 @@ async def enviar_con_partidas(data: dict):
     )
     hh_dia = float(jornada["hh_dia"]) if jornada else 9.5
 
-    cfg = await database.fetch_one("SELECT fecha_base FROM ev_config WHERE id = 1")
+    row_cfg = await database.fetch_one("SELECT valor FROM ev_config WHERE clave = :k", {"k": "fecha_base"})
     semana = 1
-    if cfg and cfg["fecha_base"]:
-        base = cfg["fecha_base"]
-        base = base if hasattr(base, "toordinal") else date.fromisoformat(str(base))
+    if row_cfg and row_cfg["valor"]:
+        base = date.fromisoformat(str(row_cfg["valor"]))
         semana = max(1, (fecha_obj - base).days // 7 + 1)
 
     hora = hora_lima()
@@ -877,11 +876,10 @@ async def cambio_partida_dia(data: dict):
     if not trabajador_ids or not partida_id:
         raise HTTPException(400, "trabajador_ids y partida_id son requeridos")
 
-    cfg = await database.fetch_one("SELECT fecha_base FROM ev_config WHERE id = 1")
+    row_cfg2 = await database.fetch_one("SELECT valor FROM ev_config WHERE clave = :k", {"k": "fecha_base"})
     semana = 1
-    if cfg and cfg["fecha_base"]:
-        base = cfg["fecha_base"]
-        base = base if hasattr(base, "toordinal") else date.fromisoformat(str(base))
+    if row_cfg2 and row_cfg2["valor"]:
+        base = date.fromisoformat(str(row_cfg2["valor"]))
         semana = max(1, (date.fromisoformat(fecha_str) - base).days // 7 + 1)
 
     creados = 0
