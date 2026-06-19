@@ -224,12 +224,16 @@ async def listar_partidas(otm: Optional[str] = None):
 
 @router.get("/otms")
 async def listar_otms_ev():
-    """OTMs que tienen partidas en el módulo EV."""
+    """TODAS las OTMs registradas, con su cantidad de partidas en el módulo EV (0 si aún no tiene)."""
     pool = await db()
     async with pool.acquire() as con:
         rows = await con.fetch(
-            """SELECT COALESCE(otm_id,'SIN OTM') AS otm_id, COUNT(*) AS partidas
-               FROM ev_partidas WHERE activo GROUP BY otm_id ORDER BY otm_id"""
+            """SELECT o.id AS otm_id, o.descripcion, o.estado,
+                      COUNT(p.id) FILTER (WHERE p.activo) AS partidas
+               FROM otms o
+               LEFT JOIN ev_partidas p ON p.otm_id = o.id
+               GROUP BY o.id, o.descripcion, o.estado
+               ORDER BY o.id"""
         )
     return [dict(r) for r in rows]
 
