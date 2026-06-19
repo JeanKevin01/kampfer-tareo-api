@@ -797,7 +797,25 @@ async def editar_trabajador(trab_id: str, data: dict):
 
 @app.get("/api/partidas-otm/{otm_id}")
 async def get_partidas_otm(otm_id: str):
-    """Devuelve las partidas hoja (con fase asignada) de una OTM."""
+    """Devuelve el árbol completo (nodos padre + hojas) de una OTM, para que
+    la app muestre la jerarquía con color, pero solo las hojas (fase != null)
+    son seleccionables para registrar tareo."""
+    rows = await database.fetch_all(
+        """SELECT p.id, p.codigo, p.descripcion, p.fase, p.sub_fase,
+                  p.unidad, p.hh_presup, p.metrado_presup,
+                  p.nivel, p.parent_codigo,
+                  (p.fase IS NOT NULL) AS es_hoja
+           FROM ev_partidas p
+           WHERE p.otm_id = :otm AND p.activo = true
+           ORDER BY p.codigo""",
+        {"otm": otm_id}
+    )
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/partidas-otm/{otm_id}/hojas")
+async def get_partidas_otm_hojas(otm_id: str):
+    """Solo las partidas hoja — compat con clientes que no necesitan el árbol."""
     rows = await database.fetch_all(
         """SELECT p.id, p.codigo, p.descripcion, p.fase, p.sub_fase,
                   p.unidad, p.hh_presup, p.metrado_presup
