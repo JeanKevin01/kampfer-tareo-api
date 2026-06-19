@@ -152,6 +152,65 @@ async def get_supervisores():
     )
     return [dict(r) for r in rows]
 
+
+# ── ADMIN: SUPERVISORES (CRUD) ────────────────────────────────
+@app.get("/admin/supervisores")
+async def listar_supervisores_admin():
+    rows = await database.fetch_all(
+        "SELECT id, nombre, email, activo FROM supervisores ORDER BY CAST(id AS INTEGER)"
+    )
+    return [dict(r) for r in rows]
+
+
+@app.post("/admin/supervisor")
+async def crear_supervisor(data: dict):
+    nombre = data.get("nombre", "").strip().upper()
+    email  = data.get("email",  "").strip()
+
+    if not nombre:
+        raise HTTPException(400, "Nombre es requerido")
+
+    row = await database.fetch_one(
+        "SELECT MAX(CAST(id AS INTEGER)) as max_id FROM supervisores"
+    )
+    next_id = str((row["max_id"] or 0) + 1).zfill(2)
+
+    await database.execute(
+        "INSERT INTO supervisores (id, nombre, email, activo) "
+        "VALUES (:id, :nombre, :email, true)",
+        {"id": next_id, "nombre": nombre, "email": email}
+    )
+    return {"status": "ok", "id": next_id, "nombre": nombre}
+
+
+@app.put("/admin/supervisor/{sup_id}")
+async def editar_supervisor(sup_id: str, data: dict):
+    row = await database.fetch_one(
+        "SELECT id FROM supervisores WHERE id = :id", {"id": sup_id}
+    )
+    if not row:
+        raise HTTPException(404, "Supervisor no encontrado")
+    await database.execute(
+        "UPDATE supervisores SET nombre = :nombre, email = :email WHERE id = :id",
+        {
+            "id": sup_id,
+            "nombre": data.get("nombre", "").upper().strip(),
+            "email":  data.get("email", "").strip(),
+        }
+    )
+    updated = await database.fetch_one(
+        "SELECT id, nombre, email FROM supervisores WHERE id = :id", {"id": sup_id}
+    )
+    return dict(updated)
+
+
+@app.put("/admin/supervisor/{sup_id}/baja")
+async def dar_baja_supervisor(sup_id: str):
+    await database.execute(
+        "UPDATE supervisores SET activo = false WHERE id = :id", {"id": sup_id}
+    )
+    return {"status": "ok"}
+
 # ── OTMs ─────────────────────────────────────────────────────
 @app.get("/api/otms")
 async def get_otms(activas: bool = False):
@@ -546,9 +605,13 @@ async def crear_trabajador(data: dict):
     nombre = data.get("nombre", "").strip().upper()
     cargo  = data.get("cargo",  "").strip().upper()
     dni    = data.get("dni",    "").strip()
+    tipo   = data.get("tipo",   "").strip().upper()
 
     if not nombre or not cargo:
         raise HTTPException(400, "Nombre y cargo son requeridos")
+
+    if tipo not in ("DIRECTO", "INDIRECTO"):
+        tipo = "DIRECTO"
 
     row = await database.fetch_one(
         "SELECT MAX(CAST(id AS INTEGER)) as max_id FROM trabajadores"
@@ -556,16 +619,18 @@ async def crear_trabajador(data: dict):
     next_id = str((row["max_id"] or 0) + 1).zfill(3)
 
     await database.execute(
-        "INSERT INTO trabajadores (id, nombre, cargo, dni) VALUES (:id, :nombre, :cargo, :dni)",
-        {"id": next_id, "nombre": nombre, "cargo": cargo, "dni": dni}
+        "INSERT INTO trabajadores (id, nombre, cargo, dni, tipo) "
+        "VALUES (:id, :nombre, :cargo, :dni, :tipo)",
+        {"id": next_id, "nombre": nombre, "cargo": cargo, "dni": dni, "tipo": tipo}
     )
-    return {"status": "ok", "id": next_id, "nombre": nombre, "cargo": cargo}
+    return {"status": "ok", "id": next_id, "nombre": nombre, "cargo": cargo, "tipo": tipo}
 
 # ── ADMIN: LISTAR TRABAJADORES ────────────────────────────────
 @app.get("/admin/trabajadores")
 async def listar_trabajadores():
     rows = await database.fetch_all(
-        "SELECT id, nombre, cargo, activo FROM trabajadores ORDER BY CAST(id AS INTEGER)"
+        "SELECT id, nombre, cargo, dni, COALESCE(tipo,'DIRECTO') AS tipo, activo "
+        "FROM trabajadores ORDER BY CAST(id AS INTEGER)"
     )
     return [dict(r) for r in rows]
 
@@ -602,6 +667,50 @@ async def crear_otm(data: dict):
     )
     return {"status": "ok", "id": otm_id}
 
+
+@app.post("/admin/otms/bulk")
+async def crear_otms_bulk(data: dict):
+    """Importación masiva de OTMs — recibe {otms: [{id,descripcion,area,estado,sdp,centro_costo}]}"""
+    otms = data.get("otms", [])
+    if not otms:
+        raise HTTPException(400, "Lista de OTMs vacía")
+
+    ESTADOS_VALIDOS = ["EJECUCION", "POR INICIAR", "CERRADO", "CONCLUIDO", "STAND BY"]
+    creadas, errores = [], []
+
+    for o in otms:
+        otm_id      = str(o.get("id", "")).strip().upper()
+        descripcion = str(o.get("descripcion", "")).strip().upper()
+        area        = str(o.get("area", "")).strip()
+        estado      = str(o.get("estado", "POR INICIAR")).strip().upper()
+        sdp         = str(o.get("sdp", "")).strip()
+        cc          = str(o.get("centro_costo", "")).strip()
+
+        if not otm_id or not descripcion:
+            errores.append({"id": otm_id or "—", "error": "ID o descripción vacíos"})
+            continue
+        if estado not in ESTADOS_VALIDOS:
+            estado = "POR INICIAR"
+
+        try:
+            await database.execute(
+                """INSERT INTO otms (id, sdp, descripcion, centro_costo, area, estado)
+                   VALUES (:id, :sdp, :desc, :cc, :area, :estado)
+                   ON CONFLICT (id) DO UPDATE SET
+                     descripcion = EXCLUDED.descripcion,
+                     area = EXCLUDED.area,
+                     estado = EXCLUDED.estado,
+                     sdp = EXCLUDED.sdp,
+                     centro_costo = EXCLUDED.centro_costo""",
+                {"id": otm_id, "sdp": sdp, "desc": descripcion, "cc": cc,
+                 "area": area, "estado": estado}
+            )
+            creadas.append(otm_id)
+        except Exception as e:
+            errores.append({"id": otm_id, "error": str(e)})
+
+    return {"status": "ok", "creadas": len(creadas), "errores": errores}
+
 # ── ADMIN: CAMBIAR ESTADO OTM ─────────────────────────────────
 @app.put("/admin/otm/{otm_id}/estado")
 async def actualizar_estado_otm(otm_id: str, data: dict):
@@ -624,17 +733,23 @@ async def editar_trabajador(trab_id: str, data: dict):
     )
     if not row:
         raise HTTPException(status_code=404, detail="Trabajador no encontrado")
+    tipo = data.get("tipo", "").strip().upper()
+    if tipo not in ("DIRECTO", "INDIRECTO"):
+        tipo = None
     await database.execute(
-        "UPDATE trabajadores SET nombre = :nombre, cargo = :cargo, dni = :dni WHERE id = :id",
+        "UPDATE trabajadores SET nombre = :nombre, cargo = :cargo, dni = :dni"
+        + (", tipo = :tipo" if tipo else "") +
+        " WHERE id = :id",
         {
             "id":     trab_id,
             "nombre": data.get("nombre", "").upper().strip(),
             "cargo":  data.get("cargo",  "").upper().strip(),
             "dni":    data.get("dni",    ""),
+            **({"tipo": tipo} if tipo else {}),
         }
     )
     updated = await database.fetch_one(
-        "SELECT id, nombre, cargo, dni FROM trabajadores WHERE id = :id",
+        "SELECT id, nombre, cargo, dni, COALESCE(tipo,'DIRECTO') AS tipo FROM trabajadores WHERE id = :id",
         {"id": trab_id}
     )
     return dict(updated)
