@@ -20,7 +20,7 @@
 import os
 import json
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 from typing import Optional
 
 import asyncpg
@@ -28,6 +28,11 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/ev", tags=["valor-ganado"])
+
+# Zona horaria de Perú (UTC-5) — sin dependencias externas (no usar pytz)
+LIMA = timezone(timedelta(hours=-5))
+def _hoy_lima() -> date:
+    return datetime.now(LIMA).date()
 
 _pool: Optional[asyncpg.Pool] = None
 
@@ -893,7 +898,7 @@ async def distribuir_hh(body: dict):
     Body: {otm_id, fecha, distribuciones: [{partida_id, hh}]}
     """
     otm_id       = str(body.get("otm_id", "")).strip()
-    fecha_str    = str(body.get("fecha", fecha_lima().isoformat()))
+    fecha_str    = str(body.get("fecha", _hoy_lima().isoformat()))
     distribs     = body.get("distribuciones", [])
     if not otm_id or not distribs:
         raise HTTPException(400, "otm_id y distribuciones son requeridos")
@@ -1407,15 +1412,20 @@ async def rendimiento_trabajador(
             *args
         )
 
-        # Cant ejecutada acumulada por partida en el mismo rango de fechas
+        # Cant ejecutada acumulada por partida en el mismo rango de fechas.
+        # OJO: se deduplica (partida, fecha) ANTES de unir con ev_avances_diarios;
+        # de lo contrario la cantidad del día se multiplicaría por cada trabajador.
         cant_rows = await con.fetch(
-            f"""SELECT tp.partida_id,
+            f"""SELECT d.partida_id,
                        SUM(COALESCE(ad.cantidad_dia, 0)) AS cant_acum
-                FROM tareo_partida tp
+                FROM (
+                    SELECT DISTINCT tp.partida_id, tp.fecha
+                    FROM tareo_partida tp
+                    WHERE {where}
+                ) d
                 LEFT JOIN ev_avances_diarios ad
-                  ON ad.partida_id = tp.partida_id AND ad.fecha = tp.fecha
-                WHERE {where}
-                GROUP BY tp.partida_id""",
+                  ON ad.partida_id = d.partida_id AND ad.fecha = d.fecha
+                GROUP BY d.partida_id""",
             *args
         )
         cant_by_pid = {r["partida_id"]: float(r["cant_acum"] or 0)
@@ -1491,17 +1501,22 @@ async def rendimiento_cuadrillas(
             *args
         )
 
-        # Cant ejecutada por (supervisor, partida, semana-rango)
+        # Cant ejecutada por (supervisor, partida) en el rango.
+        # Se deduplica (supervisor, partida, fecha) ANTES de unir con
+        # ev_avances_diarios para no multiplicar la cantidad del día por el
+        # número de trabajadores de la cuadrilla.
         cant_args = list(args)
-        cant_conds = list(conds)
         cant_rows = await con.fetch(
-            f"""SELECT tp.supervisor_id, tp.partida_id,
+            f"""SELECT d.supervisor_id, d.partida_id,
                        SUM(COALESCE(ad.cantidad_dia, 0)) AS cant_acum
-                FROM tareo_partida tp
+                FROM (
+                    SELECT DISTINCT tp.supervisor_id, tp.partida_id, tp.fecha
+                    FROM tareo_partida tp
+                    WHERE {where}
+                ) d
                 LEFT JOIN ev_avances_diarios ad
-                  ON ad.partida_id = tp.partida_id AND ad.fecha = tp.fecha
-                WHERE {where}
-                GROUP BY tp.supervisor_id, tp.partida_id""",
+                  ON ad.partida_id = d.partida_id AND ad.fecha = d.fecha
+                GROUP BY d.supervisor_id, d.partida_id""",
             *cant_args
         )
         cant_map = {(r["supervisor_id"], r["partida_id"]): float(r["cant_acum"] or 0)
@@ -1615,10 +1630,7 @@ async def sesiones_sin_asignar(
     pool = await db()
     async with pool.acquire() as con:
         if not fecha:
-            from datetime import datetime
-            import pytz
-            lima = pytz.timezone("America/Lima")
-            fecha = datetime.now(lima).date().isoformat()
+            fecha = _hoy_lima().isoformat()
 
         conds = ["s.estado = 'enviada'", "s.fecha = $1"]
         args: list = [fecha]
