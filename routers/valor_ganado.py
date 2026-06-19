@@ -924,83 +924,88 @@ async def distribuir_hh(body: dict):
 async def isp_reporte(otm: Optional[str] = None):
     """ISP completo estilo Fluor: ResPorSubFase + Productividades + Resumen.
     Devuelve datos por partida × semana para el periodo completo del proyecto."""
-    pool = await db()
-    async with pool.acquire() as con:
-        base = await _fecha_base(con)
-        if not base:
-            return {"semanas": [], "partidas": []}
-        today = date.today()
-        total = max(_semana_de(today, base), 1)
+    try:
+        pool = await db()
+        async with pool.acquire() as con:
+            base = await _fecha_base(con)
+            if not base:
+                return {"semanas": [], "partidas": []}
+            today = date.today()
+            total = max(_semana_de(today, base), 1)
 
-        if otm:
-            partidas = await con.fetch(
-                "SELECT * FROM ev_partidas WHERE activo AND otm_id=$1 ORDER BY codigo", otm
-            )
-        else:
-            partidas = await con.fetch(
-                "SELECT * FROM ev_partidas WHERE activo ORDER BY codigo"
-            )
-        hitos   = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
-        avances = await con.fetch("SELECT * FROM ev_avances ORDER BY semana")
-        hh_rows = await con.fetch("SELECT * FROM ev_hh_gastadas ORDER BY semana")
-        tareo   = await _hh_tareo_por_semana(con)
+            if otm:
+                partidas = await con.fetch(
+                    "SELECT * FROM ev_partidas WHERE activo AND otm_id=$1 ORDER BY codigo", otm
+                )
+            else:
+                partidas = await con.fetch(
+                    "SELECT * FROM ev_partidas WHERE activo ORDER BY codigo"
+                )
+            hitos   = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
+            avances = await con.fetch("SELECT * FROM ev_avances ORDER BY semana")
+            hh_rows = await con.fetch("SELECT * FROM ev_hh_gastadas ORDER BY semana")
+            tareo   = await _hh_tareo_por_semana(con)
 
-    # Calcular EV para cada semana (una llamada por semana, datos cargados en memoria)
-    result_por_partida: dict = {}
-    for p in partidas:
-        pid = p["id"]
-        mp  = float(p["metrado_proyec"] or p["metrado_presup"] or 0)
-        hp  = float(p["hh_presup"] or 0)
-        fc  = round(hp / mp, 4) if mp > 0 else 0.0
-        result_por_partida[pid] = {
-            "partida_id":   pid,
-            "codigo":       p["codigo"],
-            "otm_id":       p["otm_id"],
-            "descripcion":  p["descripcion"],
-            "unidad":       p["unidad"],
-            "fase":         p["fase"],
-            "hh_presup":    hp,
-            "metrado_presup": float(p["metrado_presup"] or 0),
-            "metrado_proyec": mp,
-            "factor_conv":  fc,
-            "es_hoja":      p["fase"] is not None,
-            "semanas":      {},
-        }
+        # Calcular EV para cada semana (una llamada por semana, datos cargados en memoria)
+        result_por_partida: dict = {}
+        for p in partidas:
+            pid = p["id"]
+            mp  = float(p["metrado_proyec"] or p["metrado_presup"] or 0)
+            hp  = float(p["hh_presup"] or 0)
+            fc  = round(hp / mp, 4) if mp > 0 else 0.0
+            result_por_partida[pid] = {
+                "partida_id":   pid,
+                "codigo":       p["codigo"],
+                "otm_id":       p["otm_id"],
+                "descripcion":  p["descripcion"],
+                "unidad":       p["unidad"],
+                "fase":         p["fase"],
+                "hh_presup":    hp,
+                "metrado_presup": float(p["metrado_presup"] or 0),
+                "metrado_proyec": mp,
+                "factor_conv":  fc,
+                "es_hoja":      p["fase"] is not None,
+                "semanas":      {},
+            }
 
-    for s in range(1, total + 1):
-        filas = _calcular(list(partidas), list(hitos), list(avances), list(hh_rows), tareo, s)
-        for f in filas:
-            pid = f["partida_id"]
-            if pid in result_por_partida:
-                result_por_partida[pid]["semanas"][s] = {
-                    "hh_gan_acum":  round(f["hh_ganadas_acum"],   2),
-                    "hh_gan_sem":   round(f["hh_ganadas_sem"],    2),
-                    "hh_gast_acum": round(f["hh_gastadas_acum"],  2),
-                    "hh_gast_sem":  round(f["hh_gastadas_sem"],   2),
-                    "pf_acum":      round(f["pf_acum"],           4),
-                    "pf_sem":       round(f["pf_sem"],            4),
-                    "pct_avance":   round(f["pct_avance"],        4),
-                    "cant_acum":    round(
-                        f["hh_ganadas_acum"] / (result_por_partida[pid]["factor_conv"] or 1), 2
-                    ) if result_por_partida[pid]["factor_conv"] > 0 else 0,
-                }
+        for s in range(1, total + 1):
+            filas = _calcular(list(partidas), list(hitos), list(avances), list(hh_rows), tareo, s)
+            for f in filas:
+                pid = f["partida_id"]
+                if pid in result_por_partida:
+                    result_por_partida[pid]["semanas"][s] = {
+                        "hh_gan_acum":  round(f["hh_ganadas_acum"],   2),
+                        "hh_gan_sem":   round(f["hh_ganadas_sem"],    2),
+                        "hh_gast_acum": round(f["hh_gastadas_acum"],  2),
+                        "hh_gast_sem":  round(f["hh_gastadas_sem"],   2),
+                        "pf_acum":      round(f["pf_acum"],           4),
+                        "pf_sem":       round(f["pf_sem"],            4),
+                        "pct_avance":   round(f["pct_avance"],        4),
+                        "cant_acum":    round(
+                            f["hh_ganadas_acum"] / (result_por_partida[pid]["factor_conv"] or 1), 2
+                        ) if result_por_partida[pid]["factor_conv"] > 0 else 0,
+                    }
 
-    # Semanas con labels
-    MESES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
-    def fmt(d: date) -> str: return f"{d.day} {MESES[d.month-1]}"
-    semanas_out = []
-    for n in range(1, total + 1):
-        lunes  = base + timedelta(weeks=n-1)
-        domingo = lunes + timedelta(days=6)
-        semanas_out.append({
-            "semana": n,
-            "label": f"Sem {n}",
-            "inicio": lunes.isoformat(),
-            "fin": domingo.isoformat(),
-            "label_full": f"Sem {n} · {fmt(lunes)}–{fmt(domingo)}",
-        })
+        # Semanas con labels
+        MESES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
+        def fmt(d: date) -> str: return f"{d.day} {MESES[d.month-1]}"
+        semanas_out = []
+        for n in range(1, total + 1):
+            lunes  = base + timedelta(weeks=n-1)
+            domingo = lunes + timedelta(days=6)
+            semanas_out.append({
+                "semana": n,
+                "label": f"Sem {n}",
+                "inicio": lunes.isoformat(),
+                "fin": domingo.isoformat(),
+                "label_full": f"Sem {n} · {fmt(lunes)}–{fmt(domingo)}",
+            })
 
-    return {"semanas": semanas_out, "partidas": list(result_por_partida.values())}
+        return {"semanas": semanas_out, "partidas": list(result_por_partida.values())}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error calculando ISP: {e}")
 
 
 @router.get("/reporte")
@@ -1102,159 +1107,163 @@ async def semana_grid(
     Incluye HH reales (tareo_partida), HH estimadas (registros histórico)
     y cant_ejecutada (ev_avances_diarios).
     """
-    pool = await db()
-    async with pool.acquire() as con:
-        # ── Fechas del período ───────────────────────────────
-        if lunes:
-            lunes_date = date.fromisoformat(lunes)
-        else:
-            cfg = await con.fetchrow(
-                "SELECT fecha_base FROM ev_config ORDER BY id LIMIT 1"
+    try:
+        pool = await db()
+        async with pool.acquire() as con:
+            # ── Fechas del período ───────────────────────────────
+            if lunes:
+                lunes_date = date.fromisoformat(lunes)
+            else:
+                base = await _fecha_base(con)
+                if not base:
+                    raise HTTPException(
+                        400,
+                        "Fecha base no configurada. Ve a Configuración en el panel, "
+                        "o pasa ?lunes=YYYY-MM-DD como parámetro."
+                    )
+                lunes_date = base + timedelta(weeks=semana - 1)
+
+            domingo_date = lunes_date + timedelta(days=6)
+            fechas = [lunes_date + timedelta(days=i) for i in range(7)]
+            fechas_str = [f.isoformat() for f in fechas]
+
+            # ── Partidas hoja de la OTM ──────────────────────────
+            q = """
+                SELECT p.id, p.codigo, p.descripcion, p.fase, p.sub_fase,
+                       p.unidad, p.hh_presup, p.metrado_presup,
+                       CASE WHEN p.metrado_presup > 0
+                            THEN p.hh_presup / p.metrado_presup
+                            ELSE 0 END AS factor_conv
+                FROM ev_partidas p
+                WHERE p.activo = true AND p.fase IS NOT NULL
+            """
+            args: list = []
+            if otm:
+                args.append(otm)
+                q += f" AND p.otm_id = ${len(args)}"
+            q += " ORDER BY p.codigo"
+
+            partidas = await con.fetch(q, *args)
+            if not partidas:
+                return {
+                    "semana":   semana,
+                    "otm":      otm,
+                    "lunes":    lunes_date.isoformat(),
+                    "fechas":   fechas_str,
+                    "partidas": [],
+                }
+
+            p_ids         = [p["id"] for p in partidas]
+            total_hh_pres = sum(float(p["hh_presup"] or 0) for p in partidas)
+
+            # ── HH exactas: tareo_partida (nuevo flujo) ──────────
+            hh_rows = await con.fetch(
+                """SELECT partida_id, fecha::text AS f, SUM(hh) AS hh_total
+                   FROM tareo_partida
+                   WHERE partida_id = ANY($1)
+                     AND fecha >= $2::date AND fecha <= $3::date
+                     AND hh IS NOT NULL
+                   GROUP BY partida_id, fecha""",
+                p_ids,
+                lunes_date.isoformat(),
+                domingo_date.isoformat(),
             )
-            if not cfg or not cfg["fecha_base"]:
-                raise HTTPException(
-                    400,
-                    "Fecha base no configurada. Pasa ?lunes=YYYY-MM-DD como parámetro."
+            hh_map = {
+                (r["partida_id"], r["f"]): float(r["hh_total"] or 0)
+                for r in hh_rows
+            }
+
+            # ── HH estimadas: registros histórico (fallback) ─────
+            # Total HH del OTM por día (tareo viejo, sin asignación a partida)
+            fallback_by_date: dict = {}
+            if otm and total_hh_pres > 0:
+                fb = await con.fetch(
+                    """SELECT fecha::text AS f, SUM(hh) AS hh_dia
+                       FROM registros
+                       WHERE otm_id = $1
+                         AND fecha >= $2::date AND fecha <= $3::date
+                         AND hh IS NOT NULL AND hh > 0
+                       GROUP BY fecha""",
+                    otm,
+                    lunes_date.isoformat(),
+                    domingo_date.isoformat(),
                 )
-            lunes_date = cfg["fecha_base"] + timedelta(weeks=semana - 1)
+                fallback_by_date = {r["f"]: float(r["hh_dia"] or 0) for r in fb}
 
-        domingo_date = lunes_date + timedelta(days=6)
-        fechas = [lunes_date + timedelta(days=i) for i in range(7)]
-        fechas_str = [f.isoformat() for f in fechas]
+            # ── Avances diarios (cant_ejecutada) ─────────────────
+            cant_rows = await con.fetch(
+                """SELECT partida_id, fecha::text AS f, cantidad_dia
+                   FROM ev_avances_diarios
+                   WHERE partida_id = ANY($1)
+                     AND fecha >= $2::date AND fecha <= $3::date""",
+                p_ids,
+                lunes_date.isoformat(),
+                domingo_date.isoformat(),
+            )
+            cant_map   = {(r["partida_id"], r["f"]): float(r["cantidad_dia"] or 0) for r in cant_rows}
+            cant_exist = {(r["partida_id"], r["f"]) for r in cant_rows}
 
-        # ── Partidas hoja de la OTM ──────────────────────────
-        q = """
-            SELECT p.id, p.codigo, p.descripcion, p.fase, p.sub_fase,
-                   p.unidad, p.hh_presup, p.metrado_presup,
-                   CASE WHEN p.metrado_presup > 0
-                        THEN p.hh_presup / p.metrado_presup
-                        ELSE 0 END AS factor_conv
-            FROM ev_partidas p
-            WHERE p.activo = true AND p.fase IS NOT NULL
-        """
-        args: list = []
-        if otm:
-            args.append(otm)
-            q += f" AND p.otm_id = ${len(args)}"
-        q += " ORDER BY p.codigo"
+            # ── Construir resultado ───────────────────────────────
+            result = []
+            for p in partidas:
+                pid    = p["id"]
+                factor = float(p["factor_conv"] or 0)
+                hh_p   = float(p["hh_presup"]  or 0)
+                dias   = {}
 
-        partidas = await con.fetch(q, *args)
-        if not partidas:
+                for fecha in fechas:
+                    fs  = fecha.isoformat()
+                    key = (pid, fs)
+
+                    # HH real (nuevo tareo)
+                    hh_real = hh_map.get(key, 0)
+
+                    # HH estimada (tareo viejo proporcional)
+                    hh_est = 0.0
+                    if hh_real == 0 and hh_p > 0 and total_hh_pres > 0:
+                        hh_dia_otm = fallback_by_date.get(fs, 0)
+                        if hh_dia_otm > 0:
+                            hh_est = round(hh_p / total_hh_pres * hh_dia_otm, 2)
+
+                    # Cant ejecutada
+                    cant       = cant_map.get(key, None) if key in cant_exist else None
+                    hh_activa  = hh_real if hh_real > 0 else hh_est
+                    hh_ganadas = round(cant * factor, 4) if cant is not None and factor > 0 else None
+                    pf         = round(hh_ganadas / hh_activa, 3) if hh_ganadas and hh_activa > 0 else None
+
+                    if hh_real > 0 or hh_est > 0 or key in cant_exist:
+                        dias[fs] = {
+                            "hh_gastadas":    round(hh_real, 2),   # nuevo tareo (exacto)
+                            "hh_estimada":    hh_est,               # tareo viejo (proporcional)
+                            "cant_ejecutada": cant,                  # None = no ingresada aún
+                            "hh_ganadas":     hh_ganadas,
+                            "pf":             pf,
+                        }
+
+                result.append({
+                    "id":             pid,
+                    "codigo":         p["codigo"],
+                    "descripcion":    p["descripcion"],
+                    "fase":           p["fase"],
+                    "sub_fase":       p["sub_fase"],
+                    "unidad":         p["unidad"],
+                    "factor_conv":    round(factor, 4),
+                    "hh_presup":      float(p["hh_presup"]      or 0),
+                    "metrado_presup": float(p["metrado_presup"] or 0),
+                    "dias":           dias,
+                })
+
             return {
                 "semana":   semana,
                 "otm":      otm,
                 "lunes":    lunes_date.isoformat(),
                 "fechas":   fechas_str,
-                "partidas": [],
+                "partidas": result,
             }
-
-        p_ids         = [p["id"] for p in partidas]
-        total_hh_pres = sum(float(p["hh_presup"] or 0) for p in partidas)
-
-        # ── HH exactas: tareo_partida (nuevo flujo) ──────────
-        hh_rows = await con.fetch(
-            """SELECT partida_id, fecha::text AS f, SUM(hh) AS hh_total
-               FROM tareo_partida
-               WHERE partida_id = ANY($1)
-                 AND fecha >= $2::date AND fecha <= $3::date
-                 AND hh IS NOT NULL
-               GROUP BY partida_id, fecha""",
-            p_ids,
-            lunes_date.isoformat(),
-            domingo_date.isoformat(),
-        )
-        hh_map = {
-            (r["partida_id"], r["f"]): float(r["hh_total"] or 0)
-            for r in hh_rows
-        }
-
-        # ── HH estimadas: registros histórico (fallback) ─────
-        # Total HH del OTM por día (tareo viejo, sin asignación a partida)
-        fallback_by_date: dict = {}
-        if otm and total_hh_pres > 0:
-            fb = await con.fetch(
-                """SELECT fecha::text AS f, SUM(hh) AS hh_dia
-                   FROM registros
-                   WHERE otm_id = $1
-                     AND fecha >= $2::date AND fecha <= $3::date
-                     AND hh IS NOT NULL AND hh > 0
-                   GROUP BY fecha""",
-                otm,
-                lunes_date.isoformat(),
-                domingo_date.isoformat(),
-            )
-            fallback_by_date = {r["f"]: float(r["hh_dia"] or 0) for r in fb}
-
-        # ── Avances diarios (cant_ejecutada) ─────────────────
-        cant_rows = await con.fetch(
-            """SELECT partida_id, fecha::text AS f, cantidad_dia
-               FROM ev_avances_diarios
-               WHERE partida_id = ANY($1)
-                 AND fecha >= $2::date AND fecha <= $3::date""",
-            p_ids,
-            lunes_date.isoformat(),
-            domingo_date.isoformat(),
-        )
-        cant_map   = {(r["partida_id"], r["f"]): float(r["cantidad_dia"] or 0) for r in cant_rows}
-        cant_exist = {(r["partida_id"], r["f"]) for r in cant_rows}
-
-        # ── Construir resultado ───────────────────────────────
-        result = []
-        for p in partidas:
-            pid    = p["id"]
-            factor = float(p["factor_conv"] or 0)
-            hh_p   = float(p["hh_presup"]  or 0)
-            dias   = {}
-
-            for fecha in fechas:
-                fs  = fecha.isoformat()
-                key = (pid, fs)
-
-                # HH real (nuevo tareo)
-                hh_real = hh_map.get(key, 0)
-
-                # HH estimada (tareo viejo proporcional)
-                hh_est = 0.0
-                if hh_real == 0 and hh_p > 0 and total_hh_pres > 0:
-                    hh_dia_otm = fallback_by_date.get(fs, 0)
-                    if hh_dia_otm > 0:
-                        hh_est = round(hh_p / total_hh_pres * hh_dia_otm, 2)
-
-                # Cant ejecutada
-                cant       = cant_map.get(key, None) if key in cant_exist else None
-                hh_activa  = hh_real if hh_real > 0 else hh_est
-                hh_ganadas = round(cant * factor, 4) if cant is not None and factor > 0 else None
-                pf         = round(hh_ganadas / hh_activa, 3) if hh_ganadas and hh_activa > 0 else None
-
-                if hh_real > 0 or hh_est > 0 or key in cant_exist:
-                    dias[fs] = {
-                        "hh_gastadas":    round(hh_real, 2),   # nuevo tareo (exacto)
-                        "hh_estimada":    hh_est,               # tareo viejo (proporcional)
-                        "cant_ejecutada": cant,                  # None = no ingresada aún
-                        "hh_ganadas":     hh_ganadas,
-                        "pf":             pf,
-                    }
-
-            result.append({
-                "id":             pid,
-                "codigo":         p["codigo"],
-                "descripcion":    p["descripcion"],
-                "fase":           p["fase"],
-                "sub_fase":       p["sub_fase"],
-                "unidad":         p["unidad"],
-                "factor_conv":    round(factor, 4),
-                "hh_presup":      float(p["hh_presup"]      or 0),
-                "metrado_presup": float(p["metrado_presup"] or 0),
-                "dias":           dias,
-            })
-
-        return {
-            "semana":   semana,
-            "otm":      otm,
-            "lunes":    lunes_date.isoformat(),
-            "fechas":   fechas_str,
-            "partidas": result,
-        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error calculando grilla diaria: {e}")
 
 
 @router.post("/avance-diario")
@@ -1269,12 +1278,10 @@ async def guardar_avance_diario(data: dict):
 
     pool = await db()
     async with pool.acquire() as con:
-        cfg = await con.fetchrow(
-            "SELECT fecha_base FROM ev_config ORDER BY id LIMIT 1"
-        )
+        base = await _fecha_base(con)
         semana = 1
-        if cfg and cfg["fecha_base"]:
-            delta  = (date.fromisoformat(fecha_str) - cfg["fecha_base"]).days
+        if base:
+            delta  = (date.fromisoformat(fecha_str) - base).days
             semana = max(1, delta // 7 + 1)
 
         await con.execute(
