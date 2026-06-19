@@ -216,7 +216,9 @@ async def dar_baja_supervisor(sup_id: str):
 async def get_otms(activas: bool = False):
     where = "WHERE estado = 'EJECUCION'" if activas else "WHERE estado IN ('EJECUCION','POR INICIAR','TERMINADO')"
     rows = await database.fetch_all(
-        f"SELECT id, descripcion, area, estado, centro_costo FROM otms {where} ORDER BY id"
+        f"SELECT id, descripcion, area, estado, centro_costo, sdp, plazo, "
+        f"       fecha_inicio, fecha_fin, monto_contractual, monto_valorizado "
+        f"FROM otms {where} ORDER BY id"
     )
     return [dict(r) for r in rows]
 
@@ -652,25 +654,43 @@ async def crear_otm(data: dict):
     estado      = data.get("estado", "POR INICIAR").strip()
     sdp         = data.get("sdp", "").strip()
     cc          = data.get("centro_costo", "").strip()
+    plazo       = data.get("plazo") or None
+    f_inicio    = data.get("fecha_inicio") or None
+    f_fin       = data.get("fecha_fin") or None
+    monto_c     = data.get("monto_contractual") or None
+    monto_v     = data.get("monto_valorizado") or 0
 
     if not otm_id or not descripcion:
         raise HTTPException(400, "ID y descripción son requeridos")
 
     await database.execute(
-        """INSERT INTO otms (id, sdp, descripcion, centro_costo, area, estado)
-           VALUES (:id, :sdp, :desc, :cc, :area, :estado)
+        """INSERT INTO otms (id, sdp, descripcion, centro_costo, area, estado,
+                              plazo, fecha_inicio, fecha_fin, monto_contractual, monto_valorizado)
+           VALUES (:id, :sdp, :desc, :cc, :area, :estado,
+                   :plazo, :f_inicio, :f_fin, :monto_c, :monto_v)
            ON CONFLICT (id) DO UPDATE SET
              estado = EXCLUDED.estado,
-             descripcion = EXCLUDED.descripcion""",
+             descripcion = EXCLUDED.descripcion,
+             area = EXCLUDED.area,
+             sdp = EXCLUDED.sdp,
+             centro_costo = EXCLUDED.centro_costo,
+             plazo = COALESCE(EXCLUDED.plazo, otms.plazo),
+             fecha_inicio = COALESCE(EXCLUDED.fecha_inicio, otms.fecha_inicio),
+             fecha_fin = COALESCE(EXCLUDED.fecha_fin, otms.fecha_fin),
+             monto_contractual = COALESCE(EXCLUDED.monto_contractual, otms.monto_contractual),
+             monto_valorizado = EXCLUDED.monto_valorizado""",
         {"id": otm_id, "sdp": sdp, "desc": descripcion, "cc": cc,
-         "area": area, "estado": estado}
+         "area": area, "estado": estado, "plazo": plazo,
+         "f_inicio": f_inicio, "f_fin": f_fin,
+         "monto_c": monto_c, "monto_v": monto_v}
     )
     return {"status": "ok", "id": otm_id}
 
 
 @app.post("/admin/otms/bulk")
 async def crear_otms_bulk(data: dict):
-    """Importación masiva de OTMs — recibe {otms: [{id,descripcion,area,estado,sdp,centro_costo}]}"""
+    """Importación masiva de OTMs — recibe {otms: [{id,descripcion,area,estado,sdp,centro_costo,
+    plazo,fecha_inicio,fecha_fin,monto_contractual,monto_valorizado}]}"""
     otms = data.get("otms", [])
     if not otms:
         raise HTTPException(400, "Lista de OTMs vacía")
@@ -685,6 +705,11 @@ async def crear_otms_bulk(data: dict):
         estado      = str(o.get("estado", "POR INICIAR")).strip().upper()
         sdp         = str(o.get("sdp", "")).strip()
         cc          = str(o.get("centro_costo", "")).strip()
+        plazo       = o.get("plazo") or None
+        f_inicio    = o.get("fecha_inicio") or None
+        f_fin       = o.get("fecha_fin") or None
+        monto_c     = o.get("monto_contractual") or None
+        monto_v     = o.get("monto_valorizado") or 0
 
         if not otm_id or not descripcion:
             errores.append({"id": otm_id or "—", "error": "ID o descripción vacíos"})
@@ -694,16 +719,25 @@ async def crear_otms_bulk(data: dict):
 
         try:
             await database.execute(
-                """INSERT INTO otms (id, sdp, descripcion, centro_costo, area, estado)
-                   VALUES (:id, :sdp, :desc, :cc, :area, :estado)
+                """INSERT INTO otms (id, sdp, descripcion, centro_costo, area, estado,
+                                      plazo, fecha_inicio, fecha_fin, monto_contractual, monto_valorizado)
+                   VALUES (:id, :sdp, :desc, :cc, :area, :estado,
+                           :plazo, :f_inicio, :f_fin, :monto_c, :monto_v)
                    ON CONFLICT (id) DO UPDATE SET
                      descripcion = EXCLUDED.descripcion,
                      area = EXCLUDED.area,
                      estado = EXCLUDED.estado,
                      sdp = EXCLUDED.sdp,
-                     centro_costo = EXCLUDED.centro_costo""",
+                     centro_costo = EXCLUDED.centro_costo,
+                     plazo = COALESCE(EXCLUDED.plazo, otms.plazo),
+                     fecha_inicio = COALESCE(EXCLUDED.fecha_inicio, otms.fecha_inicio),
+                     fecha_fin = COALESCE(EXCLUDED.fecha_fin, otms.fecha_fin),
+                     monto_contractual = COALESCE(EXCLUDED.monto_contractual, otms.monto_contractual),
+                     monto_valorizado = EXCLUDED.monto_valorizado""",
                 {"id": otm_id, "sdp": sdp, "desc": descripcion, "cc": cc,
-                 "area": area, "estado": estado}
+                 "area": area, "estado": estado, "plazo": plazo,
+                 "f_inicio": f_inicio, "f_fin": f_fin,
+                 "monto_c": monto_c, "monto_v": monto_v}
             )
             creadas.append(otm_id)
         except Exception as e:
