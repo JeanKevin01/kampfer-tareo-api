@@ -214,7 +214,11 @@ async def dar_baja_supervisor(sup_id: str):
 # ── OTMs ─────────────────────────────────────────────────────
 @app.get("/api/otms")
 async def get_otms(activas: bool = False):
-    where = "WHERE estado = 'EJECUCION'" if activas else "WHERE estado IN ('EJECUCION','POR INICIAR','TERMINADO')"
+    # activas=true (app móvil) -> solo OTMs en EJECUCION.
+    # Caso general (panel) -> TODAS las OTMs, sin filtrar por estado, porque el
+    # vocabulario real de estados es abierto (ej. 'CULMINADO', 'GENERAR NUEVO SDP')
+    # y no queremos ocultar OTMs por un estado no previsto.
+    where = "WHERE estado = 'EJECUCION'" if activas else ""
     rows = await database.fetch_all(
         f"SELECT id, descripcion, area, estado, centro_costo, sdp, plazo, "
         f"       fecha_inicio, fecha_fin, monto_contractual, monto_valorizado "
@@ -695,14 +699,16 @@ async def crear_otms_bulk(data: dict):
     if not otms:
         raise HTTPException(400, "Lista de OTMs vacía")
 
-    ESTADOS_VALIDOS = ["EJECUCION", "POR INICIAR", "CERRADO", "CONCLUIDO", "STAND BY"]
     creadas, errores = [], []
 
     for o in otms:
         otm_id      = str(o.get("id", "")).strip().upper()
         descripcion = str(o.get("descripcion", "")).strip().upper()
         area        = str(o.get("area", "")).strip()
-        estado      = str(o.get("estado", "POR INICIAR")).strip().upper()
+        # Se conserva el estado tal como viene (en mayúsculas). NO se fuerza a
+        # 'POR INICIAR' si es desconocido: el vocabulario real es abierto
+        # (ej. 'CULMINADO', 'GENERAR NUEVO SDP') y forzarlo falsearía el dato.
+        estado      = str(o.get("estado", "")).strip().upper() or "POR INICIAR"
         sdp         = str(o.get("sdp", "")).strip()
         cc          = str(o.get("centro_costo", "")).strip()
         plazo       = o.get("plazo") or None
@@ -714,8 +720,6 @@ async def crear_otms_bulk(data: dict):
         if not otm_id or not descripcion:
             errores.append({"id": otm_id or "—", "error": "ID o descripción vacíos"})
             continue
-        if estado not in ESTADOS_VALIDOS:
-            estado = "POR INICIAR"
 
         try:
             await database.execute(
@@ -956,6 +960,7 @@ async def enviar_con_partidas(data: dict):
     semana = 1
     if row_cfg and row_cfg["valor"]:
         base = date.fromisoformat(str(row_cfg["valor"]))
+        base = base - timedelta(days=base.weekday())   # alinear a lunes (consistente con _semana_de)
         semana = max(1, (fecha_obj - base).days // 7 + 1)
 
     hora = hora_lima()
@@ -1047,6 +1052,7 @@ async def cambio_partida_dia(data: dict):
     semana = 1
     if row_cfg2 and row_cfg2["valor"]:
         base = date.fromisoformat(str(row_cfg2["valor"]))
+        base = base - timedelta(days=base.weekday())   # alinear a lunes (consistente con _semana_de)
         semana = max(1, (date.fromisoformat(fecha_str) - base).days // 7 + 1)
 
     creados = 0
