@@ -837,46 +837,51 @@ async def semanas_auto():
 async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
     """Árbol WBS completo (padre + hoja) con valores EV calculados.
     Nodos padre tienen hh_ganadas/gastadas = 0 — el rollup lo hace el frontend."""
-    pool = await db()
-    async with pool.acquire() as con:
-        if otm:
-            partidas = await con.fetch(
-                "SELECT * FROM ev_partidas WHERE activo AND otm_id=$1 ORDER BY codigo", otm
+    try:
+        pool = await db()
+        async with pool.acquire() as con:
+            if otm:
+                partidas = await con.fetch(
+                    "SELECT * FROM ev_partidas WHERE activo AND otm_id=$1 ORDER BY codigo", otm
+                )
+            else:
+                partidas = await con.fetch(
+                    "SELECT * FROM ev_partidas WHERE activo ORDER BY codigo"
+                )
+            hitos   = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
+            avances = await con.fetch(
+                "SELECT hito_id, semana, cantidad_acum FROM ev_avances WHERE semana <= $1", semana
             )
-        else:
-            partidas = await con.fetch(
-                "SELECT * FROM ev_partidas WHERE activo ORDER BY codigo"
-            )
-        hitos   = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
-        avances = await con.fetch(
-            "SELECT hito_id, semana, cantidad_acum FROM ev_avances WHERE semana <= $1", semana
-        )
-        tareo   = await _hh_tareo_por_semana(con)
+            tareo   = await _hh_tareo_por_semana(con)
 
-    filas_ev = _calcular(list(partidas), list(hitos), list(avances), [], tareo, semana)
-    ev_por_id = {f["partida_id"]: f for f in filas_ev}
+        filas_ev = _calcular(list(partidas), list(hitos), list(avances), [], tareo, semana)
+        ev_por_id = {f["partida_id"]: f for f in filas_ev}
 
-    result = []
-    for p in partidas:
-        ev = ev_por_id.get(p["id"], {})
-        result.append({
-            "id":              p["id"],
-            "codigo":          p["codigo"],
-            "otm_id":          p["otm_id"],
-            "fase":            p["fase"],
-            "sub_fase":        p["sub_fase"],
-            "descripcion":     p["descripcion"],
-            "unidad":          p["unidad"],
-            "hh_presup":       float(p["hh_presup"] or 0),
-            "nivel":           int(p["nivel"] or 1),
-            "parent_codigo":   p["parent_codigo"],
-            "es_hoja":         p["fase"] is not None,
-            "hh_ganadas_acum": ev.get("hh_ganadas_acum", 0.0),
-            "hh_gastadas_acum":ev.get("hh_gastadas_acum", 0.0),
-            "pct_avance":      ev.get("pct_avance", 0.0),
-            "pf_acum":         ev.get("pf_acum", 0.0),
-        })
-    return {"semana": semana, "otm": otm, "filas": result}
+        result = []
+        for p in partidas:
+            ev = ev_por_id.get(p["id"], {})
+            result.append({
+                "id":              p["id"],
+                "codigo":          p["codigo"],
+                "otm_id":          p["otm_id"],
+                "fase":            p["fase"],
+                "sub_fase":        p["sub_fase"],
+                "descripcion":     p["descripcion"],
+                "unidad":          p["unidad"],
+                "hh_presup":       float(p["hh_presup"] or 0),
+                "nivel":           int(p["nivel"] or 1),
+                "parent_codigo":   p["parent_codigo"],
+                "es_hoja":         p["fase"] is not None,
+                "hh_ganadas_acum": ev.get("hh_ganadas_acum", 0.0),
+                "hh_gastadas_acum":ev.get("hh_gastadas_acum", 0.0),
+                "pct_avance":      ev.get("pct_avance", 0.0),
+                "pf_acum":         ev.get("pf_acum", 0.0),
+            })
+        return {"semana": semana, "otm": otm, "filas": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error calculando árbol WBS: {e}")
 
 
 
