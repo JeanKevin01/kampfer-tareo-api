@@ -1300,7 +1300,9 @@ async def enviar_con_partidas(data: dict):
     if not trabajadores:
         raise HTTPException(400, "Lista de trabajadores vacía")
 
-    fecha_obj = date.fromisoformat(fecha_str)
+    fecha_obj = parse_fecha(fecha_str)
+    if not fecha_obj:
+        raise HTTPException(400, "fecha inválida")
     hh_dia = await resolver_jornada(fecha_obj, otm_id)
 
     row_cfg = await database.fetch_one("SELECT valor FROM ev_config WHERE clave = :k", {"k": "fecha_base"})
@@ -1311,81 +1313,90 @@ async def enviar_con_partidas(data: dict):
         semana = max(1, (fecha_obj - base).days // 7 + 1)
 
     hora = hora_lima()
+    enviados = 0
+    fallidos = 0
 
-    # Idempotencia: un reenvío del mismo supervisor/OTM/día REEMPLAZA el tareo anterior
-    # (evita el doble conteo de HH por doble toque o reenvío). Un supervisor envía su
-    # tareo de una OTM una vez al día; los cambios a mitad del día van por otro endpoint.
-    await database.execute(
-        "DELETE FROM tareo_partida WHERE supervisor_id=:sup AND otm_id=:otm AND fecha=:fch",
-        {"sup": supervisor_id, "otm": otm_id, "fch": fecha_obj}
-    )
+    try:
+        # Todo el registro va en UNA transacción: o entra completo o no entra nada
+        # (evita estados a medias y condiciones de carrera en el reenvío).
+        async with database.transaction():
+            # Idempotencia: un reenvío del mismo supervisor/OTM/día REEMPLAZA el anterior.
+            await database.execute(
+                "DELETE FROM tareo_partida WHERE supervisor_id=:sup AND otm_id=:otm AND fecha=:fch",
+                {"sup": supervisor_id, "otm": otm_id, "fch": fecha_obj}
+            )
 
-    row = await database.fetch_one(
-        "INSERT INTO sesiones "
-        "(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
-        "VALUES (:sup, :otm, :fch, :hh, 'enviada', now()) RETURNING id",
-        {"sup": supervisor_id, "otm": otm_id, "hh": hh_dia, "fch": fecha_obj}
-    )
-    sesion_id = row["id"]
-    enviados  = 0
+            row = await database.fetch_one(
+                "INSERT INTO sesiones "
+                "(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
+                "VALUES (:sup, :otm, :fch, :hh, 'enviada', now()) RETURNING id",
+                {"sup": supervisor_id, "otm": otm_id, "hh": hh_dia, "fch": fecha_obj}
+            )
+            sesion_id = row["id"]
 
-    for t in trabajadores:
-        trab_id = str(t.get("trab_id", "")).zfill(3)
-        via     = t.get("via", "app")
+            for t in trabajadores:
+                trab_id = str(t.get("trab_id", "")).zfill(3)
+                via     = t.get("via", "app")
 
-        # Normalizar asignaciones — soportar ambos formatos
-        asignaciones = t.get("asignaciones")
-        if asignaciones is None:
-            pid_old = t.get("partida_id")
-            asignaciones = [{"partida_id": pid_old, "hh": hh_dia}] if pid_old else []
+                # Normalizar asignaciones — soportar ambos formatos
+                asignaciones = t.get("asignaciones")
+                if asignaciones is None:
+                    pid_old = t.get("partida_id")
+                    asignaciones = [{"partida_id": pid_old, "hh": hh_dia}] if pid_old else []
 
-        # HH total del trabajador = suma de asignaciones (o hh_dia si no hay partidas)
-        hh_total = sum(float(a.get("hh", 0)) for a in asignaciones) if asignaciones else hh_dia
-        if hh_total <= 0:
-            hh_total = hh_dia
+                # HH total del trabajador = suma de asignaciones (o hh_dia si no hay partidas)
+                hh_total = sum(float(a.get("hh", 0)) for a in asignaciones) if asignaciones else hh_dia
+                if hh_total <= 0:
+                    hh_total = hh_dia
 
-        # sesion_trabajadores
-        await database.execute(
-            "INSERT INTO sesion_trabajadores "
-            "(sesion_id, trab_id, presente, hh_override, agregado_via) "
-            "VALUES (:sid, :tid, true, null, :via)",
-            {"sid": sesion_id, "tid": trab_id, "via": via}
-        )
-
-        # registros (backward compat)
-        await database.execute(
-            "INSERT INTO registros "
-            "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-            "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
-            "ON CONFLICT (trab_id, otm_id, fecha) "
-            "DO UPDATE SET hh=:hh, hora=:hra",
-            {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_total,
-             "fch": fecha_obj, "hra": hora}
-        )
-
-        # tareo_partida — una fila por cada asignación a partida
-        for asig in asignaciones:
-            pid = asig.get("partida_id")
-            hh  = float(asig.get("hh", hh_dia))
-            if not pid or hh <= 0:
-                continue
-            try:
                 await database.execute(
-                    "INSERT INTO tareo_partida "
-                    "(trabajador_id, partida_id, otm_id, fecha, semana, "
-                    " hora_registro, hh, supervisor_id, sesion_id, fuente) "
-                    "VALUES (:tid, :pid, :otm, :fch, :sem, "
-                    "        NOW(), :hh, :sup, :sid, 'tareo')",
-                    {"tid": trab_id, "pid": pid, "otm": otm_id, "fch": fecha_obj,
-                     "sem": semana, "hh": hh,
-                     "sup": supervisor_id, "sid": sesion_id}
+                    "INSERT INTO sesion_trabajadores "
+                    "(sesion_id, trab_id, presente, hh_override, agregado_via) "
+                    "VALUES (:sid, :tid, true, null, :via)",
+                    {"sid": sesion_id, "tid": trab_id, "via": via}
                 )
-            except Exception as e:
-                print(f"[tareo_partida] trab={trab_id} pid={pid}: {e}")
 
-        enviados += 1
+                await database.execute(
+                    "INSERT INTO registros "
+                    "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
+                    "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
+                    "ON CONFLICT (trab_id, otm_id, fecha) "
+                    "DO UPDATE SET hh=:hh, hora=:hra",
+                    {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_total,
+                     "fch": fecha_obj, "hra": hora}
+                )
 
-    return {"ok": True, "enviados": enviados, "sesion_id": sesion_id, "hh_dia": hh_dia}
+                # tareo_partida — una fila por cada asignación a partida
+                for asig in asignaciones:
+                    pid = asig.get("partida_id")
+                    hh  = float(asig.get("hh", hh_dia))
+                    if not pid or hh <= 0:
+                        continue
+                    try:
+                        await database.execute(
+                            "INSERT INTO tareo_partida "
+                            "(trabajador_id, partida_id, otm_id, fecha, semana, "
+                            " hora_registro, hh, supervisor_id, sesion_id, fuente) "
+                            "VALUES (:tid, :pid, :otm, :fch, :sem, "
+                            "        NOW(), :hh, :sup, :sid, 'tareo')",
+                            {"tid": trab_id, "pid": pid, "otm": otm_id, "fch": fecha_obj,
+                             "sem": semana, "hh": hh,
+                             "sup": supervisor_id, "sid": sesion_id}
+                        )
+                    except Exception as e:
+                        fallidos += 1
+                        print(f"[tareo_partida] trab={trab_id} pid={pid}: {e}")
+
+                enviados += 1
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Cualquier error de BD se devuelve como 500 CON cabeceras CORS y mensaje legible
+        # (así el front muestra el error real en vez de un opaco "Failed to fetch").
+        raise HTTPException(500, f"Error al registrar tareo: {e}")
+
+    return {"ok": True, "enviados": enviados, "tareo_fallidos": fallidos,
+            "sesion_id": sesion_id, "hh_dia": hh_dia}
 
 
 @app.post("/api/tareo-partida/cambio")
