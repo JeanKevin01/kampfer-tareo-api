@@ -954,6 +954,7 @@ async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
                 "hh_presup":       float(p["hh_presup"] or 0),
                 "metrado_presup":  float(p["metrado_presup"] or 0),
                 "metrado_proyec":  float(p["metrado_proyec"]) if p["metrado_proyec"] is not None else None,
+                "metrado_ejec":    float(ev.get("cantidad_instalada", 0.0)),
                 "nivel":           int(p["nivel"] or 1),
                 "parent_codigo":   p["parent_codigo"],
                 "es_hoja":         p["fase"] is not None,
@@ -968,6 +969,64 @@ async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
     except Exception as e:
         raise HTTPException(500, f"Error calculando árbol WBS: {e}")
 
+
+
+@router.get("/monitor/anomalias")
+async def monitor_anomalias(otm: Optional[str] = None, semana: int = 1,
+                            pf_min: float = 0.85, pf_max: float = 1.20):
+    """Detecta errores en el tareo a nivel de partida (hoja): HH sin avance,
+    avance sin HH, PF fuera de rango y avances que superan el 100%."""
+    try:
+        pool = await db()
+        async with pool.acquire() as con:
+            if otm:
+                partidas = await con.fetch(
+                    "SELECT * FROM ev_partidas WHERE activo AND otm_id=$1 ORDER BY codigo", otm)
+            else:
+                partidas = await con.fetch("SELECT * FROM ev_partidas WHERE activo ORDER BY codigo")
+            hitos   = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
+            avances = await con.fetch(
+                "SELECT hito_id, semana, cantidad_acum FROM ev_avances WHERE semana <= $1", semana)
+            tareo   = await _hh_gastadas_unificada(con)
+
+        filas = _calcular(list(partidas), list(hitos), list(avances), [], tareo, semana)
+        anomalias = []
+        for f in filas:
+            if f["fase"] is None:          # padres del WBS: sin PF propio
+                continue
+            gast = f["hh_gastadas_acum"]; cant = f["cantidad_instalada"]
+            pf   = f["pf_acum"];          pct  = f["pct_avance"]
+            flags = []
+            if gast > 0 and cant <= 0:
+                flags.append({"tipo": "hh_sin_avance", "sev": "alta",
+                              "msg": "HH gastadas sin metrado ejecutado"})
+            if gast <= 0 and cant > 0:
+                flags.append({"tipo": "avance_sin_hh", "sev": "media",
+                              "msg": "Metrado ejecutado sin HH registradas"})
+            if gast > 0 and 0 < pf < pf_min:
+                flags.append({"tipo": "pf_bajo", "sev": "alta",
+                              "msg": f"PF {pf:.2f} bajo (< {pf_min}) — más HH que avance"})
+            if pf > pf_max:
+                flags.append({"tipo": "pf_alto", "sev": "media",
+                              "msg": f"PF {pf:.2f} alto (> {pf_max}) — revisar avance/HH"})
+            if pct > 1.001:
+                flags.append({"tipo": "avance_excede", "sev": "media",
+                              "msg": f"Avance {pct*100:.0f}% supera el 100%"})
+            if flags:
+                anomalias.append({
+                    "partida_id": f["partida_id"], "codigo": f["codigo"], "otm_id": f["otm_id"],
+                    "descripcion": f["descripcion"], "fase": f["fase"], "unidad": f["unidad"],
+                    "hh_gastadas": round(gast, 1), "hh_ganadas": round(f["hh_ganadas_acum"], 1),
+                    "metrado_ejec": round(cant, 2), "pf_acum": round(pf, 2),
+                    "pct_avance": round(pct, 4), "flags": flags,
+                })
+        # Más severas primero
+        anomalias.sort(key=lambda a: (0 if any(x["sev"] == "alta" for x in a["flags"]) else 1, a["codigo"]))
+        return {"otm": otm, "semana": semana, "total": len(anomalias), "anomalias": anomalias}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Error en monitor de anomalías: {e}")
 
 
 @router.post("/distribuir-hh")
