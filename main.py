@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import database
 from datetime import date, datetime, timezone, timedelta
 from typing import Optional
+import re
 from routers.valor_ganado import router as ev_router
 
 # Zona horaria de Peru (UTC-5)
@@ -10,6 +11,31 @@ LIMA = timezone(timedelta(hours=-5))
 def ahora_lima(): return datetime.now(LIMA)
 def fecha_lima(): return ahora_lima().date()
 def hora_lima(): return ahora_lima().strftime("%H:%M:%S")
+
+def parse_fecha(v):
+    """Convierte v a un objeto date (o None). Acepta date/datetime, 'YYYY-MM-DD'
+    y 'DD/MM/YYYY'. Necesario porque asyncpg exige date, no str, en columnas date."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return date.fromisoformat(s[:10])
+    except ValueError:
+        pass
+    m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$", s)
+    if m:
+        d, mo, y = m.groups()
+        try:
+            return date(int(y), int(mo), int(d))
+        except ValueError:
+            return None
+    return None
 
 app = FastAPI(title="Kampfer Tareo API", version="1.2.0")
 
@@ -659,8 +685,8 @@ async def crear_otm(data: dict):
     sdp         = data.get("sdp", "").strip()
     cc          = data.get("centro_costo", "").strip()
     plazo       = data.get("plazo") or None
-    f_inicio    = data.get("fecha_inicio") or None
-    f_fin       = data.get("fecha_fin") or None
+    f_inicio    = parse_fecha(data.get("fecha_inicio"))
+    f_fin       = parse_fecha(data.get("fecha_fin"))
     monto_c     = data.get("monto_contractual") or None
     monto_v     = data.get("monto_valorizado") or 0
 
@@ -712,8 +738,8 @@ async def crear_otms_bulk(data: dict):
         sdp         = str(o.get("sdp", "")).strip()
         cc          = str(o.get("centro_costo", "")).strip()
         plazo       = o.get("plazo") or None
-        f_inicio    = o.get("fecha_inicio") or None
-        f_fin       = o.get("fecha_fin") or None
+        f_inicio    = parse_fecha(o.get("fecha_inicio"))
+        f_fin       = parse_fecha(o.get("fecha_fin"))
         monto_c     = o.get("monto_contractual") or None
         monto_v     = o.get("monto_valorizado") or 0
 
