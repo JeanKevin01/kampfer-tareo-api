@@ -360,26 +360,25 @@ async def crear_sesion(data: dict):
     if not supervisor_id or not otm_id:
         raise HTTPException(400, "supervisor_id y otm_id son requeridos")
     row = await database.fetch_one(
-        f"INSERT INTO sesiones (supervisor_id, otm_id, fecha, hh_turno) "
-        f"VALUES (:sup, :otm, '{fecha_str}'::date, :hh) RETURNING id",
-        {"sup": supervisor_id, "otm": otm_id, "hh": hh_turno}
+        "INSERT INTO sesiones (supervisor_id, otm_id, fecha, hh_turno) "
+        "VALUES (:sup, :otm, :fch, :hh) RETURNING id",
+        {"sup": supervisor_id, "otm": otm_id, "fch": parse_fecha(fecha_str), "hh": hh_turno}
     )
     return {"id": row["id"], "ok": True}
 
 
 @app.get("/api/sesion/hoy/{supervisor_id}")
 async def sesiones_hoy(supervisor_id: str):
-    fecha_str = fecha_lima().isoformat()
     sesiones = await database.fetch_all(
-        f"SELECT s.id, s.supervisor_id, s.otm_id, s.estado, "
-        f"       s.hh_turno, s.created_at, "
-        f"       COUNT(st.id) AS total, "
-        f"       COUNT(st.id) FILTER (WHERE st.presente) AS presentes "
-        f"FROM sesiones s "
-        f"LEFT JOIN sesion_trabajadores st ON st.sesion_id = s.id "
-        f"WHERE s.supervisor_id = :sup AND s.fecha = '{fecha_str}'::date "
-        f"GROUP BY s.id ORDER BY s.created_at DESC",
-        {"sup": supervisor_id}
+        "SELECT s.id, s.supervisor_id, s.otm_id, s.estado, "
+        "       s.hh_turno, s.created_at, "
+        "       COUNT(st.id) AS total, "
+        "       COUNT(st.id) FILTER (WHERE st.presente) AS presentes "
+        "FROM sesiones s "
+        "LEFT JOIN sesion_trabajadores st ON st.sesion_id = s.id "
+        "WHERE s.supervisor_id = :sup AND s.fecha = :fch "
+        "GROUP BY s.id ORDER BY s.created_at DESC",
+        {"sup": supervisor_id, "fch": fecha_lima()}
     )
     result = []
     for s in sesiones:
@@ -437,13 +436,14 @@ async def enviar_sesion(sesion_id: int, data: dict):
         hh = t.get("hh_override") or float(sesion["hh_turno"])
         try:
             await database.execute(
-                f"INSERT INTO registros "
-                f"(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-                f"VALUES (:tid, :otm, :sup, '{fecha_str}'::date, '{hora}'::time, :hh) "
-                f"ON CONFLICT (trab_id, otm_id, fecha) "
-                f"DO UPDATE SET hh = :hh, hora = '{hora}'::time",
+                "INSERT INTO registros "
+                "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
+                "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
+                "ON CONFLICT (trab_id, otm_id, fecha) "
+                "DO UPDATE SET hh = :hh, hora = :hra",
                 {"tid": t["trab_id"], "otm": sesion["otm_id"],
-                 "sup": sesion["supervisor_id"], "hh": hh}
+                 "sup": sesion["supervisor_id"], "hh": hh,
+                 "fch": parse_fecha(fecha_str), "hra": hora}
             )
             enviados += 1
         except Exception as e:
@@ -693,11 +693,12 @@ async def enviar_directo(data: dict):
     if not trabajadores:
         raise HTTPException(400, "La lista de trabajadores está vacía")
     hora = hora_lima()
+    fecha_obj = parse_fecha(fecha_str)
     row = await database.fetch_one(
-        f"INSERT INTO sesiones "
-        f"(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
-        f"VALUES (:sup, :otm, '{fecha_str}'::date, :hh, 'enviada', now()) RETURNING id",
-        {"sup": supervisor_id, "otm": otm_id, "hh": hh_turno}
+        "INSERT INTO sesiones "
+        "(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
+        "VALUES (:sup, :otm, :fch, :hh, 'enviada', now()) RETURNING id",
+        {"sup": supervisor_id, "otm": otm_id, "hh": hh_turno, "fch": fecha_obj}
     )
     sesion_id = row["id"]
     enviados = 0
@@ -713,11 +714,12 @@ async def enviar_directo(data: dict):
         )
         hh_real = float(hh_ov) if hh_ov is not None else hh_turno
         await database.execute(
-            f"INSERT INTO registros "
-            f"(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-            f"VALUES (:tid, :otm, :sup, '{fecha_str}'::date, '{hora}'::time, :hh) "
-            f"ON CONFLICT (trab_id, otm_id, fecha) DO UPDATE SET hh=:hh, hora='{hora}'::time",
-            {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_real}
+            "INSERT INTO registros "
+            "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
+            "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
+            "ON CONFLICT (trab_id, otm_id, fecha) DO UPDATE SET hh=:hh, hora=:hra",
+            {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_real,
+             "fch": fecha_obj, "hra": hora}
         )
         enviados += 1
     return {"ok": True, "enviados": enviados, "sesion_id": sesion_id}
@@ -759,27 +761,32 @@ async def quitar_cuadrilla(supervisor_id: str, trab_id: str):
 # ── REGISTROS DEL DÍA ─────────────────────────────────────────
 @app.get("/api/registros/hoy")
 async def registros_hoy():
-    hoy = fecha_lima().isoformat()
+    hoy = fecha_lima()
     rows = await database.fetch_all(
-        f"""SELECT r.trab_id, t.nombre, t.cargo,
+        """SELECT r.trab_id, t.nombre, t.cargo,
                    r.otm_id, r.hora::text, r.supervisor_id, r.hh
             FROM registros r
             JOIN trabajadores t ON r.trab_id = t.id
-            WHERE r.fecha = '{hoy}'::date
-            ORDER BY r.trab_id, r.hora"""
+            WHERE r.fecha = :fch
+            ORDER BY r.trab_id, r.hora""",
+        {"fch": hoy},
     )
     return [dict(r) for r in rows]
 
 # ── REGISTROS POR FECHA ───────────────────────────────────────
 @app.get("/api/registros/{fecha}")
 async def registros_por_fecha(fecha: str):
+    f = parse_fecha(fecha)
+    if not f:
+        raise HTTPException(400, "fecha inválida")
     rows = await database.fetch_all(
-        f"""SELECT r.trab_id, t.nombre, t.cargo,
+        """SELECT r.trab_id, t.nombre, t.cargo,
                    r.otm_id, r.hora::text, r.supervisor_id, r.hh
             FROM registros r
             JOIN trabajadores t ON r.trab_id = t.id
-            WHERE r.fecha = '{fecha}'::date
-            ORDER BY r.trab_id, r.hora"""
+            WHERE r.fecha = :fch
+            ORDER BY r.trab_id, r.hora""",
+        {"fch": f},
     )
     return [dict(r) for r in rows]
 
@@ -794,11 +801,12 @@ async def calcular_hh(data: dict = {}):
 
     # Registros del día ordenados por trabajador y hora
     rows = await database.fetch_all(
-        f"""SELECT trab_id, otm_id, hora::text as hora
+        """SELECT trab_id, otm_id, hora::text as hora
             FROM registros
-            WHERE fecha = '{fecha_str}'::date
+            WHERE fecha = :fch
               AND hh IS NULL
-            ORDER BY trab_id, hora"""
+            ORDER BY trab_id, hora""",
+        {"fch": fecha_obj},
     )
 
     # Agrupar por trabajador
@@ -819,11 +827,11 @@ async def calcular_hh(data: dict = {}):
         if n == 1:
             # Una sola OTM → todas las HH del día
             await database.execute(
-                f"""UPDATE registros SET hh = {total_hh}
+                """UPDATE registros SET hh = :hh
                     WHERE trab_id = :tid
-                      AND fecha   = '{fecha_str}'::date
+                      AND fecha   = :fch
                       AND otm_id  = :otm""",
-                {"tid": trab_id, "otm": registros[0]["otm_id"]}
+                {"hh": total_hh, "tid": trab_id, "fch": fecha_obj, "otm": registros[0]["otm_id"]}
             )
             actualizados += 1
         else:
@@ -845,26 +853,26 @@ async def calcular_hh(data: dict = {}):
                     )
                     diff_h  = (t_hasta - t_desde).total_seconds() / 3600
                     # Redondear a 0.5H
-                    hh_tramo = round(diff_h * 2) / 2
+                    hh_tramo = max(round(diff_h * 2) / 2, 0.0)
                     hh_acumulado += hh_tramo
 
                     await database.execute(
-                        f"""UPDATE registros SET hh = {hh_tramo}
+                        """UPDATE registros SET hh = :hh
                             WHERE trab_id = :tid
-                              AND fecha   = '{fecha_str}'::date
+                              AND fecha   = :fch
                               AND otm_id  = :otm""",
-                        {"tid": trab_id, "otm": registros[i]["otm_id"]}
+                        {"hh": hh_tramo, "tid": trab_id, "fch": fecha_obj, "otm": registros[i]["otm_id"]}
                     )
                     actualizados += 1
                 else:
-                    # Último tramo: absorbe el restante exacto
-                    hh_restante = round(total_hh - hh_acumulado, 1)
+                    # Último tramo: absorbe el restante exacto (nunca negativo)
+                    hh_restante = max(round(total_hh - hh_acumulado, 1), 0.0)
                     await database.execute(
-                        f"""UPDATE registros SET hh = {hh_restante}
+                        """UPDATE registros SET hh = :hh
                             WHERE trab_id = :tid
-                              AND fecha   = '{fecha_str}'::date
+                              AND fecha   = :fch
                               AND otm_id  = :otm""",
-                        {"tid": trab_id, "otm": registros[i]["otm_id"]}
+                        {"hh": hh_restante, "tid": trab_id, "fch": fecha_obj, "otm": registros[i]["otm_id"]}
                     )
                     actualizados += 1
 
@@ -879,8 +887,11 @@ async def calcular_hh(data: dict = {}):
 # ── RESUMEN DÍA para Google Sheets via n8n ───────────────────
 @app.get("/api/resumen/{fecha}")
 async def resumen_dia(fecha: str):
+    f = parse_fecha(fecha)
+    if not f:
+        raise HTTPException(400, "fecha inválida")
     rows = await database.fetch_all(
-        f"""SELECT r.trab_id, t.nombre, t.cargo,
+        """SELECT r.trab_id, t.nombre, t.cargo,
                    r.otm_id, o.centro_costo,
                    r.hora::text, r.hh,
                    r.supervisor_id, s.nombre as supervisor_nombre
@@ -888,22 +899,27 @@ async def resumen_dia(fecha: str):
             JOIN trabajadores t ON r.trab_id = t.id
             JOIN otms o         ON r.otm_id  = o.id
             JOIN supervisores s ON r.supervisor_id = s.id
-            WHERE r.fecha = '{fecha}'::date
-            ORDER BY r.otm_id, t.nombre"""
+            WHERE r.fecha = :fch
+            ORDER BY r.otm_id, t.nombre""",
+        {"fch": f},
     )
     return [dict(r) for r in rows]
 
 # ── CONTEO ALMUERZOS para email 8am ──────────────────────────
 @app.get("/api/almuerzos/{fecha}")
 async def almuerzos(fecha: str):
+    f = parse_fecha(fecha)
+    if not f:
+        raise HTTPException(400, "fecha inválida")
     rows = await database.fetch_all(
-        f"""SELECT DISTINCT ON (r.trab_id)
+        """SELECT DISTINCT ON (r.trab_id)
                    r.trab_id, t.nombre, t.cargo,
                    r.otm_id, r.supervisor_id
             FROM registros r
             JOIN trabajadores t ON r.trab_id = t.id
-            WHERE r.fecha = '{fecha}'::date
-            ORDER BY r.trab_id, r.hora"""
+            WHERE r.fecha = :fch
+            ORDER BY r.trab_id, r.hora""",
+        {"fch": f},
     )
     data = [dict(r) for r in rows]
 
@@ -998,7 +1014,7 @@ async def crear_otm(data: dict):
              fecha_inicio = COALESCE(EXCLUDED.fecha_inicio, otms.fecha_inicio),
              fecha_fin = COALESCE(EXCLUDED.fecha_fin, otms.fecha_fin),
              monto_contractual = COALESCE(EXCLUDED.monto_contractual, otms.monto_contractual),
-             monto_valorizado = EXCLUDED.monto_valorizado""",
+             monto_valorizado = COALESCE(EXCLUDED.monto_valorizado, otms.monto_valorizado)""",
         {"id": otm_id, "sdp": sdp, "desc": descripcion, "cc": cc,
          "area": area, "estado": estado, "plazo": plazo,
          "f_inicio": f_inicio, "f_fin": f_fin,
@@ -1053,7 +1069,7 @@ async def crear_otms_bulk(data: dict):
                      fecha_inicio = COALESCE(EXCLUDED.fecha_inicio, otms.fecha_inicio),
                      fecha_fin = COALESCE(EXCLUDED.fecha_fin, otms.fecha_fin),
                      monto_contractual = COALESCE(EXCLUDED.monto_contractual, otms.monto_contractual),
-                     monto_valorizado = EXCLUDED.monto_valorizado""",
+                     monto_valorizado = COALESCE(EXCLUDED.monto_valorizado, otms.monto_valorizado)""",
                 {"id": otm_id, "sdp": sdp, "desc": descripcion, "cc": cc,
                  "area": area, "estado": estado, "plazo": plazo,
                  "f_inicio": f_inicio, "f_fin": f_fin,
@@ -1277,11 +1293,19 @@ async def enviar_con_partidas(data: dict):
 
     hora = hora_lima()
 
+    # Idempotencia: un reenvío del mismo supervisor/OTM/día REEMPLAZA el tareo anterior
+    # (evita el doble conteo de HH por doble toque o reenvío). Un supervisor envía su
+    # tareo de una OTM una vez al día; los cambios a mitad del día van por otro endpoint.
+    await database.execute(
+        "DELETE FROM tareo_partida WHERE supervisor_id=:sup AND otm_id=:otm AND fecha=:fch",
+        {"sup": supervisor_id, "otm": otm_id, "fch": fecha_obj}
+    )
+
     row = await database.fetch_one(
-        f"INSERT INTO sesiones "
-        f"(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
-        f"VALUES (:sup, :otm, '{fecha_str}'::date, :hh, 'enviada', now()) RETURNING id",
-        {"sup": supervisor_id, "otm": otm_id, "hh": hh_dia}
+        "INSERT INTO sesiones "
+        "(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
+        "VALUES (:sup, :otm, :fch, :hh, 'enviada', now()) RETURNING id",
+        {"sup": supervisor_id, "otm": otm_id, "hh": hh_dia, "fch": fecha_obj}
     )
     sesion_id = row["id"]
     enviados  = 0
@@ -1311,12 +1335,13 @@ async def enviar_con_partidas(data: dict):
 
         # registros (backward compat)
         await database.execute(
-            f"INSERT INTO registros "
-            f"(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-            f"VALUES (:tid, :otm, :sup, '{fecha_str}'::date, '{hora}'::time, :hh) "
-            f"ON CONFLICT (trab_id, otm_id, fecha) "
-            f"DO UPDATE SET hh=:hh, hora='{hora}'::time",
-            {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_total}
+            "INSERT INTO registros "
+            "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
+            "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
+            "ON CONFLICT (trab_id, otm_id, fecha) "
+            "DO UPDATE SET hh=:hh, hora=:hra",
+            {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_total,
+             "fch": fecha_obj, "hra": hora}
         )
 
         # tareo_partida — una fila por cada asignación a partida
@@ -1327,12 +1352,12 @@ async def enviar_con_partidas(data: dict):
                 continue
             try:
                 await database.execute(
-                    f"INSERT INTO tareo_partida "
-                    f"(trabajador_id, partida_id, otm_id, fecha, semana, "
-                    f" hora_registro, hh, supervisor_id, sesion_id, fuente) "
-                    f"VALUES (:tid, :pid, :otm, '{fecha_str}'::date, :sem, "
-                    f"        NOW(), :hh, :sup, :sid, 'tareo')",
-                    {"tid": trab_id, "pid": pid, "otm": otm_id,
+                    "INSERT INTO tareo_partida "
+                    "(trabajador_id, partida_id, otm_id, fecha, semana, "
+                    " hora_registro, hh, supervisor_id, sesion_id, fuente) "
+                    "VALUES (:tid, :pid, :otm, :fch, :sem, "
+                    "        NOW(), :hh, :sup, :sid, 'tareo')",
+                    {"tid": trab_id, "pid": pid, "otm": otm_id, "fch": fecha_obj,
                      "sem": semana, "hh": hh,
                      "sup": supervisor_id, "sid": sesion_id}
                 )
@@ -1367,16 +1392,17 @@ async def cambio_partida_dia(data: dict):
         base = base - timedelta(days=base.weekday())   # alinear a lunes (consistente con _semana_de)
         semana = max(1, (date.fromisoformat(fecha_str) - base).days // 7 + 1)
 
+    fecha_obj = parse_fecha(fecha_str)
     creados = 0
     for tid in trabajador_ids:
         trab_id = str(tid).zfill(3)
         await database.execute(
-            f"INSERT INTO tareo_partida "
-            f"(trabajador_id, partida_id, otm_id, fecha, semana, "
-            f" hora_registro, supervisor_id, fuente) "
-            f"VALUES (:tid, :pid, :otm, '{fecha_str}'::date, :sem, "
-            f"        NOW(), :sup, 'cambio')",
-            {"tid": trab_id, "pid": partida_id, "otm": otm_id,
+            "INSERT INTO tareo_partida "
+            "(trabajador_id, partida_id, otm_id, fecha, semana, "
+            " hora_registro, supervisor_id, fuente) "
+            "VALUES (:tid, :pid, :otm, :fch, :sem, "
+            "        NOW(), :sup, 'cambio')",
+            {"tid": trab_id, "pid": partida_id, "otm": otm_id, "fch": fecha_obj,
              "sem": semana, "sup": supervisor_id}
         )
         creados += 1
