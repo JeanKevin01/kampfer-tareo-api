@@ -671,6 +671,12 @@ async def captura(semana: int):
             "partida_id": p["id"],
             "codigo": p["codigo"],
             "otm_id": p["otm_id"],
+            "fase": p["fase"],
+            "sub_fase": p["sub_fase"],
+            "nivel": int(p["nivel"] or 1),
+            "parent_codigo": p["parent_codigo"],
+            "es_hoja": p["fase"] is not None,
+            "hh_presup": float(p["hh_presup"] or 0),
             "descripcion": p["descripcion"],
             "unidad": p["unidad"],
             "metrado_proyec": float(p["metrado_proyec"] or p["metrado_presup"]),
@@ -1216,6 +1222,7 @@ async def semana_grid(
             q = """
                 SELECT p.id, p.codigo, p.descripcion, p.fase, p.sub_fase,
                        p.unidad, p.hh_presup, p.metrado_presup,
+                       p.nivel, p.parent_codigo,
                        CASE WHEN p.metrado_presup > 0
                             THEN p.hh_presup / p.metrado_presup
                             ELSE 0 END AS factor_conv
@@ -1229,6 +1236,19 @@ async def semana_grid(
             q += " ORDER BY p.codigo"
 
             partidas = await con.fetch(q, *args)
+
+            # ── Nodos de agrupación (padres, fase IS NULL) ───────
+            qg = """
+                SELECT p.codigo, p.descripcion, p.nivel, p.parent_codigo
+                FROM ev_partidas p
+                WHERE p.activo = true AND p.fase IS NULL
+            """
+            gargs: list = []
+            if otm:
+                gargs.append(otm)
+                qg += f" AND p.otm_id = ${len(gargs)}"
+            qg += " ORDER BY p.codigo"
+            grupos = await con.fetch(qg, *gargs)
             if not partidas:
                 return {
                     "semana":   semana,
@@ -1331,6 +1351,8 @@ async def semana_grid(
                     "descripcion":    p["descripcion"],
                     "fase":           p["fase"],
                     "sub_fase":       p["sub_fase"],
+                    "nivel":          int(p["nivel"] or 1),
+                    "parent_codigo":  p["parent_codigo"],
                     "unidad":         p["unidad"],
                     "factor_conv":    round(factor, 4),
                     "hh_presup":      float(p["hh_presup"]      or 0),
@@ -1338,11 +1360,22 @@ async def semana_grid(
                     "dias":           dias,
                 })
 
+            grupos_out = [
+                {
+                    "codigo":        g["codigo"],
+                    "descripcion":   g["descripcion"],
+                    "nivel":         int(g["nivel"] or 1),
+                    "parent_codigo": g["parent_codigo"],
+                }
+                for g in grupos
+            ]
+
             return {
                 "semana":   semana,
                 "otm":      otm,
                 "lunes":    lunes_date.isoformat(),
                 "fechas":   fechas_str,
+                "grupos":   grupos_out,
                 "partidas": result,
             }
     except HTTPException:
