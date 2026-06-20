@@ -261,6 +261,94 @@ async def monitor_hh_diario(fecha: Optional[str] = None):
     return {"resumen": resumen, "filas": filas}
 
 
+# ── INTEGRIDAD: doble registro de HH y trabajadores duplicados ──
+@app.get("/api/monitor/duplicados-hh")
+async def monitor_duplicados_hh(fecha: Optional[str] = None):
+    """Trabajadores con HH registradas en más de una sesión el mismo día
+    (posible doble envío entre supervisores)."""
+    f = parse_fecha(fecha) or fecha_lima()
+    rows = await database.fetch_all(
+        "SELECT tp.trabajador_id, t.nombre, "
+        "       COUNT(DISTINCT tp.sesion_id)    AS n_sesiones, "
+        "       COUNT(DISTINCT tp.supervisor_id) AS n_supervisores, "
+        "       COUNT(DISTINCT tp.otm_id)        AS n_otms, "
+        "       SUM(tp.hh)                       AS total_hh "
+        "FROM tareo_partida tp "
+        "LEFT JOIN trabajadores t ON t.id = tp.trabajador_id "
+        "WHERE tp.fecha = :f "
+        "GROUP BY tp.trabajador_id, t.nombre "
+        "HAVING COUNT(DISTINCT tp.sesion_id) > 1 "
+        "ORDER BY SUM(tp.hh) DESC",
+        {"f": f},
+    )
+    filas = [{
+        "trab_id": r["trabajador_id"], "nombre": r["nombre"] or r["trabajador_id"],
+        "n_sesiones": int(r["n_sesiones"]), "n_supervisores": int(r["n_supervisores"]),
+        "n_otms": int(r["n_otms"]), "total_hh": round(float(r["total_hh"] or 0), 2),
+    } for r in rows]
+    return {"fecha": f.isoformat(), "total": len(filas), "filas": filas}
+
+
+def _norm_nombre(s: Optional[str]) -> str:
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode()
+    return " ".join(s.upper().split())
+
+
+@app.get("/api/trabajadores/duplicados")
+async def trabajadores_duplicados():
+    """Agrupa trabajadores con el mismo nombre normalizado pero distinto id,
+    con su actividad (para decidir cuál conservar)."""
+    rows = await database.fetch_all(
+        "SELECT t.id, t.nombre, t.cargo, t.activo, "
+        "  (SELECT COUNT(*) FROM tareo_partida tp WHERE tp.trabajador_id = t.id) AS n_tareo, "
+        "  (SELECT COUNT(*) FROM registros r WHERE r.trab_id = t.id)             AS n_reg "
+        "FROM trabajadores t ORDER BY t.nombre, t.id"
+    )
+    grupos: dict = {}
+    for r in rows:
+        grupos.setdefault(_norm_nombre(r["nombre"]), []).append({
+            "id": r["id"], "nombre": r["nombre"], "cargo": r["cargo"],
+            "activo": r["activo"], "n_tareo": int(r["n_tareo"] or 0), "n_reg": int(r["n_reg"] or 0),
+        })
+    dup = [{"nombre": g[0]["nombre"], "miembros": g} for g in grupos.values() if len(g) > 1]
+    dup.sort(key=lambda x: x["nombre"])
+    return {"total_grupos": len(dup), "grupos": dup}
+
+
+@app.post("/api/trabajadores/merge")
+async def trabajadores_merge(data: dict):
+    """Fusiona un trabajador duplicado en otro: reasigna TODAS las referencias
+    (vía information_schema) y desactiva el origen. Transaccional: si hay colisión
+    de claves únicas, revierte todo y reporta la tabla, sin pérdida de datos."""
+    origen  = str(data.get("from_id", "")).strip()
+    destino = str(data.get("to_id", "")).strip()
+    if not origen or not destino or origen == destino:
+        raise HTTPException(400, "from_id y to_id deben ser válidos y distintos")
+
+    cols = await database.fetch_all(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema='public' AND table_name <> 'trabajadores' "
+        "AND column_name IN ('trab_id','trabajador_id','miembro_id')"
+    )
+    async with database.transaction():
+        for c in cols:
+            tn, cn = c["table_name"], c["column_name"]
+            try:
+                await database.execute(
+                    f'UPDATE "{tn}" SET "{cn}" = :d WHERE "{cn}" = :o',
+                    {"d": destino, "o": origen},
+                )
+            except Exception as e:
+                raise HTTPException(
+                    409, f"Colisión al reasignar {tn}.{cn} ({e}). "
+                         f"El trabajador {origen} ya tiene datos que chocan con {destino} "
+                         f"en esa tabla. Revisa/elimina ese registro y reintenta.")
+        await database.execute(
+            "UPDATE trabajadores SET activo = false WHERE id = :o", {"o": origen})
+    return {"ok": True, "fusionado": origen, "en": destino, "tablas": len(cols)}
+
+
 # ── SESIONES (Session-First model) ───────────────────────────
 
 @app.post("/api/sesion")
