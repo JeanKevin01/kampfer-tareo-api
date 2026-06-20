@@ -612,7 +612,8 @@ async def _hh_real_split(con) -> dict:
                   SUM(CASE WHEN COALESCE(t.tipo,'DIRECTO') <> 'INDIRECTO'
                            THEN tp.hh ELSE 0 END) AS dir
            FROM tareo_partida tp
-           LEFT JOIN trabajadores t ON t.id = tp.trabajador_id
+           LEFT JOIN trabajadores t
+                  ON LPAD(t.id::text,3,'0') = LPAD(tp.trabajador_id::text,3,'0')
            WHERE tp.hh IS NOT NULL
            GROUP BY tp.partida_id, tp.fecha"""
     )
@@ -1221,14 +1222,17 @@ async def reporte(semana: int, otm: Optional[str] = None):
     partidas, hitos, avances, hh, tareo, split = await _datos_base(semana, otm)
     filas = _calcular(partidas, hitos, avances, hh, tareo, semana, split)
 
-    tot_proyec = sum(f["hh_proyec"] for f in filas)
-    tot_ganadas = sum(f["hh_ganadas_acum"] for f in filas)
-    tot_gastadas = sum(f["hh_gastadas_acum"] for f in filas)
-    tot_gas_dir = sum(f["hh_gastadas_dir_acum"] for f in filas)
-    tot_gas_ind = sum(f["hh_gastadas_ind_acum"] for f in filas)
-    tot_gan_sem = sum(f["hh_ganadas_sem"] for f in filas)
-    tot_gas_sem = sum(f["hh_gastadas_sem"] for f in filas)
-    tot_eac = sum(f["eac_hh"] for f in filas)
+    # Totales SOLO sobre hojas (fase != None): los nodos padre del WBS pueden traer
+    # hh_presup propio y sumarlos duplicaría el plan. El detalle (partidas) sí incluye padres.
+    hojas = [f for f in filas if f["fase"] is not None]
+    tot_proyec = sum(f["hh_proyec"] for f in hojas)
+    tot_ganadas = sum(f["hh_ganadas_acum"] for f in hojas)
+    tot_gastadas = sum(f["hh_gastadas_acum"] for f in hojas)
+    tot_gas_dir = sum(f["hh_gastadas_dir_acum"] for f in hojas)
+    tot_gas_ind = sum(f["hh_gastadas_ind_acum"] for f in hojas)
+    tot_gan_sem = sum(f["hh_ganadas_sem"] for f in hojas)
+    tot_gas_sem = sum(f["hh_gastadas_sem"] for f in hojas)
+    tot_eac = sum(f["eac_hh"] for f in hojas)
 
     return {
         "semana": semana,
@@ -1248,9 +1252,9 @@ async def reporte(semana: int, otm: Optional[str] = None):
             "eac_hh": round(tot_eac, 2),
             "desvio_hh": round(tot_eac - tot_proyec, 2),
         },
-        "por_otm": _agrupar(filas, "otm_id"),
-        "por_fase": _agrupar(filas, "fase"),
-        "por_sistema": _agrupar(filas, "sistema"),
+        "por_otm": _agrupar(hojas, "otm_id"),
+        "por_fase": _agrupar(hojas, "fase"),
+        "por_sistema": _agrupar(hojas, "sistema"),
         "partidas": filas,
     }
 
