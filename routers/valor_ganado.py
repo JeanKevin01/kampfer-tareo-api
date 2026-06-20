@@ -578,6 +578,65 @@ async def _hh_tareo_por_semana(con) -> dict:
     return out
 
 
+async def _hh_real_por_semana(con) -> dict:
+    """{(partida_id, semana): hh} — HH EXACTAS del tareo de la app (tareo_partida).
+    La semana se recalcula desde la fecha con la misma base (lunes) que usa el
+    ISP, para no depender de tareo_partida.semana (que pudo guardarse con otra
+    lógica en filas antiguas)."""
+    out: dict = defaultdict(float)
+    base = await _fecha_base(con)
+    if not base:
+        return out
+    rows = await con.fetch(
+        """SELECT partida_id, fecha, SUM(hh) AS hh
+           FROM tareo_partida
+           WHERE hh IS NOT NULL
+           GROUP BY partida_id, fecha"""
+    )
+    for r in rows:
+        out[(r['partida_id'], _semana_de(r['fecha'], base))] += float(r['hh'])
+    return out
+
+
+async def _hh_gastadas_unificada(con) -> dict:
+    """FUENTE ÚNICA de HH gastadas por (partida, semana) para árbol/ISP/reporte.
+
+    Precedencia (de mayor a menor):
+      1. override manual del residente  (ev_hh_gastadas fuente 'manual'/'distribucion')
+      2. tareo_partida REAL              (lo que captura la app — fuente principal)
+      3. migración histórica             (ev_hh_gastadas fuente 'historico'/'importado')
+      4. estimación proporcional         (desde registros, fallback legacy)
+
+    Las filas 'diario'/'tareo' de ev_hh_gastadas (que producía el botón
+    "Volcar al ISP") se IGNORAN: ahora se lee tareo_partida directamente, así que
+    el volcado manual ya no es necesario y no hay doble conteo.
+    """
+    out: dict = {}
+    # 4) proporcional (más bajo)
+    for k, v in (await _hh_tareo_por_semana(con)).items():
+        out[k] = v
+    # separar overrides y migración de ev_hh_gastadas
+    rows = await con.fetch("SELECT partida_id, semana, hh, fuente FROM ev_hh_gastadas")
+    migr, override = {}, {}
+    for r in rows:
+        key = (r["partida_id"], r["semana"])
+        f = (r["fuente"] or "").lower()
+        if f in ("manual", "distribucion"):
+            override[key] = float(r["hh"])
+        elif f in ("historico", "importado"):
+            migr[key] = float(r["hh"])
+    # 3) migración histórica
+    for k, v in migr.items():
+        out[k] = v
+    # 2) tareo real (gana sobre proporcional y migración)
+    for k, v in (await _hh_real_por_semana(con)).items():
+        out[k] = v
+    # 1) override manual (gana sobre todo)
+    for k, v in override.items():
+        out[k] = v
+    return out
+
+
 @router.get("/captura")
 async def captura(semana: int):
     pool = await db()
@@ -786,8 +845,10 @@ async def _datos_base(semana: int, otm: Optional[str] = None):
         hh = await con.fetch(
             "SELECT partida_id, semana, hh FROM ev_hh_gastadas WHERE semana <= $1", semana
         )
-        tareo = await _hh_tareo_por_semana(con)
-    return partidas, hitos, avances, hh, tareo
+        tareo = await _hh_gastadas_unificada(con)
+    # hh_rows se devuelve vacío: las HH gastadas ya vienen unificadas en `tareo`
+    # (manual > tareo_partida real > histórico > proporcional). Ver _hh_gastadas_unificada.
+    return partidas, hitos, avances, [], tareo
 
 
 
@@ -868,7 +929,7 @@ async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
             avances = await con.fetch(
                 "SELECT hito_id, semana, cantidad_acum FROM ev_avances WHERE semana <= $1", semana
             )
-            tareo   = await _hh_tareo_por_semana(con)
+            tareo   = await _hh_gastadas_unificada(con)
 
         filas_ev = _calcular(list(partidas), list(hitos), list(avances), [], tareo, semana)
         ev_por_id = {f["partida_id"]: f for f in filas_ev}
@@ -966,8 +1027,7 @@ async def isp_reporte(otm: Optional[str] = None):
                 )
             hitos   = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
             avances = await con.fetch("SELECT * FROM ev_avances ORDER BY semana")
-            hh_rows = await con.fetch("SELECT * FROM ev_hh_gastadas ORDER BY semana")
-            tareo   = await _hh_tareo_por_semana(con)
+            tareo   = await _hh_gastadas_unificada(con)
 
         # Calcular EV para cada semana (una llamada por semana, datos cargados en memoria)
         result_por_partida: dict = {}
@@ -992,7 +1052,7 @@ async def isp_reporte(otm: Optional[str] = None):
             }
 
         for s in range(1, total + 1):
-            filas = _calcular(list(partidas), list(hitos), list(avances), list(hh_rows), tareo, s)
+            filas = _calcular(list(partidas), list(hitos), list(avances), [], tareo, s)
             for f in filas:
                 pid = f["partida_id"]
                 if pid in result_por_partida:
