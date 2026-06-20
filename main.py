@@ -30,6 +30,7 @@ LIMA = timezone(timedelta(hours=-5))
 def ahora_lima(): return datetime.now(LIMA)
 def fecha_lima(): return ahora_lima().date()
 def hora_lima(): return ahora_lima().strftime("%H:%M:%S")
+def hora_lima_t(): return ahora_lima().time().replace(microsecond=0)  # objeto time para columnas SQL time
 
 def parse_fecha(v):
     """Convierte v a un objeto date (o None). Acepta date/datetime, 'YYYY-MM-DD'
@@ -426,7 +427,7 @@ async def enviar_sesion(sesion_id: int, data: dict):
     sesion      = dict(sesion)
     fecha_obj   = sesion["fecha"]
     fecha_str   = fecha_obj.isoformat() if hasattr(fecha_obj, "isoformat") else str(fecha_obj)
-    hora        = hora_lima()
+    hora        = hora_lima_t()
     trabajadores = data.get("trabajadores", [])
 
     # Limpiar y volver a insertar trabajadores
@@ -457,9 +458,9 @@ async def enviar_sesion(sesion_id: int, data: dict):
             await database.execute(
                 "INSERT INTO registros "
                 "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-                "VALUES (:tid, :otm, :sup, :fch, :hra::time, :hh) "
+                "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
                 "ON CONFLICT (trab_id, otm_id, fecha) "
-                "DO UPDATE SET hh = :hh, hora = :hra::time",
+                "DO UPDATE SET hh = :hh, hora = :hra",
                 {"tid": t["trab_id"], "otm": sesion["otm_id"],
                  "sup": sesion["supervisor_id"], "hh": hh,
                  "fch": parse_fecha(fecha_str), "hra": hora}
@@ -618,6 +619,11 @@ async def registrar(data: dict):
         trab_id  = str(t.get("trab_id", "")).zfill(3)
         hora_raw = t.get("hora", hora_lima())
         hora     = hora_raw[:8] if len(hora_raw) >= 8 else hora_raw + ":00"
+        try:
+            hora_t = datetime.strptime(hora, "%H:%M:%S").time()
+        except ValueError:
+            hora_t = hora_lima_t()
+        fch = parse_fecha(fecha_str)
         nombre   = t.get("nombre", "")
         cargo    = t.get("cargo",  "")
 
@@ -635,17 +641,11 @@ async def registrar(data: dict):
 
         trab_dict = dict(trab)
 
-        # Verificar duplicado usando SQL puro sin pasar fecha como parámetro tipado
-        # Concatenamos la fecha directamente en el SQL para evitar el problema de tipo
-        check_sql = f"""
-            SELECT id FROM registros
-            WHERE trab_id = :trab_id
-              AND otm_id  = :otm_id
-              AND fecha   = '{fecha_str}'::date
-        """
+        # Verificar duplicado (parámetros tipados: fecha como objeto date)
         existente = await database.fetch_one(
-            check_sql,
-            {"trab_id": trab_id, "otm_id": otm_id}
+            "SELECT id FROM registros "
+            "WHERE trab_id = :trab_id AND otm_id = :otm_id AND fecha = :fch",
+            {"trab_id": trab_id, "otm_id": otm_id, "fch": fch}
         )
 
         if existente:
@@ -658,18 +658,17 @@ async def registrar(data: dict):
             })
             continue
 
-        # Insertar — fecha y hora como literales SQL para evitar problema de tipo asyncpg
+        # Insertar — parámetros tipados (fecha date, hora time): sin interpolación ni inyección
         try:
-            insert_sql = f"""
-                INSERT INTO registros (trab_id, otm_id, supervisor_id, fecha, hora)
-                VALUES (:trab_id, :otm_id, :supervisor_id, '{fecha_str}'::date, '{hora}'::time)
-            """
             await database.execute(
-                insert_sql,
+                "INSERT INTO registros (trab_id, otm_id, supervisor_id, fecha, hora) "
+                "VALUES (:trab_id, :otm_id, :supervisor_id, :fch, :hra)",
                 {
                     "trab_id":       trab_id,
                     "otm_id":        otm_id,
                     "supervisor_id": supervisor_id,
+                    "fch":           fch,
+                    "hra":           hora_t,
                 }
             )
             resultados.append({
@@ -711,7 +710,7 @@ async def enviar_directo(data: dict):
         raise HTTPException(400, "supervisor_id y otm_id son requeridos")
     if not trabajadores:
         raise HTTPException(400, "La lista de trabajadores está vacía")
-    hora = hora_lima()
+    hora = hora_lima_t()
     fecha_obj = parse_fecha(fecha_str)
     row = await database.fetch_one(
         "INSERT INTO sesiones "
@@ -735,8 +734,8 @@ async def enviar_directo(data: dict):
         await database.execute(
             "INSERT INTO registros "
             "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-            "VALUES (:tid, :otm, :sup, :fch, :hra::time, :hh) "
-            "ON CONFLICT (trab_id, otm_id, fecha) DO UPDATE SET hh=:hh, hora=:hra::time",
+            "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
+            "ON CONFLICT (trab_id, otm_id, fecha) DO UPDATE SET hh=:hh, hora=:hra",
             {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_real,
              "fch": fecha_obj, "hra": hora}
         )
@@ -1312,7 +1311,7 @@ async def enviar_con_partidas(data: dict):
         base = base - timedelta(days=base.weekday())   # alinear a lunes (consistente con _semana_de)
         semana = max(1, (fecha_obj - base).days // 7 + 1)
 
-    hora = hora_lima()
+    hora = hora_lima_t()
     enviados = 0
     fallidos = 0
 
@@ -1359,9 +1358,9 @@ async def enviar_con_partidas(data: dict):
                 await database.execute(
                     "INSERT INTO registros "
                     "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-                    "VALUES (:tid, :otm, :sup, :fch, :hra::time, :hh) "
+                    "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
                     "ON CONFLICT (trab_id, otm_id, fecha) "
-                    "DO UPDATE SET hh=:hh, hora=:hra::time",
+                    "DO UPDATE SET hh=:hh, hora=:hra",
                     {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_total,
                      "fch": fecha_obj, "hra": hora}
                 )
