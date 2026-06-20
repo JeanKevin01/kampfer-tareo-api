@@ -52,10 +52,139 @@ app.include_router(ev_router)
 @app.on_event("startup")
 async def startup():
     await database.connect()
+    # ── Jornada: reglas de HH por día con vigencia (idempotente) ──
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS ev_jornada_reglas (
+            id          SERIAL PRIMARY KEY,
+            tipo        TEXT  NOT NULL DEFAULT 'semanal',  -- 'semanal' | 'puntual'
+            desde       DATE  NOT NULL,                     -- semanal: vigente desde · puntual: la fecha exacta
+            dia_semana  INT,                                -- semanal: 0=Lun..6=Dom · puntual: NULL
+            hh          NUMERIC(5,2) NOT NULL,
+            nota        TEXT,
+            creado_en   TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+    row = await database.fetch_one(
+        "SELECT COUNT(*) AS n FROM ev_jornada_reglas WHERE tipo = 'semanal'"
+    )
+    if not row or (row["n"] or 0) == 0:
+        # Base inicial: Miércoles 10 HH, resto 9.5 HH (incluye sábado y domingo)
+        for dow in range(7):
+            await database.execute(
+                "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota) "
+                "VALUES ('semanal', '2000-01-01', :d, :h, 'base inicial')",
+                {"d": dow, "h": 10.0 if dow == 2 else 9.5},
+            )
+
+
+async def resolver_jornada(fecha: date) -> float:
+    """HH de jornada vigentes para una fecha:
+    1) excepción puntual exacta de ese día (gana sobre todo),
+    2) regla semanal del día-de-semana con la mayor 'desde' <= fecha,
+    3) fallback (Miércoles 10, resto 9.5)."""
+    r = await database.fetch_one(
+        "SELECT hh FROM ev_jornada_reglas WHERE tipo='puntual' AND desde = :f "
+        "ORDER BY id DESC LIMIT 1",
+        {"f": fecha},
+    )
+    if r:
+        return float(r["hh"])
+    r = await database.fetch_one(
+        "SELECT hh FROM ev_jornada_reglas WHERE tipo='semanal' AND dia_semana = :d "
+        "AND desde <= :f ORDER BY desde DESC, id DESC LIMIT 1",
+        {"d": fecha.weekday(), "f": fecha},
+    )
+    if r:
+        return float(r["hh"])
+    return 10.0 if fecha.weekday() == 2 else 9.5
 
 @app.on_event("shutdown")
 async def shutdown():
     await database.disconnect()
+
+
+# ── JORNADA: reglas de HH por día (configurables, con vigencia) ──
+DIAS_SEM = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+
+
+@app.get("/api/jornada")
+async def jornada_listar():
+    """Reglas vigentes + excepciones + HH resueltas para los 7 días de hoy."""
+    reglas = await database.fetch_all(
+        "SELECT id, tipo, desde::text AS desde, dia_semana, hh, nota, creado_en::text AS creado_en "
+        "FROM ev_jornada_reglas ORDER BY tipo, desde DESC, dia_semana"
+    )
+    hoy = fecha_lima()
+    lunes = hoy - timedelta(days=hoy.weekday())
+    vigentes = []
+    for dow in range(7):
+        f = lunes + timedelta(days=dow)
+        vigentes.append({
+            "dia_semana": dow,
+            "dia": DIAS_SEM[dow],
+            "hh": await resolver_jornada(f),
+        })
+    return {
+        "vigentes": vigentes,
+        "puntuales": [dict(r) for r in reglas if r["tipo"] == "puntual"],
+        "semanal":   [dict(r) for r in reglas if r["tipo"] == "semanal"],
+    }
+
+
+@app.get("/api/jornada/resolver")
+async def jornada_resolver(fecha: Optional[str] = None):
+    """HH referenciales para una fecha (la usa el panel del supervisor)."""
+    f = parse_fecha(fecha) or fecha_lima()
+    return {"fecha": f.isoformat(), "dia_semana": f.weekday(), "hh": await resolver_jornada(f)}
+
+
+@app.post("/api/jornada")
+async def jornada_guardar(data: dict):
+    """Crea reglas de jornada.
+    Semanal: {tipo:'semanal', desde:'YYYY-MM-DD', dias:{0:9.5,...,2:10}}  (uno o varios días)
+    Puntual: {tipo:'puntual', fecha:'YYYY-MM-DD', hh:12, nota?}"""
+    tipo = str(data.get("tipo", "semanal"))
+    if tipo == "puntual":
+        f = parse_fecha(data.get("fecha"))
+        if not f:
+            raise HTTPException(400, "fecha requerida para excepción puntual")
+        hh = float(data.get("hh", 0))
+        if hh <= 0:
+            raise HTTPException(400, "hh debe ser > 0")
+        await database.execute(
+            "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota) "
+            "VALUES ('puntual', :f, NULL, :h, :n)",
+            {"f": f, "h": hh, "n": data.get("nota")},
+        )
+        return {"ok": True}
+
+    # semanal
+    desde = parse_fecha(data.get("desde")) or fecha_lima()
+    dias  = data.get("dias", {})
+    if not dias:
+        raise HTTPException(400, "dias requerido (ej. {\"0\":9.5,\"2\":10})")
+    nota = data.get("nota")
+    n = 0
+    for dow, hh in dias.items():
+        try:
+            dow_i = int(dow); hh_f = float(hh)
+        except (TypeError, ValueError):
+            continue
+        if dow_i < 0 or dow_i > 6 or hh_f <= 0:
+            continue
+        await database.execute(
+            "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota) "
+            "VALUES ('semanal', :d, :dw, :h, :n)",
+            {"d": desde, "dw": dow_i, "h": hh_f, "n": nota},
+        )
+        n += 1
+    return {"ok": True, "reglas_creadas": n}
+
+
+@app.delete("/api/jornada/{regla_id}")
+async def jornada_eliminar(regla_id: int):
+    await database.execute("DELETE FROM ev_jornada_reglas WHERE id = :id", {"id": regla_id})
+    return {"ok": True}
 
 
 # ── SESIONES (Session-First model) ───────────────────────────
@@ -497,10 +626,9 @@ async def registros_por_fecha(fecha: str):
 async def calcular_hh(data: dict = {}):
     fecha_str = data.get("fecha", fecha_lima().isoformat())
 
-    # HH totales según día de semana
+    # HH totales según la jornada vigente para la fecha (reglas configurables)
     fecha_obj = date.fromisoformat(fecha_str)
-    HH_DIA    = {0: 9.5, 1: 9.5, 2: 10.0, 3: 9.5, 4: 9.5}
-    total_hh  = HH_DIA.get(fecha_obj.weekday(), 9.5)
+    total_hh  = await resolver_jornada(fecha_obj)
 
     # Registros del día ordenados por trabajador y hora
     rows = await database.fetch_all(
@@ -976,11 +1104,7 @@ async def enviar_con_partidas(data: dict):
         raise HTTPException(400, "Lista de trabajadores vacía")
 
     fecha_obj = date.fromisoformat(fecha_str)
-    jornada = await database.fetch_one(
-        "SELECT hh_dia FROM ev_config_jornada WHERE dia_semana = :dow AND activo = true",
-        {"dow": fecha_obj.weekday()}
-    )
-    hh_dia = float(jornada["hh_dia"]) if jornada else 9.5
+    hh_dia = await resolver_jornada(fecha_obj)
 
     row_cfg = await database.fetch_one("SELECT valor FROM ev_config WHERE clave = :k", {"k": "fecha_base"})
     semana = 1
