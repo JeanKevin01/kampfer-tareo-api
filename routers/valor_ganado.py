@@ -34,6 +34,17 @@ LIMA = timezone(timedelta(hours=-5))
 def _hoy_lima() -> date:
     return datetime.now(LIMA).date()
 
+def _as_date(v) -> Optional[date]:
+    """Convierte v a date (o None). asyncpg exige date, no str, en parámetros
+    comparados con columnas date o casteados con ::date."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    return date.fromisoformat(str(v)[:10])
+
 _pool: Optional[asyncpg.Pool] = None
 
 
@@ -874,6 +885,8 @@ async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
                 "descripcion":     p["descripcion"],
                 "unidad":          p["unidad"],
                 "hh_presup":       float(p["hh_presup"] or 0),
+                "metrado_presup":  float(p["metrado_presup"] or 0),
+                "metrado_proyec":  float(p["metrado_proyec"]) if p["metrado_proyec"] is not None else None,
                 "nivel":           int(p["nivel"] or 1),
                 "parent_codigo":   p["parent_codigo"],
                 "es_hoja":         p["fase"] is not None,
@@ -1175,8 +1188,8 @@ async def semana_grid(
                      AND hh IS NOT NULL
                    GROUP BY partida_id, fecha""",
                 p_ids,
-                lunes_date.isoformat(),
-                domingo_date.isoformat(),
+                lunes_date,
+                domingo_date,
             )
             hh_map = {
                 (r["partida_id"], r["f"]): float(r["hh_total"] or 0)
@@ -1195,8 +1208,8 @@ async def semana_grid(
                          AND hh IS NOT NULL AND hh > 0
                        GROUP BY fecha""",
                     otm,
-                    lunes_date.isoformat(),
-                    domingo_date.isoformat(),
+                    lunes_date,
+                    domingo_date,
                 )
                 fallback_by_date = {r["f"]: float(r["hh_dia"] or 0) for r in fb}
 
@@ -1207,8 +1220,8 @@ async def semana_grid(
                    WHERE partida_id = ANY($1)
                      AND fecha >= $2::date AND fecha <= $3::date""",
                 p_ids,
-                lunes_date.isoformat(),
-                domingo_date.isoformat(),
+                lunes_date,
+                domingo_date,
             )
             cant_map   = {(r["partida_id"], r["f"]): float(r["cantidad_dia"] or 0) for r in cant_rows}
             cant_exist = {(r["partida_id"], r["f"]) for r in cant_rows}
@@ -1300,7 +1313,7 @@ async def guardar_avance_diario(data: dict):
                VALUES ($1, $2::date, $3, $4, $5, NOW())
                ON CONFLICT (partida_id, fecha)
                DO UPDATE SET cantidad_dia=$4, notas=$5, registrado_en=NOW()""",
-            partida_id, fecha_str, semana, cantidad_dia, notas
+            partida_id, _as_date(fecha_str), semana, cantidad_dia, notas
         )
     return {"ok": True}
 
@@ -1383,10 +1396,10 @@ async def rendimiento_trabajador(
         conds = ["tp.trabajador_id = $1"]
         args: list = [trabajador_id]
         if desde:
-            args.append(desde)
+            args.append(_as_date(desde))
             conds.append(f"tp.fecha >= ${len(args)}::date")
         if hasta:
-            args.append(hasta)
+            args.append(_as_date(hasta))
             conds.append(f"tp.fecha <= ${len(args)}::date")
         where = " AND ".join(conds)
 
@@ -1633,7 +1646,7 @@ async def sesiones_sin_asignar(
             fecha = _hoy_lima().isoformat()
 
         conds = ["s.estado = 'enviada'", "s.fecha = $1"]
-        args: list = [fecha]
+        args: list = [_as_date(fecha)]
         if otm_id:
             args.append(otm_id)
             conds.append(f"s.otm_id = ${len(args)}")
@@ -1817,7 +1830,7 @@ async def hh_trabajador_dia(trabajador_id: str, fecha: str):
                LEFT JOIN ev_partidas p ON p.id = stp.partida_id
                WHERE stp.trabajador_id=$1 AND stp.fecha=$2::date
                ORDER BY s.id""",
-            trabajador_id, fecha
+            trabajador_id, _as_date(fecha)
         )
         total = sum(float(r["hh"] or 0) for r in rows)
         return {
@@ -1924,7 +1937,7 @@ async def listar_conflictos(
         if estado:
             args.append(estado);  conds.append(f"c.estado = ${len(args)}")
         if fecha:
-            args.append(fecha);   conds.append(f"c.fecha  = ${len(args)}::date")
+            args.append(_as_date(fecha));   conds.append(f"c.fecha  = ${len(args)}::date")
         where = " AND ".join(conds)
         rows = await con.fetch(
             f"""SELECT c.*,
