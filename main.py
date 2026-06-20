@@ -457,9 +457,9 @@ async def enviar_sesion(sesion_id: int, data: dict):
             await database.execute(
                 "INSERT INTO registros "
                 "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-                "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
+                "VALUES (:tid, :otm, :sup, :fch, :hra::time, :hh) "
                 "ON CONFLICT (trab_id, otm_id, fecha) "
-                "DO UPDATE SET hh = :hh, hora = :hra",
+                "DO UPDATE SET hh = :hh, hora = :hra::time",
                 {"tid": t["trab_id"], "otm": sesion["otm_id"],
                  "sup": sesion["supervisor_id"], "hh": hh,
                  "fch": parse_fecha(fecha_str), "hra": hora}
@@ -735,8 +735,8 @@ async def enviar_directo(data: dict):
         await database.execute(
             "INSERT INTO registros "
             "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-            "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
-            "ON CONFLICT (trab_id, otm_id, fecha) DO UPDATE SET hh=:hh, hora=:hra",
+            "VALUES (:tid, :otm, :sup, :fch, :hra::time, :hh) "
+            "ON CONFLICT (trab_id, otm_id, fecha) DO UPDATE SET hh=:hh, hora=:hra::time",
             {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_real,
              "fch": fecha_obj, "hra": hora}
         )
@@ -1359,9 +1359,9 @@ async def enviar_con_partidas(data: dict):
                 await database.execute(
                     "INSERT INTO registros "
                     "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-                    "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
+                    "VALUES (:tid, :otm, :sup, :fch, :hra::time, :hh) "
                     "ON CONFLICT (trab_id, otm_id, fecha) "
-                    "DO UPDATE SET hh=:hh, hora=:hra",
+                    "DO UPDATE SET hh=:hh, hora=:hra::time",
                     {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_total,
                      "fch": fecha_obj, "hra": hora}
                 )
