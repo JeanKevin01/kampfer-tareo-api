@@ -1048,6 +1048,8 @@ async def isp_reporte(otm: Optional[str] = None):
                 "metrado_proyec": mp,
                 "factor_conv":  fc,
                 "es_hoja":      p["fase"] is not None,
+                "nivel":        int(p["nivel"] or 1),
+                "parent_codigo": p["parent_codigo"],
                 "semanas":      {},
             }
 
