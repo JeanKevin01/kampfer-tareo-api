@@ -598,6 +598,32 @@ async def _hh_real_por_semana(con) -> dict:
     return out
 
 
+async def _hh_real_split(con) -> dict:
+    """{(partida_id, semana): {'dir':hh_directas, 'tot':hh_totales}} desde tareo_partida,
+    clasificando por trabajadores.tipo (INDIRECTO vs resto = DIRECTO). Sirve para sacar
+    la fracción directa de cada partida y separar el PF directo del total."""
+    out: dict = {}
+    base = await _fecha_base(con)
+    if not base:
+        return out
+    rows = await con.fetch(
+        """SELECT tp.partida_id, tp.fecha,
+                  SUM(tp.hh) AS tot,
+                  SUM(CASE WHEN COALESCE(t.tipo,'DIRECTO') <> 'INDIRECTO'
+                           THEN tp.hh ELSE 0 END) AS dir
+           FROM tareo_partida tp
+           LEFT JOIN trabajadores t ON t.id = tp.trabajador_id
+           WHERE tp.hh IS NOT NULL
+           GROUP BY tp.partida_id, tp.fecha"""
+    )
+    for r in rows:
+        k = (r['partida_id'], _semana_de(r['fecha'], base))
+        e = out.setdefault(k, {'dir': 0.0, 'tot': 0.0})
+        e['dir'] += float(r['dir'] or 0)
+        e['tot'] += float(r['tot'] or 0)
+    return out
+
+
 async def _hh_gastadas_unificada(con) -> dict:
     """FUENTE ÚNICA de HH gastadas por (partida, semana) para árbol/ISP/reporte.
 
@@ -728,15 +754,26 @@ def _acum_a_semana(avances, semana: int) -> dict:
     return acum
 
 
-def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int):
+def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int, split=None):
     """hh_rows: ev_hh_gastadas (manual/importado). tareo: {(pid,sem):hh} del QR.
-    HH gastadas totales = manual + tareo."""
+    split: {(pid,sem):{'dir','tot'}} de tareo_partida por tipo de trabajador.
+    HH gastadas totales = manual + tareo; las directas = total × fracción directa."""
     por_partida = defaultdict(list)
     for h in hitos:
         por_partida[h["partida_id"]].append(h)
 
     acum_s = _acum_a_semana(avances, semana)
     acum_prev = _acum_a_semana(avances, semana - 1)
+
+    # Fracción directa por partida (acumulada y de la semana) desde tareo_partida real
+    split = split or {}
+    dir_acum_map, tot_acum_map = defaultdict(float), defaultdict(float)
+    dir_sem_map, tot_sem_map = defaultdict(float), defaultdict(float)
+    for (pid, s), e in split.items():
+        if s <= semana:
+            dir_acum_map[pid] += e["dir"]; tot_acum_map[pid] += e["tot"]
+        if s == semana:
+            dir_sem_map[pid] += e["dir"]; tot_sem_map[pid] += e["tot"]
 
     hh_acum, hh_sem = defaultdict(float), defaultdict(float)
     # Claves (partida_id, semana) con entrada manual — evita doble-conteo con tareo auto
@@ -780,6 +817,16 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int):
 
         pf_acum = (ganadas_acum / gastadas_acum) if gastadas_acum > 0 else 0.0
         pf_sem = (ganadas_sem / gastadas_sem) if gastadas_sem > 0 else 0.0
+
+        # Directa vs indirecta: fracción directa aplicada al total unificado
+        frac_acum = (dir_acum_map[pid] / tot_acum_map[pid]) if tot_acum_map[pid] > 0 else 1.0
+        frac_sem = (dir_sem_map[pid] / tot_sem_map[pid]) if tot_sem_map[pid] > 0 else 1.0
+        gastadas_dir_acum = gastadas_acum * frac_acum
+        gastadas_ind_acum = gastadas_acum - gastadas_dir_acum
+        gastadas_dir_sem = gastadas_sem * frac_sem
+        pf_dir_acum = (ganadas_acum / gastadas_dir_acum) if gastadas_dir_acum > 0 else 0.0
+        pf_dir_sem = (ganadas_sem / gastadas_dir_sem) if gastadas_dir_sem > 0 else 0.0
+
         prod_real = (gastadas_acum / cant_inst) if cant_inst > 0 else 0.0
         saldo_met = max(mp - cant_inst, 0.0)
         eac_hh = (prod_real * saldo_met + gastadas_acum) if cant_inst > 0 else hh_proyec
@@ -801,8 +848,13 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int):
             "hh_ganadas_acum": round(ganadas_acum, 2),
             "hh_gastadas_sem": round(gastadas_sem, 2),
             "hh_gastadas_acum": round(gastadas_acum, 2),
+            "hh_gastadas_dir_acum": round(gastadas_dir_acum, 2),
+            "hh_gastadas_ind_acum": round(gastadas_ind_acum, 2),
+            "hh_gastadas_dir_sem": round(gastadas_dir_sem, 2),
             "pf_sem": round(pf_sem, 3),
             "pf_acum": round(pf_acum, 3),
+            "pf_dir_acum": round(pf_dir_acum, 3),
+            "pf_dir_sem": round(pf_dir_sem, 3),
             "prod_presup": round(prod_presup, 4),
             "prod_real": round(prod_real, 4),
             "eac_hh": round(eac_hh, 2),
@@ -852,9 +904,10 @@ async def _datos_base(semana: int, otm: Optional[str] = None):
             "SELECT partida_id, semana, hh FROM ev_hh_gastadas WHERE semana <= $1", semana
         )
         tareo = await _hh_gastadas_unificada(con)
+        split = await _hh_real_split(con)
     # hh_rows se devuelve vacío: las HH gastadas ya vienen unificadas en `tareo`
     # (manual > tareo_partida real > histórico > proporcional). Ver _hh_gastadas_unificada.
-    return partidas, hitos, avances, [], tareo
+    return partidas, hitos, avances, [], tareo, split
 
 
 
@@ -936,8 +989,9 @@ async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
                 "SELECT hito_id, semana, cantidad_acum FROM ev_avances WHERE semana <= $1", semana
             )
             tareo   = await _hh_gastadas_unificada(con)
+            split   = await _hh_real_split(con)
 
-        filas_ev = _calcular(list(partidas), list(hitos), list(avances), [], tareo, semana)
+        filas_ev = _calcular(list(partidas), list(hitos), list(avances), [], tareo, semana, split)
         ev_por_id = {f["partida_id"]: f for f in filas_ev}
 
         result = []
@@ -960,8 +1014,11 @@ async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
                 "es_hoja":         p["fase"] is not None,
                 "hh_ganadas_acum": ev.get("hh_ganadas_acum", 0.0),
                 "hh_gastadas_acum":ev.get("hh_gastadas_acum", 0.0),
+                "hh_gastadas_dir_acum": ev.get("hh_gastadas_dir_acum", 0.0),
+                "hh_gastadas_ind_acum": ev.get("hh_gastadas_ind_acum", 0.0),
                 "pct_avance":      ev.get("pct_avance", 0.0),
                 "pf_acum":         ev.get("pf_acum", 0.0),
+                "pf_dir_acum":     ev.get("pf_dir_acum", 0.0),
             })
         return {"semana": semana, "otm": otm, "filas": result}
     except HTTPException:
@@ -1093,6 +1150,7 @@ async def isp_reporte(otm: Optional[str] = None):
             hitos   = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
             avances = await con.fetch("SELECT * FROM ev_avances ORDER BY semana")
             tareo   = await _hh_gastadas_unificada(con)
+            split   = await _hh_real_split(con)
 
         # Calcular EV para cada semana (una llamada por semana, datos cargados en memoria)
         result_por_partida: dict = {}
@@ -1119,7 +1177,7 @@ async def isp_reporte(otm: Optional[str] = None):
             }
 
         for s in range(1, total + 1):
-            filas = _calcular(list(partidas), list(hitos), list(avances), [], tareo, s)
+            filas = _calcular(list(partidas), list(hitos), list(avances), [], tareo, s, split)
             for f in filas:
                 pid = f["partida_id"]
                 if pid in result_por_partida:
@@ -1160,12 +1218,14 @@ async def isp_reporte(otm: Optional[str] = None):
 
 @router.get("/reporte")
 async def reporte(semana: int, otm: Optional[str] = None):
-    partidas, hitos, avances, hh, tareo = await _datos_base(semana, otm)
-    filas = _calcular(partidas, hitos, avances, hh, tareo, semana)
+    partidas, hitos, avances, hh, tareo, split = await _datos_base(semana, otm)
+    filas = _calcular(partidas, hitos, avances, hh, tareo, semana, split)
 
     tot_proyec = sum(f["hh_proyec"] for f in filas)
     tot_ganadas = sum(f["hh_ganadas_acum"] for f in filas)
     tot_gastadas = sum(f["hh_gastadas_acum"] for f in filas)
+    tot_gas_dir = sum(f["hh_gastadas_dir_acum"] for f in filas)
+    tot_gas_ind = sum(f["hh_gastadas_ind_acum"] for f in filas)
     tot_gan_sem = sum(f["hh_ganadas_sem"] for f in filas)
     tot_gas_sem = sum(f["hh_gastadas_sem"] for f in filas)
     tot_eac = sum(f["eac_hh"] for f in filas)
@@ -1179,8 +1239,11 @@ async def reporte(semana: int, otm: Optional[str] = None):
             "hh_gastadas_acum": round(tot_gastadas, 2),
             "hh_ganadas_sem": round(tot_gan_sem, 2),
             "hh_gastadas_sem": round(tot_gas_sem, 2),
+            "hh_gastadas_dir_acum": round(tot_gas_dir, 2),
+            "hh_gastadas_ind_acum": round(tot_gas_ind, 2),
             "pct_avance": round(tot_ganadas / tot_proyec, 4) if tot_proyec > 0 else 0,
             "pf_acum": round(tot_ganadas / tot_gastadas, 3) if tot_gastadas > 0 else 0,
+            "pf_dir_acum": round(tot_ganadas / tot_gas_dir, 3) if tot_gas_dir > 0 else 0,
             "pf_sem": round(tot_gan_sem / tot_gas_sem, 3) if tot_gas_sem > 0 else 0,
             "eac_hh": round(tot_eac, 2),
             "desvio_hh": round(tot_eac - tot_proyec, 2),
@@ -1194,7 +1257,7 @@ async def reporte(semana: int, otm: Optional[str] = None):
 
 @router.get("/curva")
 async def curva(hasta: int, otm: Optional[str] = None):
-    partidas, hitos, avances, hh, tareo = await _datos_base(hasta, otm)
+    partidas, hitos, avances, hh, tareo, _split = await _datos_base(hasta, otm)
     semanas_set = sorted(
         {a["semana"] for a in avances} | {r["semana"] for r in hh}
         | {s for (_, s) in tareo.keys()} | {hasta}
@@ -1221,7 +1284,7 @@ async def curva(hasta: int, otm: Optional[str] = None):
 @router.get("/curva-fase")
 async def curva_fase(hasta: int, otm: Optional[str] = None):
     """Serie semanal de PF acumulado por fase — gráficos por disciplina."""
-    partidas, hitos, avances, hh, tareo = await _datos_base(hasta, otm)
+    partidas, hitos, avances, hh, tareo, _split = await _datos_base(hasta, otm)
     semanas_set = sorted(
         {a["semana"] for a in avances} | {r["semana"] for r in hh}
         | {s for (_, s) in tareo.keys()} | {hasta}
