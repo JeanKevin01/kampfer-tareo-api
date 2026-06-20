@@ -1,10 +1,29 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from database import database
 from datetime import date, datetime, timezone, timedelta
 from typing import Optional
+import os
 import re
 from routers.valor_ganado import router as ev_router
+
+# ── Seguridad Fase 1: API key compartida (retrocompatible) ──
+# Mientras API_KEY no esté seteada, NO se exige nada (despliegue sin cortar la operación).
+# Rollout: 1) desplegar API, 2) desplegar panel/web con la key, 3) recién setear API_KEY aquí.
+API_KEY = os.getenv("API_KEY", "").strip()
+_PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc"}
+
+async def require_key(request: Request, x_api_key: str = Header(default="")):
+    if not API_KEY:                       # aún no configurada → no exige (compat)
+        return
+    if request.url.path in _PUBLIC_PATHS or request.method == "OPTIONS":
+        return
+    if x_api_key != API_KEY:
+        raise HTTPException(401, "API key inválida o ausente")
+
+# Orígenes permitidos por entorno (CSV). Default '*' = comportamiento actual hasta configurarlo.
+_origins_env = os.getenv("ALLOWED_ORIGINS", "*").strip()
+ALLOWED_ORIGINS = ["*"] if _origins_env in ("", "*") else [o.strip() for o in _origins_env.split(",") if o.strip()]
 
 # Zona horaria de Peru (UTC-5)
 LIMA = timezone(timedelta(hours=-5))
@@ -37,11 +56,11 @@ def parse_fecha(v):
             return None
     return None
 
-app = FastAPI(title="Kampfer Tareo API", version="1.2.0")
+app = FastAPI(title="Kampfer Tareo API", version="1.3.0", dependencies=[Depends(require_key)])
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
