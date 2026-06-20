@@ -64,6 +64,10 @@ async def startup():
             creado_en   TIMESTAMPTZ NOT NULL DEFAULT now()
         )
     """)
+    # OTM opcional: NULL = aplica a todas las OTMs (regla global)
+    await database.execute(
+        "ALTER TABLE ev_jornada_reglas ADD COLUMN IF NOT EXISTS otm_id TEXT"
+    )
     row = await database.fetch_one(
         "SELECT COUNT(*) AS n FROM ev_jornada_reglas WHERE tipo = 'semanal'"
     )
@@ -77,26 +81,38 @@ async def startup():
             )
 
 
-async def resolver_jornada(fecha: date) -> float:
-    """HH de jornada vigentes para una fecha:
-    1) excepción puntual exacta de ese día (gana sobre todo),
+async def resolver_jornada(fecha: date, otm_id: Optional[str] = None) -> float:
+    """HH de jornada vigentes para una fecha (y opcionalmente una OTM):
+    En cada nivel, una regla de la OTM específica gana sobre la global (otm_id NULL).
+    1) excepción puntual exacta de ese día,
     2) regla semanal del día-de-semana con la mayor 'desde' <= fecha,
     3) fallback (Miércoles 10, resto 9.5)."""
+    dow = fecha.weekday()
+    # 1) Puntual: OTM específica → global
+    if otm_id:
+        r = await database.fetch_one(
+            "SELECT hh FROM ev_jornada_reglas WHERE tipo='puntual' AND desde=:f AND otm_id=:o "
+            "ORDER BY id DESC LIMIT 1", {"f": fecha, "o": otm_id})
+        if r:
+            return float(r["hh"])
     r = await database.fetch_one(
-        "SELECT hh FROM ev_jornada_reglas WHERE tipo='puntual' AND desde = :f "
-        "ORDER BY id DESC LIMIT 1",
-        {"f": fecha},
-    )
+        "SELECT hh FROM ev_jornada_reglas WHERE tipo='puntual' AND desde=:f AND otm_id IS NULL "
+        "ORDER BY id DESC LIMIT 1", {"f": fecha})
     if r:
         return float(r["hh"])
+    # 2) Semanal: OTM específica → global
+    if otm_id:
+        r = await database.fetch_one(
+            "SELECT hh FROM ev_jornada_reglas WHERE tipo='semanal' AND dia_semana=:d AND desde<=:f "
+            "AND otm_id=:o ORDER BY desde DESC, id DESC LIMIT 1", {"d": dow, "f": fecha, "o": otm_id})
+        if r:
+            return float(r["hh"])
     r = await database.fetch_one(
-        "SELECT hh FROM ev_jornada_reglas WHERE tipo='semanal' AND dia_semana = :d "
-        "AND desde <= :f ORDER BY desde DESC, id DESC LIMIT 1",
-        {"d": fecha.weekday(), "f": fecha},
-    )
+        "SELECT hh FROM ev_jornada_reglas WHERE tipo='semanal' AND dia_semana=:d AND desde<=:f "
+        "AND otm_id IS NULL ORDER BY desde DESC, id DESC LIMIT 1", {"d": dow, "f": fecha})
     if r:
         return float(r["hh"])
-    return 10.0 if fecha.weekday() == 2 else 9.5
+    return 10.0 if dow == 2 else 9.5
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -108,12 +124,15 @@ DIAS_SEM = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Do
 
 
 @app.get("/api/jornada")
-async def jornada_listar():
-    """Reglas vigentes + excepciones + HH resueltas para los 7 días de hoy."""
+async def jornada_listar(otm: Optional[str] = None):
+    """Reglas + HH resueltas para los 7 días de hoy. 'otm' (opcional) calcula
+    los vigentes para esa OTM (regla de la OTM gana sobre la global)."""
     reglas = await database.fetch_all(
-        "SELECT id, tipo, desde::text AS desde, dia_semana, hh, nota, creado_en::text AS creado_en "
-        "FROM ev_jornada_reglas ORDER BY tipo, desde DESC, dia_semana"
+        "SELECT id, tipo, desde::text AS desde, dia_semana, hh, nota, otm_id, "
+        "       creado_en::text AS creado_en "
+        "FROM ev_jornada_reglas ORDER BY tipo, otm_id NULLS FIRST, desde DESC, dia_semana"
     )
+    otm_id = (otm or "").strip() or None
     hoy = fecha_lima()
     lunes = hoy - timedelta(days=hoy.weekday())
     vigentes = []
@@ -122,9 +141,10 @@ async def jornada_listar():
         vigentes.append({
             "dia_semana": dow,
             "dia": DIAS_SEM[dow],
-            "hh": await resolver_jornada(f),
+            "hh": await resolver_jornada(f, otm_id),
         })
     return {
+        "otm": otm_id,
         "vigentes": vigentes,
         "puntuales": [dict(r) for r in reglas if r["tipo"] == "puntual"],
         "semanal":   [dict(r) for r in reglas if r["tipo"] == "semanal"],
@@ -132,18 +152,21 @@ async def jornada_listar():
 
 
 @app.get("/api/jornada/resolver")
-async def jornada_resolver(fecha: Optional[str] = None):
-    """HH referenciales para una fecha (la usa el panel del supervisor)."""
+async def jornada_resolver(fecha: Optional[str] = None, otm: Optional[str] = None):
+    """HH referenciales para una fecha y OTM (la usa el panel del supervisor)."""
     f = parse_fecha(fecha) or fecha_lima()
-    return {"fecha": f.isoformat(), "dia_semana": f.weekday(), "hh": await resolver_jornada(f)}
+    otm_id = (otm or "").strip() or None
+    return {"fecha": f.isoformat(), "dia_semana": f.weekday(), "otm": otm_id,
+            "hh": await resolver_jornada(f, otm_id)}
 
 
 @app.post("/api/jornada")
 async def jornada_guardar(data: dict):
-    """Crea reglas de jornada.
-    Semanal: {tipo:'semanal', desde:'YYYY-MM-DD', dias:{0:9.5,...,2:10}}  (uno o varios días)
-    Puntual: {tipo:'puntual', fecha:'YYYY-MM-DD', hh:12, nota?}"""
+    """Crea reglas de jornada. 'otm_id' opcional (null/ausente = todas las OTMs).
+    Semanal: {tipo:'semanal', desde:'YYYY-MM-DD', dias:{0:9.5,...,2:10}, otm_id?}
+    Puntual: {tipo:'puntual', fecha:'YYYY-MM-DD', hh:12, nota?, otm_id?}"""
     tipo = str(data.get("tipo", "semanal"))
+    otm_id = (str(data.get("otm_id") or "").strip()) or None
     if tipo == "puntual":
         f = parse_fecha(data.get("fecha"))
         if not f:
@@ -152,9 +175,9 @@ async def jornada_guardar(data: dict):
         if hh <= 0:
             raise HTTPException(400, "hh debe ser > 0")
         await database.execute(
-            "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota) "
-            "VALUES ('puntual', :f, NULL, :h, :n)",
-            {"f": f, "h": hh, "n": data.get("nota")},
+            "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota, otm_id) "
+            "VALUES ('puntual', :f, NULL, :h, :n, :o)",
+            {"f": f, "h": hh, "n": data.get("nota"), "o": otm_id},
         )
         return {"ok": True}
 
@@ -173,9 +196,9 @@ async def jornada_guardar(data: dict):
         if dow_i < 0 or dow_i > 6 or hh_f <= 0:
             continue
         await database.execute(
-            "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota) "
-            "VALUES ('semanal', :d, :dw, :h, :n)",
-            {"d": desde, "dw": dow_i, "h": hh_f, "n": nota},
+            "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota, otm_id) "
+            "VALUES ('semanal', :d, :dw, :h, :n, :o)",
+            {"d": desde, "dw": dow_i, "h": hh_f, "n": nota, "o": otm_id},
         )
         n += 1
     return {"ok": True, "reglas_creadas": n}
@@ -1155,7 +1178,7 @@ async def enviar_con_partidas(data: dict):
         raise HTTPException(400, "Lista de trabajadores vacía")
 
     fecha_obj = date.fromisoformat(fecha_str)
-    hh_dia = await resolver_jornada(fecha_obj)
+    hh_dia = await resolver_jornada(fecha_obj, otm_id)
 
     row_cfg = await database.fetch_one("SELECT valor FROM ev_config WHERE clave = :k", {"k": "fecha_base"})
     semana = 1
