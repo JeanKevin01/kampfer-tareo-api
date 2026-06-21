@@ -5,6 +5,12 @@ from datetime import date, datetime, timezone, timedelta
 from typing import Optional
 import os
 import re
+import hmac
+import hashlib
+import base64
+import json
+import time
+import secrets
 from routers.valor_ganado import router as ev_router
 
 # ── Seguridad Fase 1: API key compartida (retrocompatible) ──
@@ -24,6 +30,66 @@ async def require_key(request: Request, x_api_key: str = Header(default="")):
 # Orígenes permitidos por entorno (CSV). Default '*' = comportamiento actual hasta configurarlo.
 _origins_env = os.getenv("ALLOWED_ORIGINS", "*").strip()
 ALLOWED_ORIGINS = ["*"] if _origins_env in ("", "*") else [o.strip() for o in _origins_env.split(",") if o.strip()]
+
+# ── Seguridad Fase 2: autenticación por usuario (JWT propio, sin dependencias) ──
+# Roles: 'admin' (todo) | 'oficina' (panel) | 'supervisor' (app). Token firmado con HMAC-SHA256.
+JWT_SECRET = (os.getenv("JWT_SECRET", "").strip() or "kampfer-cambia-este-secreto-en-produccion")
+TOKEN_TTL  = int(os.getenv("TOKEN_TTL_SEG", str(60 * 60 * 12)))   # 12 h por defecto
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")          # solo para el seed inicial
+
+def _hash_pw(password: str, salt: Optional[str] = None) -> str:
+    salt = salt or secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 100_000)
+    return f"{salt}${dk.hex()}"
+
+def _check_pw(password: str, stored: str) -> bool:
+    try:
+        salt, h = stored.split("$", 1)
+        dk = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 100_000)
+        return hmac.compare_digest(dk.hex(), h)
+    except Exception:
+        return False
+
+def _b64u(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+def _b64u_dec(s: str) -> bytes:
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+def make_token(sub: str, rol: str, nombre: str = "") -> str:
+    payload = {"sub": sub, "rol": rol, "nombre": nombre, "exp": int(time.time()) + TOKEN_TTL}
+    body = _b64u(json.dumps(payload, separators=(",", ":")).encode())
+    sig = _b64u(hmac.new(JWT_SECRET.encode(), body.encode(), hashlib.sha256).digest())
+    return f"{body}.{sig}"
+
+def verify_token(token: str) -> Optional[dict]:
+    try:
+        body, sig = token.split(".")
+        esperado = _b64u(hmac.new(JWT_SECRET.encode(), body.encode(), hashlib.sha256).digest())
+        if not hmac.compare_digest(sig, esperado):
+            return None
+        p = json.loads(_b64u_dec(body))
+        if int(p.get("exp", 0)) < time.time():
+            return None
+        return p
+    except Exception:
+        return None
+
+async def current_user(authorization: str = Header(default="")) -> Optional[dict]:
+    """No-enforcing: devuelve el usuario del token si es válido, o None. No rompe nada."""
+    if authorization[:7].lower() == "bearer ":
+        return verify_token(authorization[7:])
+    return None
+
+def require_role(*roles: str):
+    """Dependencia que EXIGE estar autenticado y (opcionalmente) un rol. 'admin' siempre pasa."""
+    async def dep(user: Optional[dict] = Depends(current_user)) -> dict:
+        if not user:
+            raise HTTPException(401, "No autenticado")
+        if roles and user.get("rol") != "admin" and user.get("rol") not in roles:
+            raise HTTPException(403, "No tienes permiso para esta acción")
+        return user
+    return dep
 
 # Zona horaria de Peru (UTC-5)
 LIMA = timezone(timedelta(hours=-5))
@@ -99,6 +165,26 @@ async def startup():
                 "VALUES ('semanal', '2000-01-01', :d, :h, 'base inicial')",
                 {"d": dow, "h": 10.0 if dow == 2 else 9.5},
             )
+
+    # ── Fase 2: usuarios para login (idempotente) + seed admin inicial ──
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id            SERIAL PRIMARY KEY,
+            username      TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            rol           TEXT NOT NULL DEFAULT 'oficina',  -- admin | oficina | supervisor
+            nombre        TEXT,
+            activo        BOOLEAN NOT NULL DEFAULT true,
+            creado_en     TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+    urow = await database.fetch_one("SELECT COUNT(*) AS n FROM usuarios")
+    if not urow or (urow["n"] or 0) == 0:
+        await database.execute(
+            "INSERT INTO usuarios (username, password_hash, rol, nombre) "
+            "VALUES ('admin', :p, 'admin', 'Administrador')",
+            {"p": _hash_pw(ADMIN_PASSWORD)},
+        )
 
 
 async def resolver_jornada(fecha: date, otm_id: Optional[str] = None) -> float:
@@ -367,6 +453,78 @@ async def trabajadores_merge(data: dict):
         await database.execute(
             "UPDATE trabajadores SET activo = false WHERE id = :o", {"o": origen})
     return {"ok": True, "fusionado": origen, "en": destino, "tablas": len(cols)}
+
+
+# ── AUTH (Fase 2): login JWT + gestión de usuarios ───────────
+@app.post("/api/auth/login")
+async def auth_login(data: dict):
+    username = str(data.get("username", "")).strip()
+    password = str(data.get("password", ""))
+    if not username or not password:
+        raise HTTPException(400, "Usuario y contraseña requeridos")
+    row = await database.fetch_one(
+        "SELECT username, password_hash, rol, nombre FROM usuarios "
+        "WHERE lower(username) = lower(:u) AND activo = true",
+        {"u": username},
+    )
+    if not row or not _check_pw(password, row["password_hash"]):
+        raise HTTPException(401, "Usuario o contraseña inválidos")
+    token = make_token(row["username"], row["rol"], row["nombre"] or "")
+    return {"token": token, "username": row["username"], "rol": row["rol"], "nombre": row["nombre"]}
+
+
+@app.get("/api/auth/me")
+async def auth_me(user: Optional[dict] = Depends(current_user)):
+    if not user:
+        raise HTTPException(401, "No autenticado")
+    return {"username": user.get("sub"), "rol": user.get("rol"), "nombre": user.get("nombre")}
+
+
+@app.get("/api/admin/usuarios")
+async def usuarios_listar(_u: dict = Depends(require_role("admin"))):
+    rows = await database.fetch_all(
+        "SELECT id, username, rol, nombre, activo, creado_en::text AS creado_en "
+        "FROM usuarios ORDER BY username"
+    )
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/admin/usuarios")
+async def usuarios_crear(data: dict, _u: dict = Depends(require_role("admin"))):
+    username = str(data.get("username", "")).strip()
+    password = str(data.get("password", ""))
+    rol = str(data.get("rol", "oficina")).strip()
+    if not username or not password:
+        raise HTTPException(400, "username y password requeridos")
+    if rol not in ("admin", "oficina", "supervisor"):
+        rol = "oficina"
+    try:
+        await database.execute(
+            "INSERT INTO usuarios (username, password_hash, rol, nombre) "
+            "VALUES (:u, :p, :r, :n)",
+            {"u": username, "p": _hash_pw(password), "r": rol, "n": data.get("nombre")},
+        )
+    except Exception:
+        raise HTTPException(409, "El usuario ya existe")
+    return {"ok": True}
+
+
+@app.put("/api/admin/usuarios/{uid}/password")
+async def usuarios_password(uid: int, data: dict, _u: dict = Depends(require_role("admin"))):
+    password = str(data.get("password", ""))
+    if len(password) < 4:
+        raise HTTPException(400, "La contraseña debe tener al menos 4 caracteres")
+    await database.execute(
+        "UPDATE usuarios SET password_hash = :p WHERE id = :id",
+        {"p": _hash_pw(password), "id": uid},
+    )
+    return {"ok": True}
+
+
+@app.put("/api/admin/usuarios/{uid}/baja")
+async def usuarios_baja(uid: int, _u: dict = Depends(require_role("admin"))):
+    await database.execute("UPDATE usuarios SET activo = false WHERE id = :id", {"id": uid})
+    return {"ok": True}
 
 
 # ── SESIONES (Session-First model) ───────────────────────────
