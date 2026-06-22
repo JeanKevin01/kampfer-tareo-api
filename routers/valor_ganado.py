@@ -45,6 +45,21 @@ def _as_date(v) -> Optional[date]:
         return v
     return date.fromisoformat(str(v)[:10])
 
+
+def _get(row, key, default=None):
+    """Acceso tolerante a dict y a asyncpg.Record (que no tiene .get())."""
+    try:
+        v = row[key]
+    except (KeyError, IndexError):
+        return default
+    return default if v is None else v
+
+
+def _norm_tipo_costo(v) -> str:
+    """Normaliza a 'DIRECTO' | 'INDIRECTO' (default DIRECTO)."""
+    t = str(v or "DIRECTO").strip().upper()
+    return "INDIRECTO" if t == "INDIRECTO" else "DIRECTO"
+
 _pool: Optional[asyncpg.Pool] = None
 
 
@@ -111,6 +126,7 @@ class ImpPartida(BaseModel):
     metrado_presup: float = 0
     metrado_proyec: Optional[float] = None
     hh_presup: float = 0
+    tipo_costo: Optional[str] = None      # 'DIRECTO' (def) | 'INDIRECTO'
     tipo_actividad: Optional[str] = None
     hitos: Optional[list[HitoIn]] = None
     nivel: Optional[int] = None          # profundidad en el WBS (calculado si None)
@@ -351,6 +367,7 @@ async def importar(body: ImportarIn):
                 parent_codigo = p.parent_codigo
                 if parent_codigo is None and nivel > 1:
                     parent_codigo = sep.join(p.codigo.split(sep)[:-1])
+                tipo_costo = _norm_tipo_costo(p.tipo_costo)
 
                 # Resolver hitos según tipo de nodo
                 if p.fase is None:
@@ -388,10 +405,11 @@ async def importar(body: ImportarIn):
                     await con.execute(
                         """UPDATE ev_partidas SET otm_id=$2, fase=$3, sub_fase=$4, descripcion=$5,
                            unidad=$6, sistema=$7, metrado_presup=$8, metrado_proyec=$9,
-                           hh_presup=$10, nivel=$11, parent_codigo=$12, activo=TRUE WHERE id=$1""",
+                           hh_presup=$10, nivel=$11, parent_codigo=$12, tipo_costo=$13,
+                           activo=TRUE WHERE id=$1""",
                         existente, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
                         p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
-                        nivel, parent_codigo,
+                        nivel, parent_codigo, tipo_costo,
                     )
                     await con.execute("DELETE FROM ev_hitos WHERE partida_id=$1", existente)
                     pid = existente; actualizadas += 1
@@ -399,11 +417,11 @@ async def importar(body: ImportarIn):
                     pid = await con.fetchval(
                         """INSERT INTO ev_partidas
                            (codigo, otm_id, fase, sub_fase, descripcion, unidad, sistema,
-                            metrado_presup, metrado_proyec, hh_presup, nivel, parent_codigo)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id""",
+                            metrado_presup, metrado_proyec, hh_presup, nivel, parent_codigo, tipo_costo)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id""",
                         p.codigo, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
                         p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
-                        nivel, parent_codigo,
+                        nivel, parent_codigo, tipo_costo,
                     )
                     creadas += 1
                 codigo_a_id[p.codigo] = pid
@@ -766,15 +784,9 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int, split=None)
     acum_s = _acum_a_semana(avances, semana)
     acum_prev = _acum_a_semana(avances, semana - 1)
 
-    # Fracción directa por partida (acumulada y de la semana) desde tareo_partida real
-    split = split or {}
-    dir_acum_map, tot_acum_map = defaultdict(float), defaultdict(float)
-    dir_sem_map, tot_sem_map = defaultdict(float), defaultdict(float)
-    for (pid, s), e in split.items():
-        if s <= semana:
-            dir_acum_map[pid] += e["dir"]; tot_acum_map[pid] += e["tot"]
-        if s == semana:
-            dir_sem_map[pid] += e["dir"]; tot_sem_map[pid] += e["tot"]
+    # Directo/Indirecto se define por PARTIDA (campo tipo_costo), igual que el ISP del
+    # gerente: toda la HH de una partida INDIRECTA es indirecta; de una DIRECTA, directa.
+    # (El parámetro `split` por tipo de trabajador queda obsoleto y se ignora.)
 
     hh_acum, hh_sem = defaultdict(float), defaultdict(float)
     # Claves (partida_id, semana) con entrada manual — evita doble-conteo con tareo auto
@@ -819,9 +831,10 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int, split=None)
         pf_acum = (ganadas_acum / gastadas_acum) if gastadas_acum > 0 else 0.0
         pf_sem = (ganadas_sem / gastadas_sem) if gastadas_sem > 0 else 0.0
 
-        # Directa vs indirecta: fracción directa aplicada al total unificado
-        frac_acum = (dir_acum_map[pid] / tot_acum_map[pid]) if tot_acum_map[pid] > 0 else 1.0
-        frac_sem = (dir_sem_map[pid] / tot_sem_map[pid]) if tot_sem_map[pid] > 0 else 1.0
+        # Directa vs indirecta según el tipo_costo de la PARTIDA
+        es_indirecto = str(_get(p, "tipo_costo", "DIRECTO")).upper() == "INDIRECTO"
+        frac_acum = 0.0 if es_indirecto else 1.0
+        frac_sem = frac_acum
         gastadas_dir_acum = gastadas_acum * frac_acum
         gastadas_ind_acum = gastadas_acum - gastadas_dir_acum
         gastadas_dir_sem = gastadas_sem * frac_sem
@@ -837,6 +850,7 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int, split=None)
             "codigo": p["codigo"],
             "otm_id": p["otm_id"],
             "fase": p["fase"],
+            "tipo_costo": "INDIRECTO" if es_indirecto else "DIRECTO",
             "sistema": p["sistema"],
             "descripcion": p["descripcion"],
             "unidad": p["unidad"],

@@ -23,6 +23,7 @@ def partida(**kw):
         id=1, codigo="01", otm_id="OTM1", fase="MEC", sistema="S1",
         descripcion="Montaje", unidad="m",
         metrado_presup=100, metrado_proyec=100, hh_presup=200,
+        tipo_costo="DIRECTO",
     )
     base.update(kw)
     return base
@@ -61,6 +62,49 @@ def test_calcular_caso_basico():
     assert f["hh_ganadas_acum"] == 100.0      # 0.5 × 200
     assert f["hh_gastadas_acum"] == 80.0
     assert f["pf_acum"] == 1.25               # 100 / 80
+
+
+def test_calcular_partida_directa_sus_hh_son_directas():
+    """Cambio #1: una partida DIRECTO carga todas sus HH como directas."""
+    filas = _calcular(
+        partidas=[partida(tipo_costo="DIRECTO")],
+        hitos=[hito()],
+        avances=[avance(cantidad_acum=50)],
+        hh_rows=[{"partida_id": 1, "semana": 1, "hh": 80}],
+        tareo={},
+        semana=1,
+    )
+    f = filas[0]
+    assert f["tipo_costo"] == "DIRECTO"
+    assert f["hh_gastadas_dir_acum"] == 80.0
+    assert f["hh_gastadas_ind_acum"] == 0.0
+    assert f["pf_dir_acum"] == 1.25            # ganadas/gastadas directas
+
+
+def test_calcular_partida_indirecta_sus_hh_son_indirectas():
+    """Cambio #1: una partida INDIRECTO carga todas sus HH como indirectas
+    (método del ISP del gerente: indirecto se define por la partida/fase)."""
+    filas = _calcular(
+        partidas=[partida(tipo_costo="INDIRECTO")],
+        hitos=[hito()],
+        avances=[avance(cantidad_acum=50)],
+        hh_rows=[{"partida_id": 1, "semana": 1, "hh": 80}],
+        tareo={},
+        semana=1,
+    )
+    f = filas[0]
+    assert f["tipo_costo"] == "INDIRECTO"
+    assert f["hh_gastadas_dir_acum"] == 0.0
+    assert f["hh_gastadas_ind_acum"] == 80.0
+    assert f["pf_dir_acum"] == 0.0             # sin HH directas, PF directo = 0
+
+
+def test_calcular_tipo_costo_por_defecto_es_directo():
+    """Si la partida no trae tipo_costo, se trata como DIRECTO."""
+    p = partida(); del p["tipo_costo"]
+    filas = _calcular([p], [hito()], [avance(cantidad_acum=50)],
+                      [{"partida_id": 1, "semana": 1, "hh": 80}], {}, 1)
+    assert filas[0]["hh_gastadas_dir_acum"] == 80.0
 
 
 def test_calcular_usa_tareo_automatico_si_no_hay_manual():

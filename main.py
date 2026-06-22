@@ -199,6 +199,15 @@ async def startup():
             {"p": _hash_pw(ADMIN_PASSWORD)},
         )
 
+    # ── Valor Ganado #1: clasificación Directo/Indirecto por partida (idempotente) ──
+    try:
+        await database.execute(
+            "ALTER TABLE ev_partidas ADD COLUMN IF NOT EXISTS "
+            "tipo_costo TEXT NOT NULL DEFAULT 'DIRECTO'"
+        )
+    except Exception as e:
+        print(f"[startup] ev_partidas.tipo_costo: {e}")
+
 
 async def resolver_jornada(fecha: date, otm_id: Optional[str] = None) -> float:
     """HH de jornada vigentes para una fecha (y opcionalmente una OTM):
