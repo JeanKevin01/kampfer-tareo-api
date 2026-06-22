@@ -13,19 +13,32 @@ import time
 import secrets
 from routers.valor_ganado import router as ev_router
 
-# ── Seguridad Fase 1: API key compartida (retrocompatible) ──
+# ── Seguridad Fase 1+3: compuerta global (retrocompatible) ──
 # Mientras API_KEY no esté seteada, NO se exige nada (despliegue sin cortar la operación).
-# Rollout: 1) desplegar API, 2) desplegar panel/web con la key, 3) recién setear API_KEY aquí.
+# Cuando se setea API_KEY, se cierra TODA la API: cada petición debe traer UNA de dos cosas:
+#   · X-API-Key correcta  → para integraciones (n8n), o
+#   · Authorization: Bearer <token JWT válido>  → para el panel y la app de campo.
+# Rollout seguro: 1) desplegar esta API, 2) configurar n8n con la key, 3) recién setear API_KEY.
 API_KEY = os.getenv("API_KEY", "").strip()
-_PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc"}
+# Rutas que NUNCA exigen credenciales (login incluido: sin él no se podría obtener el token).
+_PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc", "/api/auth/login"}
 
-async def require_key(request: Request, x_api_key: str = Header(default="")):
+async def require_key(
+    request: Request,
+    x_api_key: str = Header(default=""),
+    authorization: str = Header(default=""),
+):
     if not API_KEY:                       # aún no configurada → no exige (compat)
         return
     if request.url.path in _PUBLIC_PATHS or request.method == "OPTIONS":
         return
-    if x_api_key != API_KEY:
-        raise HTTPException(401, "API key inválida o ausente")
+    # 1) Integraciones (n8n): API key compartida en X-API-Key
+    if x_api_key and hmac.compare_digest(x_api_key, API_KEY):
+        return
+    # 2) Usuarios (panel / app de campo): token JWT válido
+    if authorization[:7].lower() == "bearer " and verify_token(authorization[7:]):
+        return
+    raise HTTPException(401, "No autenticado: se requiere token de sesión o API key")
 
 # Orígenes permitidos por entorno (CSV). Default '*' = comportamiento actual hasta configurarlo.
 _origins_env = os.getenv("ALLOWED_ORIGINS", "*").strip()

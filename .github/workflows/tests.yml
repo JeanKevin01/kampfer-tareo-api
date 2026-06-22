@@ -1,0 +1,21 @@
+name: Tests
+
+# Corre las pruebas automáticamente en cada push y en cada Pull Request.
+# Si algo rompe la lógica de Valor Ganado, GitHub lo marca en rojo.
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt pytest
+      - name: Ejecutar pruebas
+        run: pytest -v
