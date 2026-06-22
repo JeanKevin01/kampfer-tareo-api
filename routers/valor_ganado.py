@@ -1027,6 +1027,7 @@ async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
                 "nivel":           int(p["nivel"] or 1),
                 "parent_codigo":   p["parent_codigo"],
                 "es_hoja":         p["fase"] is not None,
+                "tipo_costo":      _get(p, "tipo_costo", "DIRECTO"),
                 "hh_ganadas_acum": ev.get("hh_ganadas_acum", 0.0),
                 "hh_gastadas_acum":ev.get("hh_gastadas_acum", 0.0),
                 "hh_gastadas_dir_acum": ev.get("hh_gastadas_dir_acum", 0.0),
