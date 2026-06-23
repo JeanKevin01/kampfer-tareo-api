@@ -60,6 +60,11 @@ def _norm_tipo_costo(v) -> str:
     t = str(v or "DIRECTO").strip().upper()
     return "INDIRECTO" if t == "INDIRECTO" else "DIRECTO"
 
+def _norm_naturaleza(v) -> str:
+    """Normaliza a 'CONTRACTUAL' | 'ADICIONAL' (default CONTRACTUAL)."""
+    t = str(v or "CONTRACTUAL").strip().upper()
+    return "ADICIONAL" if t in ("ADICIONAL", "ADICIONALES", "ADIC") else "CONTRACTUAL"
+
 _pool: Optional[asyncpg.Pool] = None
 
 
@@ -127,6 +132,7 @@ class ImpPartida(BaseModel):
     metrado_proyec: Optional[float] = None
     hh_presup: float = 0
     tipo_costo: Optional[str] = None      # 'DIRECTO' (def) | 'INDIRECTO'
+    naturaleza: Optional[str] = None      # 'CONTRACTUAL' (def) | 'ADICIONAL'
     tipo_actividad: Optional[str] = None
     hitos: Optional[list[HitoIn]] = None
     nivel: Optional[int] = None          # profundidad en el WBS (calculado si None)
@@ -368,6 +374,7 @@ async def importar(body: ImportarIn):
                 if parent_codigo is None and nivel > 1:
                     parent_codigo = sep.join(p.codigo.split(sep)[:-1])
                 tipo_costo = _norm_tipo_costo(p.tipo_costo)
+                naturaleza = _norm_naturaleza(p.naturaleza)
 
                 # Resolver hitos según tipo de nodo
                 if p.fase is None:
@@ -406,10 +413,10 @@ async def importar(body: ImportarIn):
                         """UPDATE ev_partidas SET otm_id=$2, fase=$3, sub_fase=$4, descripcion=$5,
                            unidad=$6, sistema=$7, metrado_presup=$8, metrado_proyec=$9,
                            hh_presup=$10, nivel=$11, parent_codigo=$12, tipo_costo=$13,
-                           activo=TRUE WHERE id=$1""",
+                           naturaleza=$14, activo=TRUE WHERE id=$1""",
                         existente, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
                         p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
-                        nivel, parent_codigo, tipo_costo,
+                        nivel, parent_codigo, tipo_costo, naturaleza,
                     )
                     await con.execute("DELETE FROM ev_hitos WHERE partida_id=$1", existente)
                     pid = existente; actualizadas += 1
@@ -417,11 +424,12 @@ async def importar(body: ImportarIn):
                     pid = await con.fetchval(
                         """INSERT INTO ev_partidas
                            (codigo, otm_id, fase, sub_fase, descripcion, unidad, sistema,
-                            metrado_presup, metrado_proyec, hh_presup, nivel, parent_codigo, tipo_costo)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id""",
+                            metrado_presup, metrado_proyec, hh_presup, nivel, parent_codigo,
+                            tipo_costo, naturaleza)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id""",
                         p.codigo, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
                         p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
-                        nivel, parent_codigo, tipo_costo,
+                        nivel, parent_codigo, tipo_costo, naturaleza,
                     )
                     creadas += 1
                 codigo_a_id[p.codigo] = pid
@@ -851,6 +859,7 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int, split=None)
             "otm_id": p["otm_id"],
             "fase": p["fase"],
             "tipo_costo": "INDIRECTO" if es_indirecto else "DIRECTO",
+            "naturaleza": str(_get(p, "naturaleza", "CONTRACTUAL")).upper(),
             "sistema": p["sistema"],
             "descripcion": p["descripcion"],
             "unidad": p["unidad"],
@@ -1028,6 +1037,7 @@ async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
                 "parent_codigo":   p["parent_codigo"],
                 "es_hoja":         p["fase"] is not None,
                 "tipo_costo":      _get(p, "tipo_costo", "DIRECTO"),
+                "naturaleza":      _get(p, "naturaleza", "CONTRACTUAL"),
                 "hh_ganadas_acum": ev.get("hh_ganadas_acum", 0.0),
                 "hh_gastadas_acum":ev.get("hh_gastadas_acum", 0.0),
                 "hh_gastadas_dir_acum": ev.get("hh_gastadas_dir_acum", 0.0),
@@ -1269,6 +1279,7 @@ async def reporte(semana: int, otm: Optional[str] = None):
         },
         "por_otm": _agrupar(hojas, "otm_id"),
         "por_fase": _agrupar(hojas, "fase"),
+        "por_naturaleza": _agrupar(hojas, "naturaleza"),
         "por_sistema": _agrupar(hojas, "sistema"),
         "partidas": filas,
     }

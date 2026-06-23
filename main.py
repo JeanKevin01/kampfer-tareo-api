@@ -208,6 +208,15 @@ async def startup():
     except Exception as e:
         print(f"[startup] ev_partidas.tipo_costo: {e}")
 
+    # ── Valor Ganado #3: naturaleza Contractual/Adicional por partida (idempotente) ──
+    try:
+        await database.execute(
+            "ALTER TABLE ev_partidas ADD COLUMN IF NOT EXISTS "
+            "naturaleza TEXT NOT NULL DEFAULT 'CONTRACTUAL'"
+        )
+    except Exception as e:
+        print(f"[startup] ev_partidas.naturaleza: {e}")
+
 
 async def resolver_jornada(fecha: date, otm_id: Optional[str] = None) -> float:
     """HH de jornada vigentes para una fecha (y opcionalmente una OTM):

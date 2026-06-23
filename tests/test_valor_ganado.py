@@ -23,7 +23,7 @@ def partida(**kw):
         id=1, codigo="01", otm_id="OTM1", fase="MEC", sistema="S1",
         descripcion="Montaje", unidad="m",
         metrado_presup=100, metrado_proyec=100, hh_presup=200,
-        tipo_costo="DIRECTO",
+        tipo_costo="DIRECTO", naturaleza="CONTRACTUAL",
     )
     base.update(kw)
     return base
@@ -105,6 +105,31 @@ def test_calcular_tipo_costo_por_defecto_es_directo():
     filas = _calcular([p], [hito()], [avance(cantidad_acum=50)],
                       [{"partida_id": 1, "semana": 1, "hh": 80}], {}, 1)
     assert filas[0]["hh_gastadas_dir_acum"] == 80.0
+
+
+def test_calcular_naturaleza_en_salida():
+    """Cambio #3: la naturaleza (Contractual/Adicional) sale en cada fila."""
+    fc = _calcular([partida(naturaleza="CONTRACTUAL")], [hito()], [avance()], [], {}, 1)
+    fa = _calcular([partida(naturaleza="ADICIONAL")], [hito()], [avance()], [], {}, 1)
+    assert fc[0]["naturaleza"] == "CONTRACTUAL"
+    assert fa[0]["naturaleza"] == "ADICIONAL"
+
+
+def test_calcular_naturaleza_por_defecto_contractual():
+    """Si la partida no trae naturaleza, se trata como CONTRACTUAL."""
+    p = partida(); del p["naturaleza"]
+    filas = _calcular([p], [hito()], [avance()], [], {}, 1)
+    assert filas[0]["naturaleza"] == "CONTRACTUAL"
+
+
+def test_agrupar_por_naturaleza():
+    """El reporte puede agrupar por naturaleza (contractual vs adicional)."""
+    filas = [
+        {"naturaleza": "CONTRACTUAL", "hh_proyec": 100, "hh_ganadas_acum": 80, "hh_gastadas_acum": 90, "eac_hh": 110},
+        {"naturaleza": "ADICIONAL",   "hh_proyec": 50,  "hh_ganadas_acum": 40, "hh_gastadas_acum": 50, "eac_hh": 60},
+    ]
+    grupos = _agrupar(filas, "naturaleza")
+    assert {g["grupo"] for g in grupos} == {"CONTRACTUAL", "ADICIONAL"}
 
 
 def test_calcular_usa_tareo_automatico_si_no_hay_manual():
