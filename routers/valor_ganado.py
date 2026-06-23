@@ -691,10 +691,15 @@ async def _hh_gastadas_unificada(con) -> dict:
 
 
 @router.get("/captura")
-async def captura(semana: int):
+async def captura(semana: int, otm: Optional[str] = None):
     pool = await db()
     async with pool.acquire() as con:
-        partidas = await con.fetch("SELECT * FROM ev_partidas WHERE activo ORDER BY codigo")
+        if otm:
+            partidas = await con.fetch(
+                "SELECT * FROM ev_partidas WHERE activo AND otm_id=$1 ORDER BY codigo", otm
+            )
+        else:
+            partidas = await con.fetch("SELECT * FROM ev_partidas WHERE activo ORDER BY codigo")
         hitos = await con.fetch("SELECT * FROM ev_hitos ORDER BY partida_id, numero")
         avances = await con.fetch(
             """SELECT hito_id, semana, cantidad_acum FROM ev_avances
