@@ -161,12 +161,21 @@ class ImportarIn(BaseModel):
 
 
 class ImproductivaIn(BaseModel):
-    """#5: HH improductivas capturadas en oficina, por OTM y semana."""
+    """#5: HH improductivas capturadas en oficina, por OTM y semana.
+    #4: partida_id opcional para atribuirlas a una partida (columna W del gerente)."""
     otm_id: Optional[str] = None
     semana: int = Field(ge=1)
     hh: float = Field(ge=0)
     motivo: Optional[str] = None
     nota: Optional[str] = None
+    partida_id: Optional[int] = None
+
+
+class ValorizadoIn(BaseModel):
+    """#2: cantidad valorizada (reconocida por el cliente) de una partida en una semana."""
+    partida_id: int
+    semana: int = Field(ge=1)
+    cantidad_valorizada: float = Field(ge=0)
 
 
 class AsignarHHIn(BaseModel):
@@ -1437,13 +1446,14 @@ async def listar_improductivas(otm: Optional[str] = None, semana: Optional[int] 
             args.append(semana); cond.append(f"semana = ${len(args)}")
         where = (" WHERE " + " AND ".join(cond)) if cond else ""
         rows = await con.fetch(
-            f"""SELECT id, otm_id, semana, hh, motivo, nota, registrado_en
+            f"""SELECT id, otm_id, semana, hh, motivo, nota, partida_id, registrado_en
                 FROM ev_hh_improductivas{where} ORDER BY semana, id""",
             *args,
         )
     return [
         {"id": r["id"], "otm_id": r["otm_id"], "semana": r["semana"],
          "hh": float(r["hh"]), "motivo": r["motivo"], "nota": r["nota"],
+         "partida_id": r["partida_id"],
          "registrado_en": r["registrado_en"].isoformat() if r["registrado_en"] else None}
         for r in rows
     ]
@@ -1452,13 +1462,14 @@ async def listar_improductivas(otm: Optional[str] = None, semana: Optional[int] 
 @router.post("/improductivas")
 async def crear_improductiva(body: ImproductivaIn):
     """Registra HH improductivas para una OTM/semana. Son HH consumidas NO asignadas
-    a partidas (bucket aparte): suman al total y bajan el PF del proyecto."""
+    a partidas (bucket aparte): suman al total y bajan el PF del proyecto.
+    partida_id es opcional (solo para atribución/trazabilidad; no cambia el PF por partida)."""
     pool = await db()
     async with pool.acquire() as con:
         new_id = await con.fetchval(
-            """INSERT INTO ev_hh_improductivas (otm_id, semana, hh, motivo, nota)
-               VALUES ($1,$2,$3,$4,$5) RETURNING id""",
-            body.otm_id, body.semana, body.hh, body.motivo, body.nota,
+            """INSERT INTO ev_hh_improductivas (otm_id, semana, hh, motivo, nota, partida_id)
+               VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
+            body.otm_id, body.semana, body.hh, body.motivo, body.nota, body.partida_id,
         )
     return {"id": new_id, "ok": True}
 
@@ -1470,6 +1481,56 @@ async def eliminar_improductiva(improd_id: int):
         res = await con.execute("DELETE FROM ev_hh_improductivas WHERE id=$1", improd_id)
     if res == "DELETE 0":
         raise HTTPException(404, "Registro no encontrado")
+    return {"ok": True}
+
+
+# ---------------------- #2: Valorizado (cantidad reconocida por el cliente) ----------------------
+@router.get("/valorizado")
+async def listar_valorizado(semana: int, otm: Optional[str] = None):
+    """Por partida hoja: cantidad ejecutada (del motor) vs cantidad valorizada
+    (lo que el cliente reconoce) y su variación. Base de la futura Valorización."""
+    partidas, hitos, avances, hh, tareo, split = await _datos_base(semana, otm)
+    filas = _calcular(partidas, hitos, avances, hh, tareo, semana, split)
+    hojas = [f for f in filas if f["fase"] is not None]
+
+    pool = await db()
+    async with pool.acquire() as con:
+        # último valor acumulado por partida hasta la semana de corte
+        rows = await con.fetch(
+            "SELECT partida_id, semana, cantidad_valorizada FROM ev_valorizado "
+            "WHERE semana <= $1 ORDER BY partida_id, semana", semana,
+        )
+    valz: dict = {}
+    for r in rows:
+        valz[r["partida_id"]] = float(r["cantidad_valorizada"])  # el más reciente gana
+
+    out = []
+    for f in hojas:
+        ejec = float(f["cantidad_instalada"])
+        v = valz.get(f["partida_id"], 0.0)
+        out.append({
+            "partida_id": f["partida_id"], "codigo": f["codigo"], "fase": f["fase"],
+            "descripcion": f["descripcion"], "unidad": f["unidad"],
+            "cantidad_ejecutada": round(ejec, 2),
+            "cantidad_valorizada": round(v, 2),
+            "variacion": round(ejec - v, 2),
+        })
+    return {"semana": semana, "otm": otm, "partidas": out}
+
+
+@router.post("/valorizado")
+async def guardar_valorizado(body: ValorizadoIn):
+    """Upsert de la cantidad valorizada de una partida en una semana."""
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            """INSERT INTO ev_valorizado (partida_id, semana, cantidad_valorizada)
+               VALUES ($1,$2,$3)
+               ON CONFLICT (partida_id, semana)
+               DO UPDATE SET cantidad_valorizada = EXCLUDED.cantidad_valorizada,
+                             registrado_en = now()""",
+            body.partida_id, body.semana, body.cantidad_valorizada,
+        )
     return {"ok": True}
 
 

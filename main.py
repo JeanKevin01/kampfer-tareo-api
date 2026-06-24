@@ -241,6 +241,26 @@ async def startup():
             registrado_en TIMESTAMPTZ NOT NULL DEFAULT now()
         )
     """)
+    # #4: atribución opcional de la improductiva a una partida (columna W del gerente)
+    try:
+        await database.execute(
+            "ALTER TABLE ev_hh_improductivas ADD COLUMN IF NOT EXISTS partida_id INT"
+        )
+    except Exception as e:
+        print(f"[startup] ev_hh_improductivas.partida_id: {e}")
+
+    # ── Valor Ganado #2: cantidad VALORIZADA por partida/semana (idempotente) ──
+    # Lo que el cliente reconoce/paga, distinto de lo ejecutado. Variación = ejec - valoriz.
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS ev_valorizado (
+            id                  SERIAL PRIMARY KEY,
+            partida_id          INT  NOT NULL,
+            semana              INT  NOT NULL,
+            cantidad_valorizada NUMERIC NOT NULL,
+            registrado_en       TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE (partida_id, semana)
+        )
+    """)
 
 
 async def resolver_jornada(fecha: date, otm_id: Optional[str] = None) -> float:
