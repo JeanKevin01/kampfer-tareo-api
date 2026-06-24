@@ -96,6 +96,7 @@ class PartidaIn(BaseModel):
     metrado_presup: float = 0
     metrado_proyec: Optional[float] = None
     hh_presup: float = 0
+    hh_actualizado: Optional[float] = None   # #6: presupuesto actualizado (default = hh_presup)
     hitos: list[HitoIn]
 
 
@@ -131,6 +132,7 @@ class ImpPartida(BaseModel):
     metrado_presup: float = 0
     metrado_proyec: Optional[float] = None
     hh_presup: float = 0
+    hh_actualizado: Optional[float] = None  # #6: presupuesto actualizado (default = hh_presup)
     tipo_costo: Optional[str] = None      # 'DIRECTO' (def) | 'INDIRECTO'
     naturaleza: Optional[str] = None      # 'CONTRACTUAL' (def) | 'ADICIONAL'
     tipo_actividad: Optional[str] = None
@@ -156,6 +158,15 @@ class ImportarIn(BaseModel):
     partidas: list[ImpPartida]
     avances: list[ImpAvance] = []
     hh: list[ImpHH] = []
+
+
+class ImproductivaIn(BaseModel):
+    """#5: HH improductivas capturadas en oficina, por OTM y semana."""
+    otm_id: Optional[str] = None
+    semana: int = Field(ge=1)
+    hh: float = Field(ge=0)
+    motivo: Optional[str] = None
+    nota: Optional[str] = None
 
 
 class AsignarHHIn(BaseModel):
@@ -286,11 +297,11 @@ async def crear_partida(body: PartidaIn):
                 pid = await con.fetchval(
                     """INSERT INTO ev_partidas
                        (codigo, otm_id, fase, sub_fase, descripcion, unidad, sistema,
-                        metrado_presup, metrado_proyec, hh_presup)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id""",
+                        metrado_presup, metrado_proyec, hh_presup, hh_actualizado)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id""",
                     body.codigo, body.otm_id, body.fase, body.sub_fase, body.descripcion,
                     body.unidad, body.sistema, body.metrado_presup,
-                    body.metrado_proyec, body.hh_presup,
+                    body.metrado_proyec, body.hh_presup, body.hh_actualizado,
                 )
             except asyncpg.UniqueViolationError:
                 raise HTTPException(409, f"Ya existe una partida con código {body.codigo}")
@@ -312,10 +323,11 @@ async def actualizar_partida(partida_id: int, body: PartidaIn):
             res = await con.execute(
                 """UPDATE ev_partidas SET codigo=$2, otm_id=$3, fase=$4, sub_fase=$5,
                    descripcion=$6, unidad=$7, sistema=$8, metrado_presup=$9,
-                   metrado_proyec=$10, hh_presup=$11 WHERE id=$1""",
+                   metrado_proyec=$10, hh_presup=$11, hh_actualizado=$12 WHERE id=$1""",
                 partida_id, body.codigo, body.otm_id, body.fase, body.sub_fase,
                 body.descripcion, body.unidad, body.sistema,
                 body.metrado_presup, body.metrado_proyec, body.hh_presup,
+                body.hh_actualizado,
             )
             if res == "UPDATE 0":
                 raise HTTPException(404, "Partida no encontrada")
@@ -413,10 +425,10 @@ async def importar(body: ImportarIn):
                         """UPDATE ev_partidas SET otm_id=$2, fase=$3, sub_fase=$4, descripcion=$5,
                            unidad=$6, sistema=$7, metrado_presup=$8, metrado_proyec=$9,
                            hh_presup=$10, nivel=$11, parent_codigo=$12, tipo_costo=$13,
-                           naturaleza=$14, activo=TRUE WHERE id=$1""",
+                           naturaleza=$14, hh_actualizado=$15, activo=TRUE WHERE id=$1""",
                         existente, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
                         p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
-                        nivel, parent_codigo, tipo_costo, naturaleza,
+                        nivel, parent_codigo, tipo_costo, naturaleza, p.hh_actualizado,
                     )
                     await con.execute("DELETE FROM ev_hitos WHERE partida_id=$1", existente)
                     pid = existente; actualizadas += 1
@@ -425,11 +437,11 @@ async def importar(body: ImportarIn):
                         """INSERT INTO ev_partidas
                            (codigo, otm_id, fase, sub_fase, descripcion, unidad, sistema,
                             metrado_presup, metrado_proyec, hh_presup, nivel, parent_codigo,
-                            tipo_costo, naturaleza)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id""",
+                            tipo_costo, naturaleza, hh_actualizado)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id""",
                         p.codigo, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
                         p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
-                        nivel, parent_codigo, tipo_costo, naturaleza,
+                        nivel, parent_codigo, tipo_costo, naturaleza, p.hh_actualizado,
                     )
                     creadas += 1
                 codigo_a_id[p.codigo] = pid
@@ -872,6 +884,9 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int, split=None)
             "cantidad_instalada": round(cant_inst, 2),
             "pct_avance": round(pct, 4),
             "hh_presup": round(hh_presup, 2),
+            # #6: presupuesto actualizado (denominador del % avance del proyecto).
+            # Si la partida no lo trae, cae a hh_presup.
+            "hh_actualizado": round(float(_get(p, "hh_actualizado", None) or hh_presup), 2),
             "hh_proyec": round(hh_proyec, 2),
             "hh_ganadas_sem": round(ganadas_sem, 2),
             "hh_ganadas_acum": round(ganadas_acum, 2),
@@ -893,10 +908,12 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int, split=None)
 
 
 def _agrupar(filas, clave):
-    grupos = defaultdict(lambda: {"hh_proyec": 0.0, "ganadas": 0.0, "gastadas": 0.0, "eac": 0.0})
+    grupos = defaultdict(lambda: {"hh_presup": 0.0, "hh_proyec": 0.0,
+                                  "ganadas": 0.0, "gastadas": 0.0, "eac": 0.0})
     for f in filas:
         k = f[clave] or "SIN ASIGNAR"
         g = grupos[k]
+        g["hh_presup"] += f.get("hh_presup", 0.0)
         g["hh_proyec"] += f["hh_proyec"]
         g["ganadas"] += f["hh_ganadas_acum"]
         g["gastadas"] += f["hh_gastadas_acum"]
@@ -905,6 +922,7 @@ def _agrupar(filas, clave):
     for k, g in sorted(grupos.items()):
         out.append({
             "grupo": k,
+            "hh_presup": round(g["hh_presup"], 2),
             "hh_proyec": round(g["hh_proyec"], 2),
             "hh_ganadas": round(g["ganadas"], 2),
             "hh_gastadas": round(g["gastadas"], 2),
@@ -913,6 +931,133 @@ def _agrupar(filas, clave):
             "eac_hh": round(g["eac"], 2),
         })
     return out
+
+
+def _matriz_area_disciplina(hojas):
+    """Replica la hoja 'Resumen Ejecutivo' del gerente: matriz Área (sistema) ×
+    Disciplina (fase). Por celda: HH contractual/proyec/ganada/gastada, % avance
+    (ganadas/proyec), PF (ganadas/gastadas) e incidencia (proyec/Σproyec).
+    Subtotal por sistema y total general usan el mismo criterio (proyectada).
+    """
+    tot_proyec_global = sum(f["hh_proyec"] for f in hojas) or 0.0
+
+    def _celda():
+        return {"hh_contractual": 0.0, "hh_proyec": 0.0, "hh_ganadas": 0.0,
+                "hh_gastadas": 0.0, "eac": 0.0}
+
+    # areas[sistema][disciplina] = celda
+    areas: dict = defaultdict(lambda: defaultdict(_celda))
+    for f in hojas:
+        area = f["sistema"] or "SIN ÁREA"
+        disc = f["fase"] or "SIN DISCIPLINA"
+        c = areas[area][disc]
+        c["hh_contractual"] += f.get("hh_presup", 0.0)
+        c["hh_proyec"] += f["hh_proyec"]
+        c["hh_ganadas"] += f["hh_ganadas_acum"]
+        c["hh_gastadas"] += f["hh_gastadas_acum"]
+        c["eac"] += f["eac_hh"]
+
+    def _fmt(grupo, c, denom_inc):
+        return {
+            **grupo,
+            "hh_contractual": round(c["hh_contractual"], 2),
+            "hh_proyec": round(c["hh_proyec"], 2),
+            "hh_ganadas": round(c["hh_ganadas"], 2),
+            "hh_gastadas": round(c["hh_gastadas"], 2),
+            "eac_hh": round(c["eac"], 2),
+            "pct_avance": round(c["hh_ganadas"] / c["hh_proyec"], 4) if c["hh_proyec"] > 0 else 0,
+            "pf": round(c["hh_ganadas"] / c["hh_gastadas"], 3) if c["hh_gastadas"] > 0 else 0,
+            "inc_proyec": round(c["hh_proyec"] / denom_inc, 4) if denom_inc > 0 else 0,
+        }
+
+    out_areas = []
+    total = _celda()
+    for area in sorted(areas.keys()):
+        sub = _celda()
+        disciplinas = []
+        for disc in sorted(areas[area].keys()):
+            c = areas[area][disc]
+            disciplinas.append(_fmt({"disciplina": disc}, c, tot_proyec_global))
+            for k in sub:
+                sub[k] += c[k]
+        for k in total:
+            total[k] += sub[k]
+        out_areas.append({
+            "area": area,
+            "disciplinas": disciplinas,
+            "subtotal": _fmt({}, sub, tot_proyec_global),
+        })
+
+    return {"areas": out_areas, "total": _fmt({}, total, tot_proyec_global)}
+
+
+def _totales(hojas, improd_acum: float = 0.0):
+    """Totales del proyecto (función pura, sobre las hojas del WBS).
+    #6: % avance del proyecto = ganadas / presupuesto ACTUALIZADO (no proyectada).
+    #5: las HH improductivas entran al consumo total y bajan el PF del proyecto.
+    """
+    tot_proyec = sum(f["hh_proyec"] for f in hojas)
+    tot_actualizado = sum(f["hh_actualizado"] for f in hojas)
+    tot_presup = sum(f.get("hh_presup", 0.0) for f in hojas)
+    tot_ganadas = sum(f["hh_ganadas_acum"] for f in hojas)
+    tot_gastadas = sum(f["hh_gastadas_acum"] for f in hojas)
+    tot_gas_dir = sum(f["hh_gastadas_dir_acum"] for f in hojas)
+    tot_gas_ind = sum(f["hh_gastadas_ind_acum"] for f in hojas)
+    tot_gan_sem = sum(f["hh_ganadas_sem"] for f in hojas)
+    tot_gas_sem = sum(f["hh_gastadas_sem"] for f in hojas)
+    tot_eac = sum(f["eac_hh"] for f in hojas)
+    tot_consumidas = tot_gastadas + improd_acum
+    tot_consumidas_dir = tot_gas_dir + improd_acum
+    return {
+        "hh_proyec": round(tot_proyec, 2),
+        "hh_presup": round(tot_presup, 2),
+        "hh_actualizado": round(tot_actualizado, 2),
+        "hh_ganadas_acum": round(tot_ganadas, 2),
+        "hh_gastadas_acum": round(tot_gastadas, 2),
+        "hh_ganadas_sem": round(tot_gan_sem, 2),
+        "hh_gastadas_sem": round(tot_gas_sem, 2),
+        "hh_gastadas_dir_acum": round(tot_gas_dir, 2),
+        "hh_gastadas_ind_acum": round(tot_gas_ind, 2),
+        # #5: improductivas y consumo total
+        "hh_improductivas_acum": round(improd_acum, 2),
+        "hh_consumidas_acum": round(tot_consumidas, 2),
+        "index_improductividad": round(improd_acum / tot_consumidas, 4) if tot_consumidas > 0 else 0,
+        # #6: % avance del proyecto = ganadas / presupuesto ACTUALIZADO (método del gerente)
+        "pct_avance": round(tot_ganadas / tot_actualizado, 4) if tot_actualizado > 0 else 0,
+        "pct_avance_proyec": round(tot_ganadas / tot_proyec, 4) if tot_proyec > 0 else 0,
+        # PF del proyecto: titular incluye improductivas + variante productiva (referencia)
+        "pf_acum": round(tot_ganadas / tot_consumidas, 3) if tot_consumidas > 0 else 0,
+        "pf_acum_productivo": round(tot_ganadas / tot_gastadas, 3) if tot_gastadas > 0 else 0,
+        "pf_dir_acum": round(tot_ganadas / tot_consumidas_dir, 3) if tot_consumidas_dir > 0 else 0,
+        "pf_sem": round(tot_gan_sem / tot_gas_sem, 3) if tot_gas_sem > 0 else 0,
+        "eac_hh": round(tot_eac, 2),
+        "desvio_hh": round(tot_eac - tot_proyec, 2),
+    }
+
+
+async def _improductivas(con, semana: int, otm: Optional[str] = None):
+    """HH improductivas (captura de oficina, semanal por OTM). Son HH consumidas
+    NO asignadas a partidas: entran al total de HH gastadas y bajan el PF del
+    proyecto. acum = Σ hh con semana<=; sem = Σ hh de la semana exacta."""
+    if otm:
+        rows = await con.fetch(
+            "SELECT semana, hh, motivo FROM ev_hh_improductivas WHERE semana <= $1 AND otm_id = $2",
+            semana, otm,
+        )
+    else:
+        rows = await con.fetch(
+            "SELECT semana, hh, motivo FROM ev_hh_improductivas WHERE semana <= $1", semana,
+        )
+    acum = sum(float(r["hh"]) for r in rows)
+    sem = sum(float(r["hh"]) for r in rows if r["semana"] == semana)
+    por_motivo: dict = defaultdict(float)
+    for r in rows:
+        por_motivo[r["motivo"] or "SIN MOTIVO"] += float(r["hh"])
+    return {
+        "acum": round(acum, 2),
+        "sem": round(sem, 2),
+        "por_motivo": [{"motivo": k, "hh": round(v, 2)} for k, v in sorted(por_motivo.items())],
+    }
 
 
 async def _datos_base(semana: int, otm: Optional[str] = None):
@@ -1255,39 +1400,77 @@ async def reporte(semana: int, otm: Optional[str] = None):
     # Totales SOLO sobre hojas (fase != None): los nodos padre del WBS pueden traer
     # hh_presup propio y sumarlos duplicaría el plan. El detalle (partidas) sí incluye padres.
     hojas = [f for f in filas if f["fase"] is not None]
-    tot_proyec = sum(f["hh_proyec"] for f in hojas)
-    tot_ganadas = sum(f["hh_ganadas_acum"] for f in hojas)
-    tot_gastadas = sum(f["hh_gastadas_acum"] for f in hojas)
-    tot_gas_dir = sum(f["hh_gastadas_dir_acum"] for f in hojas)
-    tot_gas_ind = sum(f["hh_gastadas_ind_acum"] for f in hojas)
-    tot_gan_sem = sum(f["hh_ganadas_sem"] for f in hojas)
-    tot_gas_sem = sum(f["hh_gastadas_sem"] for f in hojas)
-    tot_eac = sum(f["eac_hh"] for f in hojas)
+
+    # #5: HH improductivas (oficina). Se suman a las HH consumidas del proyecto y
+    # bajan el PF (son HH directas de obreros no asignadas a partidas).
+    pool = await db()
+    async with pool.acquire() as con:
+        improd = await _improductivas(con, semana, otm)
+
+    totales = _totales(hojas, improd["acum"])
+    totales["hh_improductivas_sem"] = round(improd["sem"], 2)
 
     return {
         "semana": semana,
         "otm": otm,
-        "totales": {
-            "hh_proyec": round(tot_proyec, 2),
-            "hh_ganadas_acum": round(tot_ganadas, 2),
-            "hh_gastadas_acum": round(tot_gastadas, 2),
-            "hh_ganadas_sem": round(tot_gan_sem, 2),
-            "hh_gastadas_sem": round(tot_gas_sem, 2),
-            "hh_gastadas_dir_acum": round(tot_gas_dir, 2),
-            "hh_gastadas_ind_acum": round(tot_gas_ind, 2),
-            "pct_avance": round(tot_ganadas / tot_proyec, 4) if tot_proyec > 0 else 0,
-            "pf_acum": round(tot_ganadas / tot_gastadas, 3) if tot_gastadas > 0 else 0,
-            "pf_dir_acum": round(tot_ganadas / tot_gas_dir, 3) if tot_gas_dir > 0 else 0,
-            "pf_sem": round(tot_gan_sem / tot_gas_sem, 3) if tot_gas_sem > 0 else 0,
-            "eac_hh": round(tot_eac, 2),
-            "desvio_hh": round(tot_eac - tot_proyec, 2),
-        },
+        "totales": totales,
         "por_otm": _agrupar(hojas, "otm_id"),
         "por_fase": _agrupar(hojas, "fase"),
         "por_naturaleza": _agrupar(hojas, "naturaleza"),
         "por_sistema": _agrupar(hojas, "sistema"),
+        "matriz_area_disciplina": _matriz_area_disciplina(hojas),
+        "improductivas": improd,
         "partidas": filas,
     }
+
+
+# ---------------------- #5: HH improductivas (CRUD) ----------------------
+@router.get("/improductivas")
+async def listar_improductivas(otm: Optional[str] = None, semana: Optional[int] = None):
+    """Lista las HH improductivas registradas (opcionalmente por OTM y/o semana)."""
+    pool = await db()
+    async with pool.acquire() as con:
+        cond, args = [], []
+        if otm:
+            args.append(otm); cond.append(f"otm_id = ${len(args)}")
+        if semana is not None:
+            args.append(semana); cond.append(f"semana = ${len(args)}")
+        where = (" WHERE " + " AND ".join(cond)) if cond else ""
+        rows = await con.fetch(
+            f"""SELECT id, otm_id, semana, hh, motivo, nota, registrado_en
+                FROM ev_hh_improductivas{where} ORDER BY semana, id""",
+            *args,
+        )
+    return [
+        {"id": r["id"], "otm_id": r["otm_id"], "semana": r["semana"],
+         "hh": float(r["hh"]), "motivo": r["motivo"], "nota": r["nota"],
+         "registrado_en": r["registrado_en"].isoformat() if r["registrado_en"] else None}
+        for r in rows
+    ]
+
+
+@router.post("/improductivas")
+async def crear_improductiva(body: ImproductivaIn):
+    """Registra HH improductivas para una OTM/semana. Son HH consumidas NO asignadas
+    a partidas (bucket aparte): suman al total y bajan el PF del proyecto."""
+    pool = await db()
+    async with pool.acquire() as con:
+        new_id = await con.fetchval(
+            """INSERT INTO ev_hh_improductivas (otm_id, semana, hh, motivo, nota)
+               VALUES ($1,$2,$3,$4,$5) RETURNING id""",
+            body.otm_id, body.semana, body.hh, body.motivo, body.nota,
+        )
+    return {"id": new_id, "ok": True}
+
+
+@router.delete("/improductivas/{improd_id}")
+async def eliminar_improductiva(improd_id: int):
+    pool = await db()
+    async with pool.acquire() as con:
+        res = await con.execute("DELETE FROM ev_hh_improductivas WHERE id=$1", improd_id)
+    if res == "DELETE 0":
+        raise HTTPException(404, "Registro no encontrado")
+    return {"ok": True}
 
 
 @router.get("/curva")

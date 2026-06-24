@@ -217,6 +217,31 @@ async def startup():
     except Exception as e:
         print(f"[startup] ev_partidas.naturaleza: {e}")
 
+    # ── Valor Ganado #6: presupuesto ACTUALIZADO por partida (idempotente) ──
+    # Denominador del % avance del proyecto (método del gerente).
+    # Nullable: si es NULL, el motor usa hh_presup como fallback.
+    try:
+        await database.execute(
+            "ALTER TABLE ev_partidas ADD COLUMN IF NOT EXISTS hh_actualizado NUMERIC"
+        )
+    except Exception as e:
+        print(f"[startup] ev_partidas.hh_actualizado: {e}")
+
+    # ── Valor Ganado #5: HH improductivas por OTM/semana (idempotente) ──
+    # Captura de oficina (semanal por OTM, con motivo). Son HH consumidas NO
+    # asignadas a partidas; entran a las HH gastadas totales y bajan el PF del proyecto.
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS ev_hh_improductivas (
+            id            SERIAL PRIMARY KEY,
+            otm_id        TEXT,
+            semana        INT  NOT NULL,
+            hh            NUMERIC NOT NULL,
+            motivo        TEXT,
+            nota          TEXT,
+            registrado_en TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+    """)
+
 
 async def resolver_jornada(fecha: date, otm_id: Optional[str] = None) -> float:
     """HH de jornada vigentes para una fecha (y opcionalmente una OTM):

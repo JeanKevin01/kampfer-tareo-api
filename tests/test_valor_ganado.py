@@ -14,6 +14,7 @@ import pytest
 
 from routers.valor_ganado import (
     _calcular, _validar_pesos, _semana_de, _agrupar, HitoIn,
+    _matriz_area_disciplina, _totales,
 )
 
 
@@ -266,3 +267,116 @@ def test_agrupar_suma_por_fase():
     assert g["hh_gastadas"] == 140.0
     assert g["pct_avance"] == 0.8             # 120 / 150
     assert g["pf"] == 0.857                    # round(120 / 140, 3)
+
+
+# ════════════════════════════════════════════════════════════════
+# #6 — % avance del proyecto = ganadas / presupuesto ACTUALIZADO
+# ════════════════════════════════════════════════════════════════
+
+def test_calcular_emite_hh_actualizado_default():
+    """Si la partida no trae hh_actualizado, el motor cae a hh_presup."""
+    filas = _calcular([partida(hh_presup=200)], [hito()], [avance()], [], {}, 1)
+    assert filas[0]["hh_actualizado"] == 200.0
+
+
+def test_calcular_emite_hh_actualizado_explicito():
+    """Si la partida trae hh_actualizado, se respeta (≠ hh_presup)."""
+    filas = _calcular([partida(hh_presup=200, hh_actualizado=250)], [hito()], [avance()], [], {}, 1)
+    assert filas[0]["hh_actualizado"] == 250.0
+
+
+def test_totales_pct_avance_usa_presupuesto_actualizado():
+    """Golden ISP Sem34: % avance del proyecto = ganadas / actualizado (no proyectada).
+    Resumen: ganadas 10175.82 / actualizado 140740.18 = 0.0723 (J26).
+    PF productivo del proyecto = 10175.82 / 12819.5 = 0.7938 (L27)."""
+    hoja = {
+        "hh_proyec": 156048.47, "hh_presup": 138793.39, "hh_actualizado": 140740.18,
+        "hh_ganadas_acum": 10175.82, "hh_gastadas_acum": 12819.5,
+        "hh_gastadas_dir_acum": 12819.5, "hh_gastadas_ind_acum": 0,
+        "hh_ganadas_sem": 0, "hh_gastadas_sem": 0, "eac_hh": 0,
+    }
+    t = _totales([hoja], improd_acum=0.0)
+    assert t["pct_avance"] == 0.0723                 # ganadas / actualizado (método del gerente)
+    assert t["pct_avance_proyec"] == 0.0652          # ganadas / proyectada (referencia, distinto)
+    assert t["pf_acum_productivo"] == 0.794          # 10175.82 / 12819.5
+    # con presupuesto ORIGINAL daría otro número (demuestra que el denominador importa)
+    assert round(10175.82 / 138793.39, 4) == 0.0733
+
+
+# ════════════════════════════════════════════════════════════════
+# #5 — HH improductivas: suman al consumo y bajan el PF del proyecto
+# ════════════════════════════════════════════════════════════════
+
+def test_totales_improductivas_bajan_pf_del_proyecto():
+    hoja = {
+        "hh_proyec": 156048.47, "hh_presup": 138793.39, "hh_actualizado": 140740.18,
+        "hh_ganadas_acum": 10175.82, "hh_gastadas_acum": 12819.5,
+        "hh_gastadas_dir_acum": 12819.5, "hh_gastadas_ind_acum": 0,
+        "hh_ganadas_sem": 0, "hh_gastadas_sem": 0, "eac_hh": 0,
+    }
+    sin = _totales([hoja], improd_acum=0.0)
+    con = _totales([hoja], improd_acum=1000.0)
+    # el titular de PF incluye improductivas y baja respecto al productivo
+    assert con["pf_acum"] < con["pf_acum_productivo"]
+    assert con["pf_acum_productivo"] == sin["pf_acum"]           # productivo no cambia
+    assert con["hh_consumidas_acum"] == 13819.5                  # 12819.5 + 1000
+    assert con["index_improductividad"] == round(1000 / 13819.5, 4)
+    assert con["pf_acum"] == round(10175.82 / 13819.5, 3)
+
+
+# ════════════════════════════════════════════════════════════════
+# Matriz Área × Disciplina (hoja "Resumen Ejecutivo" del gerente)
+# ════════════════════════════════════════════════════════════════
+
+def _hoja_disc(sistema, fase, contractual, proyec, ganadas, gastadas):
+    return {
+        "sistema": sistema, "fase": fase, "hh_presup": contractual,
+        "hh_proyec": proyec, "hh_ganadas_acum": ganadas,
+        "hh_gastadas_acum": gastadas, "eac_hh": 0,
+    }
+
+
+def test_matriz_sem34_sistema1():
+    """Golden ISP Sem34 'Resumen Ejecutivo' — Sistema 1: Lauder 3B.
+    MOV01: contractual 4245.196 · proyec 4588.736 · ganadas 3202.877 · gastadas 4318
+      ⇒ % avance 0.698 · PF 0.742
+    Subtotal Sistema 1: proyec 12770.40 · ganadas 3811.806 ⇒ % avance 0.2985."""
+    s1 = "Sistema 1: Lauder 3B"
+    hojas = [
+        _hoja_disc(s1, "Movimiento de Tierras", 4245.196, 4588.736, 3202.877, 4318),
+        _hoja_disc(s1, "Concreto",              866.766, 1515.771, 0, 0),
+        _hoja_disc(s1, "Encofrado",             2431,    2694.273, 0, 0),
+        _hoja_disc(s1, "Acero",                 2106.369, 2435.718, 608.929, 567),
+        _hoja_disc(s1, "Instalación de Anclajes", 928.185, 1535.902, 0, 0),
+    ]
+    m = _matriz_area_disciplina(hojas)
+    assert len(m["areas"]) == 1
+    area = m["areas"][0]
+    assert area["area"] == s1
+    assert len(area["disciplinas"]) == 5
+
+    mov = next(d for d in area["disciplinas"] if d["disciplina"] == "Movimiento de Tierras")
+    assert mov["hh_contractual"] == 4245.2
+    assert mov["pct_avance"] == 0.698          # 3202.877 / 4588.736
+    assert mov["pf"] == 0.742                   # 3202.877 / 4318
+
+    sub = area["subtotal"]
+    assert sub["hh_proyec"] == 12770.4
+    assert sub["hh_ganadas"] == 3811.81
+    assert sub["pct_avance"] == 0.2985          # 3811.806 / 12770.40
+
+
+def test_matriz_dos_areas_y_total():
+    """Dos áreas con una disciplina cada una: total general suma ambas."""
+    hojas = [
+        _hoja_disc("A1", "Acero", 100, 120, 60, 50),
+        _hoja_disc("A2", "Concreto", 200, 240, 120, 100),
+    ]
+    m = _matriz_area_disciplina(hojas)
+    assert [a["area"] for a in m["areas"]] == ["A1", "A2"]
+    assert m["total"]["hh_proyec"] == 360.0
+    assert m["total"]["hh_ganadas"] == 180.0
+    assert m["total"]["pct_avance"] == 0.5      # 180 / 360
+    # incidencia proyectada de A1 = 120 / 360
+    a1 = m["areas"][0]["disciplinas"][0]
+    assert a1["inc_proyec"] == round(120 / 360, 4)
