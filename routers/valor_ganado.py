@@ -1559,13 +1559,16 @@ async def guardar_valorizado(body: ValorizadoIn):
 
 # ---------------------- Rentabilidad (Fase 3): tarifas + resultado operativo ----------------------
 _HH_POR_CARGO_SQL = """
-    SELECT {grp} COALESCE(t.cargo, '(Sin cargo)') AS cargo, SUM(tp.hh) AS hh
+    SELECT {sel} COALESCE(t.cargo, '(Sin cargo)') AS cargo, SUM(tp.hh) AS hh
     FROM tareo_partida tp
     LEFT JOIN trabajadores t
            ON LPAD(t.id::text, 3, '0') = LPAD(tp.trabajador_id::text, 3, '0')
     WHERE tp.hh IS NOT NULL
-    GROUP BY {grp} COALESCE(t.cargo, '(Sin cargo)')
+    GROUP BY {grpby} COALESCE(t.cargo, '(Sin cargo)')
 """
+# Nota: en GROUP BY no se puede usar el alias (`AS otm`) — Postgres lanza
+# "syntax error at or near AS". Por eso la expr del SELECT y la del GROUP BY
+# se inyectan por separado.
 
 
 @router.get("/tarifas")
@@ -1573,7 +1576,7 @@ async def listar_tarifas():
     """Cargos con HH reales (de tareo_partida) + su tarifa S/./HH. Incluye '(Default)'."""
     pool = await db()
     async with pool.acquire() as con:
-        hh_rows = await con.fetch(_HH_POR_CARGO_SQL.format(grp=""))
+        hh_rows = await con.fetch(_HH_POR_CARGO_SQL.format(sel="", grpby=""))
         tar_rows = await con.fetch("SELECT cargo, costo_hh FROM ev_tarifas_cargo")
     tar = {r["cargo"]: float(r["costo_hh"]) for r in tar_rows}
     default = tar.get("(Default)", 0.0)
@@ -1609,7 +1612,9 @@ async def rentabilidad():
     Costo basado en tareo_partida (HH reales por trabajador → cargo → tarifa)."""
     pool = await db()
     async with pool.acquire() as con:
-        hh_rows = await con.fetch(_HH_POR_CARGO_SQL.format(grp="tp.otm_id AS otm,"))
+        hh_rows = await con.fetch(
+            _HH_POR_CARGO_SQL.format(sel="tp.otm_id AS otm,", grpby="tp.otm_id,")
+        )
         tar_rows = await con.fetch("SELECT cargo, costo_hh FROM ev_tarifas_cargo")
         otm_rows = await con.fetch(
             "SELECT id, descripcion, monto_contractual, monto_valorizado FROM otms"

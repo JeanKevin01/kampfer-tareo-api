@@ -15,6 +15,7 @@ import pytest
 from routers.valor_ganado import (
     _calcular, _validar_pesos, _semana_de, _agrupar, HitoIn,
     _matriz_area_disciplina, _totales, _calc_costo_mo,
+    _HH_POR_CARGO_SQL,
 )
 
 
@@ -382,6 +383,28 @@ def test_calc_costo_mo_usa_default():
     costo, hh_sin = _calc_costo_mo(hh, tar, default=15.0)
     assert costo == 100 * 30 + 50 * 15         # 3750
     assert hh_sin == 0
+
+
+def _group_by_clause(sql: str) -> str:
+    """Extrae el texto del GROUP BY (hasta el fin) para inspeccionarlo."""
+    return sql.upper().split("GROUP BY", 1)[1]
+
+
+def test_hh_por_cargo_sql_tarifas_sin_otm():
+    """/tarifas formatea sin columna OTM y produce un GROUP BY válido."""
+    sql = _HH_POR_CARGO_SQL.format(sel="", grpby="")
+    assert "TP.OTM_ID" not in sql.upper()
+    # un GROUP BY no puede contener un alias `AS` — sería sintaxis inválida
+    assert " AS " not in _group_by_clause(sql)
+
+
+def test_hh_por_cargo_sql_rentabilidad_agrupa_por_otm():
+    """/rentabilidad agrupa por OTM SIN colar el alias en el GROUP BY (bug Postgres)."""
+    sql = _HH_POR_CARGO_SQL.format(sel="tp.otm_id AS otm,", grpby="tp.otm_id,")
+    up = sql.upper()
+    assert "TP.OTM_ID AS OTM" in up            # el alias va en el SELECT…
+    assert "TP.OTM_ID," in _group_by_clause(sql)  # …y la columna cruda en el GROUP BY
+    assert " AS " not in _group_by_clause(sql)    # nunca el alias en el GROUP BY
 
 
 def test_matriz_dos_areas_y_total():
