@@ -262,6 +262,15 @@ async def startup():
         )
     """)
 
+    # ── Rentabilidad (Fase 3): tarifa de Mano de Obra por cargo (S/./HH) ──
+    # El cargo '(Default)' actúa como tarifa de respaldo para cargos sin tarifa propia.
+    await database.execute("""
+        CREATE TABLE IF NOT EXISTS ev_tarifas_cargo (
+            cargo     TEXT PRIMARY KEY,
+            costo_hh  NUMERIC NOT NULL DEFAULT 0
+        )
+    """)
+
 
 async def resolver_jornada(fecha: date, otm_id: Optional[str] = None) -> float:
     """HH de jornada vigentes para una fecha (y opcionalmente una OTM):

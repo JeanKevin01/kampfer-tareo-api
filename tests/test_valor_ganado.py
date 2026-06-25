@@ -14,7 +14,7 @@ import pytest
 
 from routers.valor_ganado import (
     _calcular, _validar_pesos, _semana_de, _agrupar, HitoIn,
-    _matriz_area_disciplina, _totales,
+    _matriz_area_disciplina, _totales, _calc_costo_mo,
 )
 
 
@@ -364,6 +364,24 @@ def test_matriz_sem34_sistema1():
     assert sub["hh_proyec"] == 12770.4
     assert sub["hh_ganadas"] == 3811.81
     assert sub["pct_avance"] == 0.2985          # 3811.806 / 12770.40
+
+
+def test_calc_costo_mo_por_cargo():
+    """Costo MO = Σ HH×tarifa; cargos sin tarifa quedan marcados (no en silencio)."""
+    hh = {"Operario": 100, "Peon": 200, "Capataz": 50}
+    tar = {"Operario": 30.0, "Peon": 20.0}   # Capataz sin tarifa
+    costo, hh_sin = _calc_costo_mo(hh, tar, default=0.0)
+    assert costo == 100 * 30 + 200 * 20 + 0   # 7000
+    assert hh_sin == 50                        # las HH de Capataz quedan marcadas
+
+
+def test_calc_costo_mo_usa_default():
+    """Con tarifa de respaldo, los cargos sin tarifa propia la usan y no quedan sin contar."""
+    hh = {"Operario": 100, "Capataz": 50}
+    tar = {"Operario": 30.0}
+    costo, hh_sin = _calc_costo_mo(hh, tar, default=15.0)
+    assert costo == 100 * 30 + 50 * 15         # 3750
+    assert hh_sin == 0
 
 
 def test_matriz_dos_areas_y_total():

@@ -178,6 +178,12 @@ class ValorizadoIn(BaseModel):
     cantidad_valorizada: float = Field(ge=0)
 
 
+class TarifaIn(BaseModel):
+    """Rentabilidad: tarifa de Mano de Obra (S/./HH) por cargo. cargo='(Default)' = respaldo."""
+    cargo: str
+    costo_hh: float = Field(ge=0)
+
+
 class AsignarHHIn(BaseModel):
     otm_id: str
     fecha: date
@@ -1000,6 +1006,23 @@ def _matriz_area_disciplina(hojas):
     return {"areas": out_areas, "total": _fmt({}, total, tot_proyec_global)}
 
 
+def _calc_costo_mo(hh_por_cargo: dict, tarifas: dict, default: float = 0.0):
+    """Costo de Mano de Obra = Σ (HH del cargo × tarifa del cargo).
+    Si un cargo no tiene tarifa propia, usa `default`; si tampoco hay default,
+    esas HH se acumulan en hh_sin_tarifa (no se cuentan en silencio como 0).
+    Función pura → testeable. Devuelve (costo, hh_sin_tarifa)."""
+    costo = 0.0
+    hh_sin = 0.0
+    for cargo, hh in hh_por_cargo.items():
+        rate = tarifas.get(cargo)
+        if not rate:                 # None o 0 → intenta el respaldo
+            rate = default
+            if not rate:
+                hh_sin += hh
+        costo += hh * (rate or 0.0)
+    return round(costo, 2), round(hh_sin, 2)
+
+
 def _totales(hojas, improd_acum: float = 0.0):
     """Totales del proyecto (función pura, sobre las hojas del WBS).
     #6: % avance del proyecto = ganadas / presupuesto ACTUALIZADO (no proyectada).
@@ -1532,6 +1555,107 @@ async def guardar_valorizado(body: ValorizadoIn):
             body.partida_id, body.semana, body.cantidad_valorizada,
         )
     return {"ok": True}
+
+
+# ---------------------- Rentabilidad (Fase 3): tarifas + resultado operativo ----------------------
+_HH_POR_CARGO_SQL = """
+    SELECT {grp} COALESCE(t.cargo, '(Sin cargo)') AS cargo, SUM(tp.hh) AS hh
+    FROM tareo_partida tp
+    LEFT JOIN trabajadores t
+           ON LPAD(t.id::text, 3, '0') = LPAD(tp.trabajador_id::text, 3, '0')
+    WHERE tp.hh IS NOT NULL
+    GROUP BY {grp} COALESCE(t.cargo, '(Sin cargo)')
+"""
+
+
+@router.get("/tarifas")
+async def listar_tarifas():
+    """Cargos con HH reales (de tareo_partida) + su tarifa S/./HH. Incluye '(Default)'."""
+    pool = await db()
+    async with pool.acquire() as con:
+        hh_rows = await con.fetch(_HH_POR_CARGO_SQL.format(grp=""))
+        tar_rows = await con.fetch("SELECT cargo, costo_hh FROM ev_tarifas_cargo")
+    tar = {r["cargo"]: float(r["costo_hh"]) for r in tar_rows}
+    default = tar.get("(Default)", 0.0)
+    cargos = []
+    vistos = set()
+    for r in hh_rows:
+        c = r["cargo"]; vistos.add(c)
+        cargos.append({"cargo": c, "costo_hh": tar.get(c, 0.0), "hh": round(float(r["hh"] or 0), 1)})
+    # cargos con tarifa pero sin HH aún (excepto el respaldo)
+    for c, v in tar.items():
+        if c != "(Default)" and c not in vistos:
+            cargos.append({"cargo": c, "costo_hh": v, "hh": 0.0})
+    cargos.sort(key=lambda x: x["cargo"])
+    return {"cargos": cargos, "default": default}
+
+
+@router.post("/tarifas")
+async def guardar_tarifa(body: TarifaIn):
+    """Upsert de la tarifa de un cargo (o de '(Default)')."""
+    pool = await db()
+    async with pool.acquire() as con:
+        await con.execute(
+            """INSERT INTO ev_tarifas_cargo (cargo, costo_hh) VALUES ($1, $2)
+               ON CONFLICT (cargo) DO UPDATE SET costo_hh = EXCLUDED.costo_hh""",
+            body.cargo.strip(), body.costo_hh,
+        )
+    return {"ok": True}
+
+
+@router.get("/rentabilidad")
+async def rentabilidad():
+    """Resultado Operativo por OTM: Ingreso valorizado − Costo MO (HH reales × tarifa).
+    Costo basado en tareo_partida (HH reales por trabajador → cargo → tarifa)."""
+    pool = await db()
+    async with pool.acquire() as con:
+        hh_rows = await con.fetch(_HH_POR_CARGO_SQL.format(grp="tp.otm_id AS otm,"))
+        tar_rows = await con.fetch("SELECT cargo, costo_hh FROM ev_tarifas_cargo")
+        otm_rows = await con.fetch(
+            "SELECT id, descripcion, monto_contractual, monto_valorizado FROM otms"
+        )
+    tar = {r["cargo"]: float(r["costo_hh"]) for r in tar_rows}
+    default = tar.get("(Default)", 0.0)
+    otm_info = {r["id"]: r for r in otm_rows}
+
+    por_otm: dict = defaultdict(lambda: defaultdict(float))
+    for r in hh_rows:
+        por_otm[r["otm"]][r["cargo"]] += float(r["hh"] or 0)
+
+    out = []
+    tot_ing = tot_costo = tot_hh = 0.0
+    for otm, hhc in por_otm.items():
+        costo, hh_sin = _calc_costo_mo(dict(hhc), tar, default)
+        hh_total = round(sum(hhc.values()), 1)
+        info = otm_info.get(otm)
+        ingreso = float(info["monto_valorizado"] or 0) if info else 0.0
+        contractual = float(info["monto_contractual"] or 0) if info else 0.0
+        margen = round(ingreso - costo, 2)
+        out.append({
+            "otm": otm,
+            "descripcion": info["descripcion"] if info else None,
+            "ingreso_valorizado": round(ingreso, 2),
+            "ingreso_contractual": round(contractual, 2),
+            "hh_total": hh_total,
+            "hh_sin_tarifa": hh_sin,
+            "costo_mo": costo,
+            "margen": margen,
+            "pct_margen": round(margen / ingreso, 4) if ingreso > 0 else 0,
+        })
+        tot_ing += ingreso; tot_costo += costo; tot_hh += hh_total
+    out.sort(key=lambda x: x["otm"] or "")
+    tot_margen = round(tot_ing - tot_costo, 2)
+    return {
+        "otms": out,
+        "total": {
+            "ingreso_valorizado": round(tot_ing, 2),
+            "costo_mo": round(tot_costo, 2),
+            "hh_total": round(tot_hh, 1),
+            "margen": tot_margen,
+            "pct_margen": round(tot_margen / tot_ing, 4) if tot_ing > 0 else 0,
+        },
+        "tarifa_default": default,
+    }
 
 
 @router.get("/curva")
