@@ -1006,20 +1006,26 @@ def _matriz_area_disciplina(hojas):
     return {"areas": out_areas, "total": _fmt({}, total, tot_proyec_global)}
 
 
-def _calc_costo_mo(hh_por_cargo: dict, tarifas: dict, default: float = 0.0):
+def _calc_costo_mo(hh_por_cargo: dict, tarifas: dict, default=None):
     """Costo de Mano de Obra = Σ (HH del cargo × tarifa del cargo).
-    Si un cargo no tiene tarifa propia, usa `default`; si tampoco hay default,
-    esas HH se acumulan en hh_sin_tarifa (no se cuentan en silencio como 0).
+    Reglas:
+      • Tarifa propia presente (incluido 0.0 explícito) → se respeta.
+      • Cargo sin tarifa propia → usa el respaldo `default`.
+      • Ni tarifa propia ni respaldo (ambos None) → esas HH NO se cuentan
+        como 0 en silencio: se acumulan en hh_sin_tarifa para poder avisar.
+    Convención: `None` = "no configurado"; `0.0` = "configurado en cero"
+    (p.ej. cargo subcontratado / no facturable).
     Función pura → testeable. Devuelve (costo, hh_sin_tarifa)."""
     costo = 0.0
     hh_sin = 0.0
     for cargo, hh in hh_por_cargo.items():
-        rate = tarifas.get(cargo)
-        if not rate:                 # None o 0 → intenta el respaldo
-            rate = default
-            if not rate:
-                hh_sin += hh
-        costo += hh * (rate or 0.0)
+        rate = tarifas.get(cargo)        # None ⇒ cargo sin tarifa configurada
+        if rate is None:
+            rate = default               # respaldo (puede ser None)
+        if rate is None:                 # ni propia ni respaldo
+            hh_sin += hh
+            rate = 0.0
+        costo += hh * rate
     return round(costo, 2), round(hh_sin, 2)
 
 
@@ -1579,16 +1585,18 @@ async def listar_tarifas():
         hh_rows = await con.fetch(_HH_POR_CARGO_SQL.format(sel="", grpby=""))
         tar_rows = await con.fetch("SELECT cargo, costo_hh FROM ev_tarifas_cargo")
     tar = {r["cargo"]: float(r["costo_hh"]) for r in tar_rows}
-    default = tar.get("(Default)", 0.0)
+    default = tar.get("(Default)")          # None ⇒ respaldo sin configurar
     cargos = []
     vistos = set()
     for r in hh_rows:
         c = r["cargo"]; vistos.add(c)
-        cargos.append({"cargo": c, "costo_hh": tar.get(c, 0.0), "hh": round(float(r["hh"] or 0), 1)})
+        # costo_hh None ⇒ "sin configurar" (≠ 0 explícito). hh entera para que
+        # la suma de la tarjeta cuadre con el total de la tabla (mismo redondeo).
+        cargos.append({"cargo": c, "costo_hh": tar.get(c), "hh": round(float(r["hh"] or 0))})
     # cargos con tarifa pero sin HH aún (excepto el respaldo)
     for c, v in tar.items():
         if c != "(Default)" and c not in vistos:
-            cargos.append({"cargo": c, "costo_hh": v, "hh": 0.0})
+            cargos.append({"cargo": c, "costo_hh": v, "hh": 0})
     cargos.sort(key=lambda x: x["cargo"])
     return {"cargos": cargos, "default": default}
 
@@ -1606,32 +1614,24 @@ async def guardar_tarifa(body: TarifaIn):
     return {"ok": True}
 
 
-@router.get("/rentabilidad")
-async def rentabilidad():
-    """Resultado Operativo por OTM: Ingreso valorizado − Costo MO (HH reales × tarifa).
-    Costo basado en tareo_partida (HH reales por trabajador → cargo → tarifa)."""
-    pool = await db()
-    async with pool.acquire() as con:
-        hh_rows = await con.fetch(
-            _HH_POR_CARGO_SQL.format(sel="tp.otm_id AS otm,", grpby="tp.otm_id,")
-        )
-        tar_rows = await con.fetch("SELECT cargo, costo_hh FROM ev_tarifas_cargo")
-        otm_rows = await con.fetch(
-            "SELECT id, descripcion, monto_contractual, monto_valorizado FROM otms"
-        )
-    tar = {r["cargo"]: float(r["costo_hh"]) for r in tar_rows}
-    default = tar.get("(Default)", 0.0)
-    otm_info = {r["id"]: r for r in otm_rows}
+def _resultado_operativo(por_otm: dict, tar: dict, default, otm_info: dict):
+    """Arma filas y totales de rentabilidad. Función pura → testeable sin BD.
 
-    por_otm: dict = defaultdict(lambda: defaultdict(float))
-    for r in hh_rows:
-        por_otm[r["otm"]][r["cargo"]] += float(r["hh"] or 0)
-
+    • Incluye TODA OTM con HH de tareo O con ingreso valorizado (>0), para que el
+      ingreso de una OTM aún sin tareo no desaparezca del total (bug 🔴).
+    • HH redondeadas a entero UNA sola vez por cargo: la tabla cuadra con la
+      tarjeta de tarifas y el costo es auditable (HH×tarifa = costo) (🟡).
+    Devuelve (filas, total)."""
+    otm_keys = set(por_otm.keys()) | {
+        oid for oid, info in otm_info.items()
+        if float(info["monto_valorizado"] or 0) > 0
+    }
     out = []
-    tot_ing = tot_costo = tot_hh = 0.0
-    for otm, hhc in por_otm.items():
-        costo, hh_sin = _calc_costo_mo(dict(hhc), tar, default)
-        hh_total = round(sum(hhc.values()), 1)
+    tot_ing = tot_costo = tot_hh = tot_hh_sin = 0.0
+    for otm in otm_keys:
+        hhc = {cargo: round(hh) for cargo, hh in por_otm.get(otm, {}).items()}
+        costo, hh_sin = _calc_costo_mo(hhc, tar, default)
+        hh_total = sum(hhc.values())
         info = otm_info.get(otm)
         ingreso = float(info["monto_valorizado"] or 0) if info else 0.0
         contractual = float(info["monto_contractual"] or 0) if info else 0.0
@@ -1647,19 +1647,46 @@ async def rentabilidad():
             "margen": margen,
             "pct_margen": round(margen / ingreso, 4) if ingreso > 0 else 0,
         })
-        tot_ing += ingreso; tot_costo += costo; tot_hh += hh_total
+        tot_ing += ingreso; tot_costo += costo; tot_hh += hh_total; tot_hh_sin += hh_sin
     out.sort(key=lambda x: x["otm"] or "")
     tot_margen = round(tot_ing - tot_costo, 2)
+    total = {
+        "ingreso_valorizado": round(tot_ing, 2),
+        "costo_mo": round(tot_costo, 2),
+        "hh_total": round(tot_hh),
+        "hh_sin_tarifa": round(tot_hh_sin),
+        "margen": tot_margen,
+        "pct_margen": round(tot_margen / tot_ing, 4) if tot_ing > 0 else 0,
+    }
+    return out, total
+
+
+@router.get("/rentabilidad")
+async def rentabilidad():
+    """Resultado Operativo por OTM: Ingreso valorizado − Costo MO (HH reales × tarifa).
+    Costo basado en tareo_partida (HH reales por trabajador → cargo → tarifa)."""
+    pool = await db()
+    async with pool.acquire() as con:
+        hh_rows = await con.fetch(
+            _HH_POR_CARGO_SQL.format(sel="tp.otm_id AS otm,", grpby="tp.otm_id,")
+        )
+        tar_rows = await con.fetch("SELECT cargo, costo_hh FROM ev_tarifas_cargo")
+        otm_rows = await con.fetch(
+            "SELECT id, descripcion, monto_contractual, monto_valorizado FROM otms"
+        )
+    tar = {r["cargo"]: float(r["costo_hh"]) for r in tar_rows}
+    default = tar.get("(Default)")          # None ⇒ respaldo sin configurar
+    otm_info = {r["id"]: r for r in otm_rows}
+
+    por_otm: dict = defaultdict(lambda: defaultdict(float))
+    for r in hh_rows:
+        por_otm[r["otm"]][r["cargo"]] += float(r["hh"] or 0)
+
+    out, total = _resultado_operativo(por_otm, tar, default, otm_info)
     return {
         "otms": out,
-        "total": {
-            "ingreso_valorizado": round(tot_ing, 2),
-            "costo_mo": round(tot_costo, 2),
-            "hh_total": round(tot_hh, 1),
-            "margen": tot_margen,
-            "pct_margen": round(tot_margen / tot_ing, 4) if tot_ing > 0 else 0,
-        },
-        "tarifa_default": default,
+        "total": total,
+        "tarifa_default": default if default is not None else 0.0,
     }
 
 

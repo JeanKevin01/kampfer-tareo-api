@@ -15,7 +15,7 @@ import pytest
 from routers.valor_ganado import (
     _calcular, _validar_pesos, _semana_de, _agrupar, HitoIn,
     _matriz_area_disciplina, _totales, _calc_costo_mo,
-    _HH_POR_CARGO_SQL,
+    _HH_POR_CARGO_SQL, _resultado_operativo,
 )
 
 
@@ -368,10 +368,10 @@ def test_matriz_sem34_sistema1():
 
 
 def test_calc_costo_mo_por_cargo():
-    """Costo MO = Σ HH×tarifa; cargos sin tarifa quedan marcados (no en silencio)."""
+    """Costo MO = Σ HH×tarifa; cargos sin tarifa NI respaldo quedan marcados."""
     hh = {"Operario": 100, "Peon": 200, "Capataz": 50}
     tar = {"Operario": 30.0, "Peon": 20.0}   # Capataz sin tarifa
-    costo, hh_sin = _calc_costo_mo(hh, tar, default=0.0)
+    costo, hh_sin = _calc_costo_mo(hh, tar, default=None)   # sin respaldo
     assert costo == 100 * 30 + 200 * 20 + 0   # 7000
     assert hh_sin == 50                        # las HH de Capataz quedan marcadas
 
@@ -383,6 +383,62 @@ def test_calc_costo_mo_usa_default():
     costo, hh_sin = _calc_costo_mo(hh, tar, default=15.0)
     assert costo == 100 * 30 + 50 * 15         # 3750
     assert hh_sin == 0
+
+
+def test_calc_costo_mo_tarifa_cero_explicita_se_respeta():
+    """Una tarifa 0.0 explícita (subcontrata/no facturable) cuesta 0 y NO se marca."""
+    hh = {"Operario": 100, "Subcontrata": 50}
+    tar = {"Operario": 30.0, "Subcontrata": 0.0}   # 0 a propósito
+    costo, hh_sin = _calc_costo_mo(hh, tar, default=99.0)
+    assert costo == 100 * 30 + 0               # NO usa el default para Subcontrata
+    assert hh_sin == 0                          # 0 explícito ≠ "sin tarifa"
+
+
+def test_calc_costo_mo_default_cero_explicito_no_marca():
+    """Default=0.0 explícito ⇒ los cargos sin tarifa cuestan 0 y no se marcan."""
+    hh = {"Operario": 100, "Capataz": 50}
+    tar = {"Operario": 30.0}
+    costo, hh_sin = _calc_costo_mo(hh, tar, default=0.0)
+    assert costo == 100 * 30
+    assert hh_sin == 0
+
+
+# ── Resultado operativo (rentabilidad): unión de OTMs + cuadre HH/costo ──
+def _otm(desc, valorizado, contractual=0):
+    return {"descripcion": desc, "monto_valorizado": valorizado, "monto_contractual": contractual}
+
+
+def test_resultado_incluye_otm_con_ingreso_sin_tareo():
+    """🔴 Una OTM con ingreso valorizado pero sin tareo SÍ aparece y suma al total."""
+    por_otm = {"OTM-A": {"Operario": 100}}                 # solo A tiene tareo
+    tar = {"Operario": 30.0}
+    otm_info = {"OTM-A": _otm("A", 5000), "OTM-B": _otm("B", 8000)}  # B sin tareo
+    out, total = _resultado_operativo(por_otm, tar, None, otm_info)
+    otms = {r["otm"]: r for r in out}
+    assert "OTM-B" in otms                                  # antes desaparecía
+    assert otms["OTM-B"]["hh_total"] == 0
+    assert otms["OTM-B"]["costo_mo"] == 0
+    assert otms["OTM-B"]["ingreso_valorizado"] == 8000
+    assert total["ingreso_valorizado"] == 13000            # 5000 + 8000 (no se pierde)
+
+
+def test_resultado_excluye_otm_sin_ingreso_ni_tareo():
+    """Una OTM sin tareo y sin ingreso no ensucia la tabla."""
+    por_otm = {"OTM-A": {"Operario": 100}}
+    otm_info = {"OTM-A": _otm("A", 5000), "OTM-Z": _otm("Z", 0)}
+    out, _ = _resultado_operativo(por_otm, {"Operario": 30.0}, None, otm_info)
+    assert {r["otm"] for r in out} == {"OTM-A"}
+
+
+def test_resultado_hh_y_costo_cuadran_y_son_auditables():
+    """🟡 HH entera por cargo: el total cuadra con la suma y el costo es auditable."""
+    por_otm = {"OTM-A": {"Operario": 142.6, "Peon": 10.4}}   # con decimales
+    tar = {"Operario": 30.0, "Peon": 20.0}
+    out, total = _resultado_operativo(por_otm, tar, None, {"OTM-A": _otm("A", 0)})
+    fila = out[0]
+    assert fila["hh_total"] == 143 + 10                      # suma de HH enteras
+    assert fila["costo_mo"] == 143 * 30 + 10 * 20            # HH×tarifa exacto
+    assert total["hh_total"] == fila["hh_total"]
 
 
 def _group_by_clause(sql: str) -> str:
