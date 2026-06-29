@@ -19,21 +19,28 @@ from routers.valor_ganado import router as ev_router
 #   · X-API-Key correcta  → para integraciones (n8n), o
 #   · Authorization: Bearer <token JWT válido>  → para el panel y la app de campo.
 # Rollout seguro: 1) desplegar esta API, 2) configurar n8n con la key, 3) recién setear API_KEY.
+ENV = os.getenv("ENV", "dev").strip().lower()   # 'dev' | 'prod' — controla el modo fail-closed
 API_KEY = os.getenv("API_KEY", "").strip()
 # Rutas que NUNCA exigen credenciales (login incluido: sin él no se podría obtener el token).
 _PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc", "/api/auth/login"}
+
+def _api_key_ok(x_api_key: str) -> bool:
+    """True si la X-API-Key coincide con la configurada (comparación en tiempo constante)."""
+    return bool(API_KEY) and bool(x_api_key) and hmac.compare_digest(x_api_key, API_KEY)
 
 async def require_key(
     request: Request,
     x_api_key: str = Header(default=""),
     authorization: str = Header(default=""),
 ):
-    if not API_KEY:                       # aún no configurada → no exige (compat)
+    # Compat (EPIC 0.4.3): en dev sin API_KEY no se exige nada → operación sin cortes.
+    # En prod, validar_secretos_arranque() garantiza API_KEY, así que la API queda cerrada.
+    if not API_KEY and ENV != "prod":
         return
     if request.url.path in _PUBLIC_PATHS or request.method == "OPTIONS":
         return
     # 1) Integraciones (n8n): API key compartida en X-API-Key
-    if x_api_key and hmac.compare_digest(x_api_key, API_KEY):
+    if _api_key_ok(x_api_key):
         return
     # 2) Usuarios (panel / app de campo): token JWT válido
     if authorization[:7].lower() == "bearer " and verify_token(authorization[7:]):
@@ -46,9 +53,29 @@ ALLOWED_ORIGINS = ["*"] if _origins_env in ("", "*") else [o.strip() for o in _o
 
 # ── Seguridad Fase 2: autenticación por usuario (JWT propio, sin dependencias) ──
 # Roles: 'admin' (todo) | 'oficina' (panel) | 'supervisor' (app). Token firmado con HMAC-SHA256.
-JWT_SECRET = (os.getenv("JWT_SECRET", "").strip() or "kampfer-cambia-este-secreto-en-produccion")
+_DEFAULT_JWT_SECRET = "kampfer-cambia-este-secreto-en-produccion"
+_DEFAULT_ADMIN_PW   = "admin123"
+JWT_SECRET = (os.getenv("JWT_SECRET", "").strip() or _DEFAULT_JWT_SECRET)
 TOKEN_TTL  = int(os.getenv("TOKEN_TTL_SEG", str(60 * 60 * 12)))   # 12 h por defecto
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")          # solo para el seed inicial
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", _DEFAULT_ADMIN_PW)   # solo para el seed inicial
+
+def validar_secretos_arranque():
+    """Fail-closed (EPIC 0.4.1): en producción NO arrancar con secretos por defecto
+    ni con la API abierta. En dev no hace nada (operación sin cortes)."""
+    if ENV != "prod":
+        return
+    faltas = []
+    if JWT_SECRET == _DEFAULT_JWT_SECRET:
+        faltas.append("JWT_SECRET sin configurar")
+    if not API_KEY:
+        faltas.append("API_KEY obligatoria")
+    if ADMIN_PASSWORD == _DEFAULT_ADMIN_PW:
+        faltas.append("ADMIN_PASSWORD por defecto")
+    if faltas:
+        raise RuntimeError(
+            "Arranque abortado por seguridad (ENV=prod): " + "; ".join(faltas) +
+            ". Configura estas variables de entorno en Coolify."
+        )
 
 def _hash_pw(password: str, salt: Optional[str] = None) -> str:
     salt = salt or secrets.token_hex(16)
@@ -95,9 +122,20 @@ async def current_user(authorization: str = Header(default="")) -> Optional[dict
     return None
 
 def require_role(*roles: str):
-    """Dependencia que EXIGE estar autenticado y (opcionalmente) un rol. 'admin' siempre pasa."""
-    async def dep(user: Optional[dict] = Depends(current_user)) -> dict:
+    """Dependencia que EXIGE estar autenticado y (opcionalmente) un rol. 'admin' siempre pasa.
+    · X-API-Key válida → principal de servicio (n8n): acceso pleno (no rompe integraciones).
+    · En dev sin API_KEY → no bloquea (compat con la operación actual).
+    · roles vacío = basta con estar autenticado."""
+    async def dep(
+        x_api_key: str = Header(default=""),
+        authorization: str = Header(default=""),
+    ) -> dict:
+        if _api_key_ok(x_api_key):
+            return {"sub": "service", "rol": "admin"}
+        user = verify_token(authorization[7:]) if authorization[:7].lower() == "bearer " else None
         if not user:
+            if not API_KEY and ENV != "prod":      # seguridad global inactiva (compat)
+                return {"sub": "compat", "rol": "admin"}
             raise HTTPException(401, "No autenticado")
         if roles and user.get("rol") != "admin" and user.get("rol") not in roles:
             raise HTTPException(403, "No tienes permiso para esta acción")
@@ -136,7 +174,10 @@ def parse_fecha(v):
             return None
     return None
 
-app = FastAPI(title="Kampfer Tareo API", version="1.3.0", dependencies=[Depends(require_key)])
+# EPIC 0.4.1: aborta el arranque en prod si los secretos están por defecto o la API quedaría abierta.
+validar_secretos_arranque()
+
+app = FastAPI(title="Kampfer Tareo API", version="1.4.0", dependencies=[Depends(require_key)])
 
 app.add_middleware(
     CORSMiddleware,
@@ -352,7 +393,7 @@ async def jornada_resolver(fecha: Optional[str] = None, otm: Optional[str] = Non
 
 
 @app.post("/api/jornada")
-async def jornada_guardar(data: dict):
+async def jornada_guardar(data: dict, _u: dict = Depends(require_role("oficina"))):
     """Crea reglas de jornada. 'otm_id' opcional (null/ausente = todas las OTMs).
     Semanal: {tipo:'semanal', desde:'YYYY-MM-DD', dias:{0:9.5,...,2:10}, otm_id?}
     Puntual: {tipo:'puntual', fecha:'YYYY-MM-DD', hh:12, nota?, otm_id?}"""
@@ -396,7 +437,7 @@ async def jornada_guardar(data: dict):
 
 
 @app.delete("/api/jornada/{regla_id}")
-async def jornada_eliminar(regla_id: int):
+async def jornada_eliminar(regla_id: int, _u: dict = Depends(require_role("oficina"))):
     await database.execute("DELETE FROM ev_jornada_reglas WHERE id = :id", {"id": regla_id})
     return {"ok": True}
 
@@ -508,7 +549,7 @@ async def trabajadores_duplicados():
 
 
 @app.post("/api/trabajadores/merge")
-async def trabajadores_merge(data: dict):
+async def trabajadores_merge(data: dict, _u: dict = Depends(require_role("oficina"))):
     """Fusiona un trabajador duplicado en otro: reasigna TODAS las referencias
     (vía information_schema) y desactiva el origen. Transaccional: si hay colisión
     de claves únicas, revierte todo y reporta la tabla, sin pérdida de datos."""
@@ -743,7 +784,7 @@ async def listar_supervisores_admin():
 
 
 @app.post("/admin/supervisor")
-async def crear_supervisor(data: dict):
+async def crear_supervisor(data: dict, _u: dict = Depends(require_role("oficina"))):
     nombre = data.get("nombre", "").strip().upper()
     email  = data.get("email",  "").strip()
 
@@ -764,7 +805,7 @@ async def crear_supervisor(data: dict):
 
 
 @app.put("/admin/supervisor/{sup_id}")
-async def editar_supervisor(sup_id: str, data: dict):
+async def editar_supervisor(sup_id: str, data: dict, _u: dict = Depends(require_role("oficina"))):
     row = await database.fetch_one(
         "SELECT id FROM supervisores WHERE id = :id", {"id": sup_id}
     )
@@ -785,7 +826,7 @@ async def editar_supervisor(sup_id: str, data: dict):
 
 
 @app.put("/admin/supervisor/{sup_id}/baja")
-async def dar_baja_supervisor(sup_id: str):
+async def dar_baja_supervisor(sup_id: str, _u: dict = Depends(require_role("oficina"))):
     await database.execute(
         "UPDATE supervisores SET activo = false WHERE id = :id", {"id": sup_id}
     )
@@ -1200,7 +1241,7 @@ async def almuerzos(fecha: str):
 
 # ── ADMIN: CREAR TRABAJADOR ───────────────────────────────────
 @app.post("/admin/trabajador")
-async def crear_trabajador(data: dict):
+async def crear_trabajador(data: dict, _u: dict = Depends(require_role("oficina"))):
     nombre = data.get("nombre", "").strip().upper()
     cargo  = data.get("cargo",  "").strip().upper()
     dni    = data.get("dni",    "").strip()
@@ -1235,7 +1276,7 @@ async def listar_trabajadores():
 
 # ── ADMIN: DAR DE BAJA ────────────────────────────────────────
 @app.put("/admin/trabajador/{trab_id}/baja")
-async def dar_baja(trab_id: str):
+async def dar_baja(trab_id: str, _u: dict = Depends(require_role("oficina"))):
     await database.execute(
         "UPDATE trabajadores SET activo = false WHERE id = :id",
         {"id": trab_id.zfill(3)}
@@ -1244,7 +1285,7 @@ async def dar_baja(trab_id: str):
 
 # ── ADMIN: AGREGAR / ACTUALIZAR OTM ──────────────────────────
 @app.post("/admin/otm")
-async def crear_otm(data: dict):
+async def crear_otm(data: dict, _u: dict = Depends(require_role("oficina"))):
     otm_id      = data.get("id", "").strip().upper()
     descripcion = data.get("descripcion", "").strip().upper()
     area        = data.get("area", "").strip()
@@ -1285,7 +1326,7 @@ async def crear_otm(data: dict):
 
 
 @app.post("/admin/otms/bulk")
-async def crear_otms_bulk(data: dict):
+async def crear_otms_bulk(data: dict, _u: dict = Depends(require_role("oficina"))):
     """Importación masiva de OTMs — recibe {otms: [{id,descripcion,area,estado,sdp,centro_costo,
     plazo,fecha_inicio,fecha_fin,monto_contractual,monto_valorizado}]}"""
     otms = data.get("otms", [])
@@ -1344,7 +1385,7 @@ async def crear_otms_bulk(data: dict):
 
 # ── ADMIN: CAMBIAR ESTADO OTM ─────────────────────────────────
 @app.put("/admin/otm/{otm_id}/estado")
-async def actualizar_estado_otm(otm_id: str, data: dict):
+async def actualizar_estado_otm(otm_id: str, data: dict, _u: dict = Depends(require_role("oficina"))):
     estado = data.get("estado", "").strip()
     validos = ["EJECUCION", "POR INICIAR", "CERRADO", "CONCLUIDO", "STAND BY"]
     if estado not in validos:
@@ -1357,7 +1398,7 @@ async def actualizar_estado_otm(otm_id: str, data: dict):
 
 # ── EDITAR TRABAJADOR ─────────────────────────────────────────
 @app.put("/admin/trabajador/{trab_id}")
-async def editar_trabajador(trab_id: str, data: dict):
+async def editar_trabajador(trab_id: str, data: dict, _u: dict = Depends(require_role("oficina"))):
     row = await database.fetch_one(
         "SELECT id FROM trabajadores WHERE id = :id",
         {"id": trab_id}
