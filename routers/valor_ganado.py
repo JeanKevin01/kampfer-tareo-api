@@ -1122,7 +1122,6 @@ async def _datos_base(semana: int, otm: Optional[str] = None):
     return partidas, hitos, avances, [], tareo, split
 
 
-
 @router.get("/semanas-auto")
 async def semanas_auto():
     """Semanas reales del proyecto (Lun-Dom) desde el primer registro de tareo.
@@ -1178,7 +1177,6 @@ async def semanas_auto():
                           + ("" if hh > 0 else "  (sin actividad)"),
             })
         return result
-
 
 
 @router.get("/arbol")
@@ -1239,7 +1237,6 @@ async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
         raise
     except Exception as e:
         raise HTTPException(500, f"Error calculando árbol WBS: {e}")
-
 
 
 @router.get("/monitor/anomalias")
@@ -1337,7 +1334,6 @@ async def distribuir_hh(body: dict):
             asignados += 1
 
     return {"ok": True, "semana": semana, "asignados": asignados}
-
 
 
 @router.get("/isp")
@@ -1970,72 +1966,6 @@ async def guardar_avance_diario(data: dict):
     return {"ok": True}
 
 
-
-
-@router.post("/volcar-diario-a-isp")
-async def volcar_diario_a_isp(data: dict):
-    """
-    Agrega las HH del control diario (tareo_partida) hacia ev_hh_gastadas,
-    que es la tabla que alimenta el ISP semanal y el PF.
-    Solo vuelca si hay datos reales en tareo_partida (no estimaciones).
-    Devuelve cuántas partidas fueron volcadas.
-    """
-    semana = data.get("semana")
-    otm    = data.get("otm")
-    lunes  = data.get("lunes")  # solo para validar rango de fechas alternativo
-
-    if not semana:
-        raise HTTPException(400, "semana es requerido")
-
-    pool = await db()
-    async with pool.acquire() as con:
-        # Sumar HH por partida para la semana
-        if otm:
-            rows = await con.fetch(
-                """SELECT partida_id, SUM(hh) AS hh_total
-                   FROM tareo_partida
-                   WHERE semana = $1 AND otm_id = $2 AND hh IS NOT NULL
-                   GROUP BY partida_id""",
-                semana, otm
-            )
-        else:
-            rows = await con.fetch(
-                """SELECT partida_id, SUM(hh) AS hh_total
-                   FROM tareo_partida
-                   WHERE semana = $1 AND hh IS NOT NULL
-                   GROUP BY partida_id""",
-                semana
-            )
-
-        if not rows:
-            raise HTTPException(
-                404,
-                f"Sin datos de tareo_partida para semana {semana}"
-                + (f" / {otm}" if otm else "")
-                + ". ¿El nuevo flujo de la app ya está en uso?"
-            )
-
-        volcados = 0
-        async with con.transaction():
-            for r in rows:
-                await con.execute(
-                    """INSERT INTO ev_hh_gastadas (partida_id, semana, hh, fuente)
-                       VALUES ($1, $2, $3, 'diario')
-                       ON CONFLICT (partida_id, semana)
-                       DO UPDATE SET hh = $3, fuente = 'diario'""",
-                    r["partida_id"], semana, round(float(r["hh_total"]), 2)
-                )
-                volcados += 1
-
-        return {
-            "ok":              True,
-            "semana":          semana,
-            "otm":             otm,
-            "partidas_volcadas": volcados,
-            "mensaje": f"{volcados} partidas volcadas al ISP semana {semana}. "
-                       "Los valores del ISP se actualizarán en el siguiente cálculo."
-        }
-
 @router.get("/rendimiento-trabajador")
 async def rendimiento_trabajador(
     trabajador_id: str,
@@ -2283,218 +2213,6 @@ async def guardar_cuadrilla_plantilla(data: dict):
                 )
     return {"ok": True, "nombre": nombre, "total": len(trabajadores)}
 
-
-# ── Sesiones del día para asignación a partidas ───────────────
-
-@router.get("/sesiones-sin-asignar")
-async def sesiones_sin_asignar(
-    fecha:  Optional[str] = None,
-    otm_id: Optional[str] = None,
-):
-    """Sesiones enviadas del día con detalle de trabajadores y partidas."""
-    pool = await db()
-    async with pool.acquire() as con:
-        if not fecha:
-            fecha = _hoy_lima().isoformat()
-
-        conds = ["s.estado = 'enviada'", "s.fecha = $1"]
-        args: list = [_as_date(fecha)]
-        if otm_id:
-            args.append(otm_id)
-            conds.append(f"s.otm_id = ${len(args)}")
-        where = " AND ".join(conds)
-
-        rows = await con.fetch(
-            f"""SELECT s.id AS sesion_id, s.supervisor_id,
-                       sup.nombre AS supervisor,
-                       s.otm_id, s.fecha::text,
-                       s.hh_turno,
-                       COUNT(st.id)  AS n_trabajadores,
-                       s.hh_turno * COUNT(st.id) AS hh_total,
-                       COALESCE(SUM(stp.hh), 0)  AS hh_asignadas
-                FROM sesiones s
-                JOIN supervisores sup ON sup.id = s.supervisor_id
-                LEFT JOIN sesion_trabajadores st  ON st.sesion_id = s.id
-                LEFT JOIN sesion_trabajador_partidas stp ON stp.sesion_id = s.id
-                WHERE {where}
-                GROUP BY s.id, s.supervisor_id, sup.nombre,
-                         s.otm_id, s.fecha, s.hh_turno
-                ORDER BY s.id DESC""",
-            *args
-        )
-
-        result = []
-        for r in rows:
-            hh_total = float(r["hh_total"] or 0)
-            hh_asig  = float(r["hh_asignadas"] or 0)
-
-            # Trabajadores con HH ya asignadas
-            trab_rows = await con.fetch(
-                """SELECT st.trab_id AS trabajador_id,
-                          t.nombre, t.cargo,
-                          COALESCE(t.tipo,'DIRECTO') AS tipo,
-                          COALESCE(st.hh_override, s.hh_turno, 9.5) AS hh_registradas,
-                          COALESCE(SUM(stp.hh), 0) AS hh_asignadas
-                   FROM sesion_trabajadores st
-                   JOIN sesiones s    ON s.id  = st.sesion_id
-                   JOIN trabajadores t ON t.id = st.trab_id
-                   LEFT JOIN sesion_trabajador_partidas stp
-                     ON stp.sesion_id     = st.sesion_id
-                    AND stp.trabajador_id = st.trab_id
-                   WHERE st.sesion_id = $1
-                   GROUP BY st.trab_id, t.nombre, t.cargo, t.tipo,
-                            st.hh_override, s.hh_turno
-                   ORDER BY t.nombre""",
-                r["sesion_id"]
-            )
-
-            # Partidas hoja de la OTM
-            part_rows = await con.fetch(
-                """SELECT id, codigo, descripcion, fase, unidad,
-                          hh_presup, metrado_presup
-                   FROM ev_partidas
-                   WHERE otm_id = $1 AND fase IS NOT NULL AND activo = TRUE
-                   ORDER BY codigo""",
-                r["otm_id"]
-            )
-
-            trabajadores = []
-            for t in trab_rows:
-                hh_reg  = float(t["hh_registradas"] or 9.5)
-                hh_asig_t = float(t["hh_asignadas"] or 0)
-                trabajadores.append({
-                    "trabajador_id": t["trabajador_id"],
-                    "nombre":        t["nombre"],
-                    "cargo":         t["cargo"],
-                    "tipo":          t["tipo"],
-                    "hh_registradas": round(hh_reg, 2),
-                    "hh_asignadas":   round(hh_asig_t, 2),
-                    "hh_pendientes":  round(hh_reg - hh_asig_t, 2),
-                })
-
-            result.append({
-                "sesion_id":   r["sesion_id"],
-                "supervisor":  r["supervisor"],
-                "supervisor_id": r["supervisor_id"],
-                "otm_id":      r["otm_id"],
-                "fecha":       r["fecha"],
-                "hh_turno":    float(r["hh_turno"] or 9.5),
-                "hh_total":    round(hh_total, 2),
-                "hh_asignadas": round(hh_asig, 2),
-                "hh_pendientes": round(hh_total - hh_asig, 2),
-                "trabajadores": trabajadores,
-                "partidas":     [dict(p) for p in part_rows],
-            })
-
-        return result
-
-
-@router.post("/asignar-sesion-partidas")
-async def asignar_sesion_partidas(data: dict):
-    """Guarda la asignación de HH de una sesión → partidas específicas."""
-    sesion_id    = data.get("sesion_id")
-    asignaciones = data.get("asignaciones", [])  # [{trabajador_id, partida_id, hh}]
-
-    if not sesion_id:
-        raise HTTPException(400, "sesion_id es requerido")
-
-    pool = await db()
-    async with pool.acquire() as con:
-        ses = await con.fetchrow(
-            "SELECT id, fecha, supervisor_id, otm_id FROM sesiones WHERE id=$1",
-            sesion_id
-        )
-        if not ses:
-            raise HTTPException(404, "Sesión no encontrada")
-
-        async with con.transaction():
-            # Borrar asignaciones previas
-            await con.execute(
-                "DELETE FROM sesion_trabajador_partidas WHERE sesion_id=$1",
-                sesion_id
-            )
-            for a in asignaciones:
-                hh = float(a.get("hh", 0))
-                if hh <= 0:
-                    continue
-                await con.execute(
-                    """INSERT INTO sesion_trabajador_partidas
-                         (sesion_id, trabajador_id, partida_id, hh,
-                          fecha, supervisor_id, otm_id)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7)""",
-                    sesion_id,
-                    str(a["trabajador_id"]),
-                    a.get("partida_id"),
-                    hh,
-                    ses["fecha"],
-                    ses["supervisor_id"],
-                    ses["otm_id"],
-                )
-
-            # Detectar conflictos de HH duplicadas
-            for a in asignaciones:
-                tid   = str(a["trabajador_id"])
-                total = await con.fetchval(
-                    """SELECT COALESCE(SUM(hh),0)
-                       FROM sesion_trabajador_partidas
-                       WHERE trabajador_id=$1 AND fecha=$2""",
-                    tid, ses["fecha"]
-                )
-                if float(total or 0) > 11:   # umbral razonable
-                    otras = await con.fetch(
-                        """SELECT DISTINCT s.supervisor_id
-                           FROM sesion_trabajador_partidas stp
-                           JOIN sesiones s ON s.id = stp.sesion_id
-                           WHERE stp.trabajador_id=$1 AND stp.fecha=$2
-                             AND stp.sesion_id != $3 LIMIT 1""",
-                        tid, ses["fecha"], sesion_id
-                    )
-                    if otras:
-                        await con.execute(
-                            """INSERT INTO hh_conflictos
-                                 (trabajador_id, fecha,
-                                  supervisor_id_1, supervisor_id_2, hh_1, hh_2)
-                               VALUES ($1,$2,$3,$4,$5,$6)
-                               ON CONFLICT DO NOTHING""",
-                            tid, ses["fecha"],
-                            otras[0]["supervisor_id"], ses["supervisor_id"],
-                            9.5, float(total or 0) - 9.5
-                        )
-
-    return {"ok": True, "sesion_id": sesion_id, "asignados": len(asignaciones)}
-
-
-# ── Validación HH duplicadas ──────────────────────────────────
-
-@router.get("/hh-trabajador-dia")
-async def hh_trabajador_dia(trabajador_id: str, fecha: str):
-    """HH registradas para un trabajador en un día específico."""
-    pool = await db()
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            """SELECT s.id AS sesion_id, s.supervisor_id,
-                      sup.nombre AS supervisor,
-                      s.otm_id, stp.partida_id, p.codigo, p.descripcion,
-                      stp.hh
-               FROM sesion_trabajador_partidas stp
-               JOIN sesiones s    ON s.id  = stp.sesion_id
-               JOIN supervisores sup ON sup.id = s.supervisor_id
-               LEFT JOIN ev_partidas p ON p.id = stp.partida_id
-               WHERE stp.trabajador_id=$1 AND stp.fecha=$2::date
-               ORDER BY s.id""",
-            trabajador_id, _as_date(fecha)
-        )
-        total = sum(float(r["hh"] or 0) for r in rows)
-        return {
-            "trabajador_id": trabajador_id,
-            "fecha":  fecha,
-            "hh_total": round(total, 2),
-            "alerta": total > 11,
-            "detalle": [dict(r) for r in rows],
-        }
-
-
-# ── Carga histórica manual ────────────────────────────────────
 
 @router.post("/historico/cargar")
 async def cargar_historico(data: dict):
