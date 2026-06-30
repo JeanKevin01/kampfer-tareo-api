@@ -14,6 +14,7 @@ import secrets
 from contextlib import asynccontextmanager
 from routers.valor_ganado import router as ev_router
 from routers.presupuesto import router as presupuesto_router
+from routers.ro import router as ro_router
 
 # ── Seguridad Fase 1+3: compuerta global (retrocompatible) ──
 # Mientras API_KEY no esté seteada, NO se exige nada (despliegue sin cortar la operación).
@@ -221,6 +222,8 @@ app.add_middleware(
 app.include_router(ev_router)
 # Fase 1: módulo de presupuesto (todos los endpoints son de oficina).
 app.include_router(presupuesto_router, dependencies=[Depends(require_role("oficina"))])
+# Fase 2: Resultado Operativo (oficina).
+app.include_router(ro_router, dependencies=[Depends(require_role("oficina"))])
 
 async def resolver_jornada(fecha: date, otm_id: Optional[str] = None) -> float:
     """HH de jornada vigentes para una fecha (y opcionalmente una OTM):
