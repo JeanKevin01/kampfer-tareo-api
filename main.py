@@ -11,6 +11,7 @@ import base64
 import json
 import time
 import secrets
+from contextlib import asynccontextmanager
 from routers.valor_ganado import router as ev_router
 
 # ── Seguridad Fase 1+3: compuerta global (retrocompatible) ──
@@ -177,7 +178,36 @@ def parse_fecha(v):
 # EPIC 0.4.1: aborta el arranque en prod si los secretos están por defecto o la API quedaría abierta.
 validar_secretos_arranque()
 
-app = FastAPI(title="Kampfer Tareo API", version="1.4.0", dependencies=[Depends(require_key)])
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # EPIC 0.2.4: el esquema lo gobiernan las migraciones (Alembic). Aquí NO hay DDL,
+    # solo conexión y semillas idempotentes (datos) para una BD recién creada.
+    await database.connect()
+    # Semilla de jornada base (si no hay reglas semanales): Miércoles 10 HH, resto 9.5.
+    row = await database.fetch_one(
+        "SELECT COUNT(*) AS n FROM ev_jornada_reglas WHERE tipo = 'semanal'"
+    )
+    if not row or (row["n"] or 0) == 0:
+        for dow in range(7):
+            await database.execute(
+                "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota) "
+                "VALUES ('semanal', '2000-01-01', :d, :h, 'base inicial')",
+                {"d": dow, "h": 10.0 if dow == 2 else 9.5},
+            )
+    # Semilla de usuario admin (si la tabla está vacía).
+    urow = await database.fetch_one("SELECT COUNT(*) AS n FROM usuarios")
+    if not urow or (urow["n"] or 0) == 0:
+        await database.execute(
+            "INSERT INTO usuarios (username, password_hash, rol, nombre) "
+            "VALUES ('admin', :p, 'admin', 'Administrador')",
+            {"p": _hash_pw(ADMIN_PASSWORD)},
+        )
+    yield
+    await database.disconnect()
+
+
+app = FastAPI(title="Kampfer Tareo API", version="1.5.0", lifespan=lifespan, dependencies=[Depends(require_key)])
 
 app.add_middleware(
     CORSMiddleware,
@@ -188,130 +218,6 @@ app.add_middleware(
 )
 
 app.include_router(ev_router)
-
-@app.on_event("startup")
-async def startup():
-    await database.connect()
-    # ── Jornada: reglas de HH por día con vigencia (idempotente) ──
-    await database.execute("""
-        CREATE TABLE IF NOT EXISTS ev_jornada_reglas (
-            id          SERIAL PRIMARY KEY,
-            tipo        TEXT  NOT NULL DEFAULT 'semanal',  -- 'semanal' | 'puntual'
-            desde       DATE  NOT NULL,                     -- semanal: vigente desde · puntual: la fecha exacta
-            dia_semana  INT,                                -- semanal: 0=Lun..6=Dom · puntual: NULL
-            hh          NUMERIC(5,2) NOT NULL,
-            nota        TEXT,
-            creado_en   TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-    """)
-    # OTM opcional: NULL = aplica a todas las OTMs (regla global)
-    await database.execute(
-        "ALTER TABLE ev_jornada_reglas ADD COLUMN IF NOT EXISTS otm_id TEXT"
-    )
-    row = await database.fetch_one(
-        "SELECT COUNT(*) AS n FROM ev_jornada_reglas WHERE tipo = 'semanal'"
-    )
-    if not row or (row["n"] or 0) == 0:
-        # Base inicial: Miércoles 10 HH, resto 9.5 HH (incluye sábado y domingo)
-        for dow in range(7):
-            await database.execute(
-                "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota) "
-                "VALUES ('semanal', '2000-01-01', :d, :h, 'base inicial')",
-                {"d": dow, "h": 10.0 if dow == 2 else 9.5},
-            )
-
-    # ── Fase 2: usuarios para login (idempotente) + seed admin inicial ──
-    await database.execute("""
-        CREATE TABLE IF NOT EXISTS usuarios (
-            id            SERIAL PRIMARY KEY,
-            username      TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            rol           TEXT NOT NULL DEFAULT 'oficina',  -- admin | oficina | supervisor
-            nombre        TEXT,
-            activo        BOOLEAN NOT NULL DEFAULT true,
-            creado_en     TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-    """)
-    urow = await database.fetch_one("SELECT COUNT(*) AS n FROM usuarios")
-    if not urow or (urow["n"] or 0) == 0:
-        await database.execute(
-            "INSERT INTO usuarios (username, password_hash, rol, nombre) "
-            "VALUES ('admin', :p, 'admin', 'Administrador')",
-            {"p": _hash_pw(ADMIN_PASSWORD)},
-        )
-
-    # ── Valor Ganado #1: clasificación Directo/Indirecto por partida (idempotente) ──
-    try:
-        await database.execute(
-            "ALTER TABLE ev_partidas ADD COLUMN IF NOT EXISTS "
-            "tipo_costo TEXT NOT NULL DEFAULT 'DIRECTO'"
-        )
-    except Exception as e:
-        print(f"[startup] ev_partidas.tipo_costo: {e}")
-
-    # ── Valor Ganado #3: naturaleza Contractual/Adicional por partida (idempotente) ──
-    try:
-        await database.execute(
-            "ALTER TABLE ev_partidas ADD COLUMN IF NOT EXISTS "
-            "naturaleza TEXT NOT NULL DEFAULT 'CONTRACTUAL'"
-        )
-    except Exception as e:
-        print(f"[startup] ev_partidas.naturaleza: {e}")
-
-    # ── Valor Ganado #6: presupuesto ACTUALIZADO por partida (idempotente) ──
-    # Denominador del % avance del proyecto (método del gerente).
-    # Nullable: si es NULL, el motor usa hh_presup como fallback.
-    try:
-        await database.execute(
-            "ALTER TABLE ev_partidas ADD COLUMN IF NOT EXISTS hh_actualizado NUMERIC"
-        )
-    except Exception as e:
-        print(f"[startup] ev_partidas.hh_actualizado: {e}")
-
-    # ── Valor Ganado #5: HH improductivas por OTM/semana (idempotente) ──
-    # Captura de oficina (semanal por OTM, con motivo). Son HH consumidas NO
-    # asignadas a partidas; entran a las HH gastadas totales y bajan el PF del proyecto.
-    await database.execute("""
-        CREATE TABLE IF NOT EXISTS ev_hh_improductivas (
-            id            SERIAL PRIMARY KEY,
-            otm_id        TEXT,
-            semana        INT  NOT NULL,
-            hh            NUMERIC NOT NULL,
-            motivo        TEXT,
-            nota          TEXT,
-            registrado_en TIMESTAMPTZ NOT NULL DEFAULT now()
-        )
-    """)
-    # #4: atribución opcional de la improductiva a una partida (columna W del gerente)
-    try:
-        await database.execute(
-            "ALTER TABLE ev_hh_improductivas ADD COLUMN IF NOT EXISTS partida_id INT"
-        )
-    except Exception as e:
-        print(f"[startup] ev_hh_improductivas.partida_id: {e}")
-
-    # ── Valor Ganado #2: cantidad VALORIZADA por partida/semana (idempotente) ──
-    # Lo que el cliente reconoce/paga, distinto de lo ejecutado. Variación = ejec - valoriz.
-    await database.execute("""
-        CREATE TABLE IF NOT EXISTS ev_valorizado (
-            id                  SERIAL PRIMARY KEY,
-            partida_id          INT  NOT NULL,
-            semana              INT  NOT NULL,
-            cantidad_valorizada NUMERIC NOT NULL,
-            registrado_en       TIMESTAMPTZ NOT NULL DEFAULT now(),
-            UNIQUE (partida_id, semana)
-        )
-    """)
-
-    # ── Rentabilidad (Fase 3): tarifa de Mano de Obra por cargo (S/./HH) ──
-    # El cargo '(Default)' actúa como tarifa de respaldo para cargos sin tarifa propia.
-    await database.execute("""
-        CREATE TABLE IF NOT EXISTS ev_tarifas_cargo (
-            cargo     TEXT PRIMARY KEY,
-            costo_hh  NUMERIC NOT NULL DEFAULT 0
-        )
-    """)
-
 
 async def resolver_jornada(fecha: date, otm_id: Optional[str] = None) -> float:
     """HH de jornada vigentes para una fecha (y opcionalmente una OTM):
@@ -346,9 +252,6 @@ async def resolver_jornada(fecha: date, otm_id: Optional[str] = None) -> float:
         return float(r["hh"])
     return 10.0 if dow == 2 else 9.5
 
-@app.on_event("shutdown")
-async def shutdown():
-    await database.disconnect()
 
 
 # ── JORNADA: reglas de HH por día (configurables, con vigencia) ──
