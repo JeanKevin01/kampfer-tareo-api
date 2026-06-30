@@ -1,0 +1,102 @@
+diff --git a/migrations/versions/0002_limpieza_hh.py b/migrations/versions/0002_limpieza_hh.py
+new file mode 100644
+index 0000000..646d505
+--- /dev/null
++++ b/migrations/versions/0002_limpieza_hh.py
+@@ -0,0 +1,96 @@
++"""limpieza: eliminar la sincronización muerta/rota de HH gastadas
++
++Contexto (decisión de negocio): la fuente OFICIAL de HH gastadas es el tareo
++(`tareo_partida`), que el motor de Valor Ganado ya lee directamente vía
++`_hh_gastadas_unificada`. Por eso este subsistema quedó muerto Y roto:
++
++  · ev_semana_de(date)          -> BUG: lee ev_config.fecha_base/id (columnas que
++                                   no existen; ev_config hoy es clave/valor). Solo lo
++                                   usaban la función y la vista de abajo. 0 usos en la app.
++  · fn_sync_hh_gastadas()       -> escribía filas (fuente='tareo_partida') en
++    + trigger trg_sync_hh_gastadas  ev_hh_gastadas que el motor IGNORA (no hay doble
++                                   conteo) y además fallaba por el bug de arriba.
++  · v_hh_sesion_partida_semana  -> vista sin ningún lector (0 refs en código/frontend).
++
++Se ELIMINAN. ev_hh_gastadas (overrides manuales + histórico) y tareo_partida se mantienen.
++
++Revision ID: 0002_limpieza_hh
++Revises: 0001_baseline
++Create Date: 2026-06-29
++"""
++from alembic import op
++
++revision = "0002_limpieza_hh"
++down_revision = "0001_baseline"
++branch_labels = None
++depends_on = None
++
++_UP = """
++DROP TRIGGER IF EXISTS trg_sync_hh_gastadas ON sesion_trabajador_partidas;
++DROP FUNCTION IF EXISTS fn_sync_hh_gastadas();
++DROP VIEW IF EXISTS v_hh_sesion_partida_semana;
++DROP FUNCTION IF EXISTS ev_semana_de(date);
++"""
++
++# downgrade = recrear EXACTAMENTE los objetos originales (incluido el bug), para ser
++# un reverso fiel del baseline.
++_DOWN = r"""
++CREATE OR REPLACE FUNCTION public.ev_semana_de(p_fecha date)
++ RETURNS integer LANGUAGE plpgsql STABLE
++AS $function$
++DECLARE
++    v_base DATE;
++BEGIN
++    SELECT fecha_base INTO v_base FROM ev_config ORDER BY id LIMIT 1;
++    IF v_base IS NULL THEN
++        SELECT MIN(fecha) INTO v_base FROM registros;
++    END IF;
++    IF v_base IS NULL THEN RETURN 1; END IF;
++    RETURN GREATEST(1, (p_fecha - v_base) / 7 + 1);
++END;
++$function$;
++
++CREATE OR REPLACE FUNCTION public.fn_sync_hh_gastadas()
++ RETURNS trigger LANGUAGE plpgsql
++AS $function$
++DECLARE
++    v_semana  INTEGER;
++    v_hh_acum NUMERIC;
++BEGIN
++    IF NEW.partida_id IS NULL THEN RETURN NEW; END IF;
++    v_semana := ev_semana_de(NEW.fecha);
++    IF NOT EXISTS (
++        SELECT 1 FROM ev_hh_gastadas
++        WHERE partida_id = NEW.partida_id AND semana = v_semana AND fuente = 'manual'
++    ) THEN
++        SELECT COALESCE(SUM(hh), 0) INTO v_hh_acum
++        FROM sesion_trabajador_partidas
++        WHERE partida_id = NEW.partida_id AND ev_semana_de(fecha) = v_semana;
++        INSERT INTO ev_hh_gastadas (partida_id, semana, hh, fuente)
++        VALUES (NEW.partida_id, v_semana, v_hh_acum, 'tareo_partida')
++        ON CONFLICT (partida_id, semana)
++        DO UPDATE SET hh = EXCLUDED.hh, fuente = 'tareo_partida';
++    END IF;
++    RETURN NEW;
++END;
++$function$;
++
++CREATE TRIGGER trg_sync_hh_gastadas
++    AFTER INSERT OR UPDATE ON sesion_trabajador_partidas
++    FOR EACH ROW EXECUTE FUNCTION fn_sync_hh_gastadas();
++
++CREATE VIEW public.v_hh_sesion_partida_semana AS
++ SELECT partida_id, otm_id, ev_semana_de(fecha) AS semana,
++        sum(hh) AS hh_total, count(DISTINCT fecha) AS dias
++   FROM sesion_trabajador_partidas
++  WHERE (partida_id IS NOT NULL)
++  GROUP BY partida_id, otm_id, (ev_semana_de(fecha));
++"""
++
++
++def upgrade() -> None:
++    op.get_bind().exec_driver_sql(_UP)
++
++
++def downgrade() -> None:
++    op.get_bind().exec_driver_sql(_DOWN)
