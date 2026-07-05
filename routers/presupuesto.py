@@ -179,15 +179,18 @@ async def congelar(pid: int):
             "UPDATE presupuestos SET estado = 'CONGELADO', vigente = true, congelado_en = now() WHERE id = :id",
             {"id": pid},
         )
-        # 3) sincronizar a ev_partidas (match por código)
+        # 3) sincronizar a ev_partidas (match por código, SOLO en OTMs del proyecto —
+        #    con unicidad por OTM (0008) el mismo código puede existir en otros proyectos)
         await database.execute(
             """UPDATE ev_partidas ev SET
                   metrado_presup  = pp.metrado,
                   hh_presup       = pp.hh_meta,
                   precio_unitario = pp.precio_unitario
                FROM presupuesto_partidas pp
-               WHERE pp.presupuesto_id = :id AND pp.codigo = ev.codigo""",
-            {"id": pid},
+               WHERE pp.presupuesto_id = :id AND pp.codigo = ev.codigo
+                 AND (ev.otm_id IN (SELECT id FROM otms WHERE proyecto_id = :pyid)
+                      OR ev.otm_id IS NULL)""",
+            {"id": pid, "pyid": proyecto_id},
         )
         total = await database.fetch_val(
             "SELECT count(*) FROM presupuesto_partidas WHERE presupuesto_id = :id", {"id": pid}
@@ -195,8 +198,11 @@ async def congelar(pid: int):
         sincronizadas = await database.fetch_val(
             """SELECT count(*) FROM presupuesto_partidas pp
                WHERE pp.presupuesto_id = :id
-                 AND EXISTS (SELECT 1 FROM ev_partidas ev WHERE ev.codigo = pp.codigo)""",
-            {"id": pid},
+                 AND EXISTS (SELECT 1 FROM ev_partidas ev
+                             WHERE ev.codigo = pp.codigo
+                               AND (ev.otm_id IN (SELECT id FROM otms WHERE proyecto_id = :pyid)
+                                    OR ev.otm_id IS NULL))""",
+            {"id": pid, "pyid": proyecto_id},
         )
     return {
         "ok": True, "estado": "CONGELADO", "vigente": True,

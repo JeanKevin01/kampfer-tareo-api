@@ -323,7 +323,9 @@ async def crear_partida(body: PartidaIn):
                     body.metrado_proyec, body.hh_presup, body.hh_actualizado,
                 )
             except asyncpg.UniqueViolationError:
-                raise HTTPException(409, f"Ya existe una partida con código {body.codigo}")
+                raise HTTPException(
+                    409, f"Ya existe una partida con código {body.codigo} "
+                         f"en la OTM {body.otm_id or '(sin OTM)'}")
             for h in body.hitos:
                 await con.execute(
                     """INSERT INTO ev_hitos (partida_id, numero, descripcion, peso, es_principal)
@@ -436,8 +438,10 @@ async def importar(body: ImportarIn):
                     except Exception as e:
                         errores.append(f"Fila {i} ({p.codigo}): {e}"); continue
 
+                # 0008: el código es único POR OTM — resolver siempre con la pareja (codigo, otm)
                 existente = await con.fetchval(
-                    "SELECT id FROM ev_partidas WHERE codigo=$1", p.codigo
+                    "SELECT id FROM ev_partidas WHERE codigo=$1 AND otm_id IS NOT DISTINCT FROM $2",
+                    p.codigo, p.otm_id,
                 )
                 if existente:
                     await con.execute(
@@ -478,11 +482,21 @@ async def importar(body: ImportarIn):
             hitos_db = await con.fetch("SELECT id, partida_id, numero FROM ev_hitos")
             hito_id = {(h["partida_id"], h["numero"]): h["id"] for h in hitos_db}
 
+            async def _pid_por_codigo(codigo: str):
+                """Resuelve un código NO incluido en este import. Con unicidad por OTM (0008)
+                el código a secas puede ser ambiguo → error explícito en vez de adivinar."""
+                filas = await con.fetch("SELECT id FROM ev_partidas WHERE codigo=$1", codigo)
+                if len(filas) > 1:
+                    return "AMBIGUO"
+                return filas[0]["id"] if filas else None
+
             av_ins, hist_err = 0, []
             for a in body.avances:
-                pid = codigo_a_id.get(a.codigo) or await con.fetchval(
-                    "SELECT id FROM ev_partidas WHERE codigo=$1", a.codigo
-                )
+                pid = codigo_a_id.get(a.codigo) or await _pid_por_codigo(a.codigo)
+                if pid == "AMBIGUO":
+                    hist_err.append(f"Avance: código {a.codigo} existe en varias OTMs — "
+                                    "incluye la partida en el import para desambiguar")
+                    continue
                 if not pid:
                     hist_err.append(f"Avance: código {a.codigo} no existe")
                     continue
@@ -500,9 +514,11 @@ async def importar(body: ImportarIn):
 
             hh_ins = 0
             for r in body.hh:
-                pid = codigo_a_id.get(r.codigo) or await con.fetchval(
-                    "SELECT id FROM ev_partidas WHERE codigo=$1", r.codigo
-                )
+                pid = codigo_a_id.get(r.codigo) or await _pid_por_codigo(r.codigo)
+                if pid == "AMBIGUO":
+                    hist_err.append(f"HH: código {r.codigo} existe en varias OTMs — "
+                                    "incluye la partida en el import para desambiguar")
+                    continue
                 if not pid:
                     hist_err.append(f"HH: código {r.codigo} no existe")
                     continue
