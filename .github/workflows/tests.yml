@@ -34,3 +34,15 @@ jobs:
         run: alembic upgrade head
       - name: Ejecutar pruebas
         run: pytest -v
+      # Validación E2E tareo→ISP (los 11 checks del arnés): levanta la API real
+      # contra la BD migrada y recorre el circuito completo, incluida la
+      # idempotencia del reenvío y las HH ganadas/gastadas exactas.
+      - name: Validación E2E tareo→ISP
+        run: |
+          python -m uvicorn main:app --port 8765 --log-level warning &
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8765/health && break || sleep 1
+          done
+          API_URL=http://localhost:8765 python scripts/validacion_e2e.py
+        env:
+          ENV: dev
