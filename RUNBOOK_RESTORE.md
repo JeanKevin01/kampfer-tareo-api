@@ -12,21 +12,17 @@
 - ⚠️ El token R2 quedó expuesto en una captura durante el setup → **rotarlo** (R2 → API Tokens →
   Roll) y actualizar las claves del Storage en Coolify una vez validado el flujo.
 
-## 1. Verificaciones pendientes del primer backup ☐
+## 1. Verificaciones del primer backup — COMPLETADAS 2026-07-05 ✅
 
-1. ☐ El campo "Bases de datos para realizar copias de seguridad" coincide con la BD real del
-   `DATABASE_URL` del API (lo que va tras la última `/`). Si hay duda: marcar "todas las bases
-   de datos".
-2. ☐ "Copia de seguridad ahora" → Ejecuciones muestra corrida exitosa.
-3. ☐ El `.dmp` de hoy aparece en el bucket `kampfer-backups` de R2.
-4. ☐ Prueba de restauración local (sección 3) con verificación de que `tareo_partida` contiene
-   los datos reales → registrar en la tabla de la sección 4.
-5. ☐ Token R2 rotado tras validar todo.
-6. ☐ Secretos del API rotados (expuestos en capturas 2026-07-05): **ADMIN_PASSWORD ≠ admin123 es
-   OBLIGATORIO antes del primer redeploy con ENV=prod** (fail-closed aborta el arranque);
-   JWT_SECRET y API_KEY nuevos. La clave REAL del usuario admin vive en la BD (la env var solo
-   siembra la primera vez) → cambiarla también desde el panel. La contraseña de Postgres queda
-   sin rotar por ahora: el contenedor no expone puerto público (solo red interna del VPS).
+1. ✅ BD verificada: `DATABASE_URL` del API apunta a la misma BD (`postgres`) que respalda Coolify.
+2. ✅ "Copia de seguridad ahora" ejecutada con éxito.
+3. ✅ `pg-dump-postgres-1783236464.dmp` (110 KB) en el bucket `kampfer-backups` (02:27 PET).
+4. ✅ Prueba de restauración local OK (ver tabla §4): 58 tareo_partida / 551 HH / 100 trabajadores.
+5. ☐ **PENDIENTE: rotar el token R2** (quedó expuesto en captura durante el setup) — R2 → API
+   Tokens → Roll → actualizar claves en el Storage de Coolify → Validate Connection.
+6. ✅ Secretos del API rotados y redeploy hecho (2026-07-05). Recordatorio: la clave REAL del
+   usuario admin vive en la BD (cambiarla desde el panel → Usuarios). Contraseña de Postgres sin
+   rotar (aceptado: el contenedor no expone puerto público).
 
 ## 2. Alternativa (solo si el backup nativo fallara) — Contenedor propio
 
@@ -61,4 +57,4 @@ docker rm -f pg-restore-test
 
 | Fecha | Dump probado | Resultado |
 |---|---|---|
-| _pendiente_ | | |
+| 2026-07-05 | `pg-dump-postgres-1783236464.dmp` (110,566 B, backup nativo Coolify → R2) | ✅ OK — restaurado en postgres:16 limpio: alembic 0006_ro · tareo_partida 58 filas/551 HH · registros 52 · trabajadores 100 · ev_partidas 70 · usuarios 2 |
