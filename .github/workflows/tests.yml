@@ -1,21 +1,36 @@
 name: Tests
 
-# Corre las pruebas automáticamente en cada push y en cada Pull Request.
-# Si algo rompe la lógica de Valor Ganado, GitHub lo marca en rojo.
+# F0.1: pruebas contra Postgres REAL + migraciones en BD limpia antes de pytest.
+# Si una migración no aplica desde cero, el workflow falla (antes el CI era ciego a esto).
 on:
   push:
-    branches: [ main ]
+    branches: [main, 'fase*/**']
   pull_request:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: kampfer_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:test@localhost:5432/kampfer_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: pip
       - name: Instalar dependencias
-        run: pip install -r requirements.txt pytest
+        run: pip install -r requirements.txt pytest httpx
+      - name: Migraciones en BD limpia (la prueba que antes faltaba)
+        run: alembic upgrade head
       - name: Ejecutar pruebas
         run: pytest -v
