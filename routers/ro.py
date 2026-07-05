@@ -125,12 +125,12 @@ def _armar_ro(mo_por_fase: dict, costos, venta_real: dict, ajustes, fases_desc: 
     }
 
 
-# SQL: HH del tareo por fase y cargo (LPAD para tolerar formatos de id de trabajador).
+# SQL: HH del tareo por fase y cargo (join directo: 0009 garantiza ids con pad + FK).
 _HH_FASE_CARGO_SQL = """
     SELECT ev.fase AS fase, COALESCE(t.cargo, '(Sin cargo)') AS cargo, SUM(tp.hh) AS hh
     FROM tareo_partida tp
     JOIN ev_partidas ev ON ev.id = tp.partida_id
-    LEFT JOIN trabajadores t ON LPAD(t.id::text, 3, '0') = LPAD(tp.trabajador_id::text, 3, '0')
+    LEFT JOIN trabajadores t ON t.id = tp.trabajador_id
     WHERE tp.hh IS NOT NULL AND ev.fase IS NOT NULL
       AND ev.otm_id IN (SELECT id FROM otms WHERE proyecto_id = :pid)
     GROUP BY ev.fase, t.cargo

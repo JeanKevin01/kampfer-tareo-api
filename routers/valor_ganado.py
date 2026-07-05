@@ -686,7 +686,7 @@ async def _hh_real_split(con) -> dict:
                            THEN tp.hh ELSE 0 END) AS dir
            FROM tareo_partida tp
            LEFT JOIN trabajadores t
-                  ON LPAD(t.id::text,3,'0') = LPAD(tp.trabajador_id::text,3,'0')
+                  ON t.id = tp.trabajador_id
            WHERE tp.hh IS NOT NULL
            GROUP BY tp.partida_id, tp.fecha"""
     )
@@ -1588,7 +1588,7 @@ _HH_POR_CARGO_SQL = """
     SELECT {sel} COALESCE(t.cargo, '(Sin cargo)') AS cargo, SUM(tp.hh) AS hh
     FROM tareo_partida tp
     LEFT JOIN trabajadores t
-           ON LPAD(t.id::text, 3, '0') = LPAD(tp.trabajador_id::text, 3, '0')
+           ON t.id = tp.trabajador_id
     WHERE tp.hh IS NOT NULL
     GROUP BY {grpby} COALESCE(t.cargo, '(Sin cargo)')
 """
