@@ -38,7 +38,22 @@ def upgrade():
             f"ABORTADO: hay {len(dups)} (otm,codigo) duplicados en ev_partidas; "
             f"resolver antes de migrar: {dups[:5]}"
         )
-    op.execute("DROP INDEX ev_partidas_codigo_key")
+    # En PROD ev_partidas_codigo_key es una CONSTRAINT (BD creada por el DDL pre-Alembic);
+    # en BDs creadas desde el baseline es un ÍNDICE (el export del baseline lo convirtió).
+    # Deriva detectada el 2026-07-05 al aplicar en prod — manejar ambos casos:
+    op.execute("""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_constraint
+                       WHERE conname = 'ev_partidas_codigo_key'
+                         AND conrelid = 'ev_partidas'::regclass) THEN
+                ALTER TABLE ev_partidas DROP CONSTRAINT ev_partidas_codigo_key;
+            ELSIF EXISTS (SELECT 1 FROM pg_indexes
+                          WHERE indexname = 'ev_partidas_codigo_key') THEN
+                DROP INDEX ev_partidas_codigo_key;
+            END IF;
+        END $$;
+    """)
     op.execute(
         "CREATE UNIQUE INDEX uq_partida_otm_codigo "
         "ON ev_partidas (COALESCE(otm_id,'(SIN)'), codigo)"
@@ -47,4 +62,5 @@ def upgrade():
 
 def downgrade():
     op.execute("DROP INDEX uq_partida_otm_codigo")
-    op.execute("CREATE UNIQUE INDEX ev_partidas_codigo_key ON ev_partidas USING btree (codigo)")
+    # Se restaura como CONSTRAINT (la forma original de prod; funcionalmente equivalente)
+    op.execute("ALTER TABLE ev_partidas ADD CONSTRAINT ev_partidas_codigo_key UNIQUE (codigo)")
