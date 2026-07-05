@@ -3,7 +3,7 @@ uvicorn==0.29.0
 asyncpg==0.29.0
 databases==0.9.0
 python-multipart==0.0.9
-# Migraciones (EPIC 0.2): Alembic usa un driver SÍNCRONO (psycopg2); la app sigue async con asyncpg.
+# Migraciones (EPIC 0.2): Alembic usa un driver SINCRONO (psycopg2); la app sigue async con asyncpg.
 alembic==1.13.2
 SQLAlchemy==2.0.31
 psycopg2-binary==2.9.9
