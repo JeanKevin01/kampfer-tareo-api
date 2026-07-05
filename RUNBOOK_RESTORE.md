@@ -22,6 +22,11 @@
 4. ☐ Prueba de restauración local (sección 3) con verificación de que `tareo_partida` contiene
    los datos reales → registrar en la tabla de la sección 4.
 5. ☐ Token R2 rotado tras validar todo.
+6. ☐ Secretos del API rotados (expuestos en capturas 2026-07-05): **ADMIN_PASSWORD ≠ admin123 es
+   OBLIGATORIO antes del primer redeploy con ENV=prod** (fail-closed aborta el arranque);
+   JWT_SECRET y API_KEY nuevos. La clave REAL del usuario admin vive en la BD (la env var solo
+   siembra la primera vez) → cambiarla también desde el panel. La contraseña de Postgres queda
+   sin rotar por ahora: el contenedor no expone puerto público (solo red interna del VPS).
 
 ## 2. Alternativa (solo si el backup nativo fallara) — Contenedor propio
 
