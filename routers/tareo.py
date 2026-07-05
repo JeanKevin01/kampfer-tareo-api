@@ -6,8 +6,9 @@
 # ============================================================
 from datetime import date
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from core.auth import exigir_identidad_supervisor, require_role
 from core.db import db as core_db
 from core.log import get_logger
 from core.tiempo import fecha_lima, parse_fecha
@@ -21,13 +22,14 @@ router = APIRouter(tags=["tareo"])
 
 # ── SESIONES (Session-First model) ───────────────────────────
 @router.post("/api/sesion")
-async def crear_sesion(data: dict):
+async def crear_sesion(data: dict, user: dict = Depends(require_role())):
     supervisor_id = str(data.get("supervisor_id", "")).strip()
     otm_id        = str(data.get("otm_id", "")).strip()
     fecha_str     = str(data.get("fecha", fecha_lima().isoformat()))
     hh_turno      = float(data.get("hh_turno", 9.5))
     if not supervisor_id or not otm_id:
         raise HTTPException(400, "supervisor_id y otm_id son requeridos")
+    exigir_identidad_supervisor(user, supervisor_id)   # F0.6: anti-suplantación
     pool = await core_db()
     sid = await pool.fetchval(
         "INSERT INTO sesiones (supervisor_id, otm_id, fecha, hh_turno) "
@@ -118,7 +120,9 @@ async def get_cuadrilla(supervisor_id: str):
 
 
 @router.post("/api/cuadrilla/{supervisor_id}/{trab_id}")
-async def agregar_cuadrilla(supervisor_id: str, trab_id: str):
+async def agregar_cuadrilla(supervisor_id: str, trab_id: str,
+                            user: dict = Depends(require_role())):
+    exigir_identidad_supervisor(user, supervisor_id)
     pool = await core_db()
     await pool.execute(
         "INSERT INTO cuadrillas (supervisor_id, trab_id) "
@@ -129,7 +133,9 @@ async def agregar_cuadrilla(supervisor_id: str, trab_id: str):
 
 
 @router.delete("/api/cuadrilla/{supervisor_id}/{trab_id}")
-async def quitar_cuadrilla(supervisor_id: str, trab_id: str):
+async def quitar_cuadrilla(supervisor_id: str, trab_id: str,
+                           user: dict = Depends(require_role())):
+    exigir_identidad_supervisor(user, supervisor_id)
     pool = await core_db()
     await pool.execute(
         "DELETE FROM cuadrillas WHERE supervisor_id = $1 AND trab_id = $2",
@@ -169,8 +175,10 @@ async def listar_cuadrilla_grupos(supervisor_id: str):
 
 
 @router.post("/api/cuadrillas/{supervisor_id}")
-async def crear_cuadrilla_grupo(supervisor_id: str, data: dict):
+async def crear_cuadrilla_grupo(supervisor_id: str, data: dict,
+                                user: dict = Depends(require_role())):
     """Crea un nuevo grupo de cuadrilla con su lista de miembros."""
+    exigir_identidad_supervisor(user, supervisor_id)
     nombre   = data.get("nombre", "").strip()
     trab_ids = data.get("trab_ids", [])
     if not nombre:
@@ -191,11 +199,22 @@ async def crear_cuadrilla_grupo(supervisor_id: str, data: dict):
     return {"ok": True, "id": grupo_id, "nombre": nombre}
 
 
+async def _exigir_dueno_grupo(pool, grupo_id: int, user: dict) -> None:
+    """F0.6: las escrituras sobre un grupo solo las hace su supervisor dueño
+    (o un rol de oficina/admin/servicio)."""
+    if user and user.get("rol") == "supervisor":
+        dueno = await pool.fetchval(
+            "SELECT supervisor_id FROM cuadrilla_grupos WHERE id = $1", grupo_id)
+        exigir_identidad_supervisor(user, dueno)
+
+
 @router.put("/api/cuadrilla-grupo/{grupo_id}/miembros")
-async def reemplazar_miembros_grupo(grupo_id: int, data: dict):
+async def reemplazar_miembros_grupo(grupo_id: int, data: dict,
+                                    user: dict = Depends(require_role())):
     """Reemplaza la lista completa de miembros del grupo."""
     trab_ids = data.get("trab_ids", [])
     pool = await core_db()
+    await _exigir_dueno_grupo(pool, grupo_id, user)
     async with pool.acquire() as con:
         async with con.transaction():
             await con.execute(
@@ -210,8 +229,10 @@ async def reemplazar_miembros_grupo(grupo_id: int, data: dict):
 
 
 @router.post("/api/cuadrilla-grupo/{grupo_id}/miembro/{trab_id}")
-async def agregar_miembro_grupo(grupo_id: int, trab_id: str):
+async def agregar_miembro_grupo(grupo_id: int, trab_id: str,
+                                user: dict = Depends(require_role())):
     pool = await core_db()
+    await _exigir_dueno_grupo(pool, grupo_id, user)
     await pool.execute(
         "INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id) "
         "VALUES ($1, $2) ON CONFLICT DO NOTHING",
@@ -221,8 +242,10 @@ async def agregar_miembro_grupo(grupo_id: int, trab_id: str):
 
 
 @router.delete("/api/cuadrilla-grupo/{grupo_id}/miembro/{trab_id}")
-async def quitar_miembro_grupo(grupo_id: int, trab_id: str):
+async def quitar_miembro_grupo(grupo_id: int, trab_id: str,
+                               user: dict = Depends(require_role())):
     pool = await core_db()
+    await _exigir_dueno_grupo(pool, grupo_id, user)
     await pool.execute(
         "DELETE FROM cuadrilla_grupo_miembros WHERE grupo_id = $1 AND trab_id = $2",
         grupo_id, trab_id.zfill(3),
@@ -231,8 +254,10 @@ async def quitar_miembro_grupo(grupo_id: int, trab_id: str):
 
 
 @router.delete("/api/cuadrilla-grupo/{grupo_id}")
-async def eliminar_cuadrilla_grupo(grupo_id: int):
+async def eliminar_cuadrilla_grupo(grupo_id: int,
+                                   user: dict = Depends(require_role())):
     pool = await core_db()
+    await _exigir_dueno_grupo(pool, grupo_id, user)
     await pool.execute(
         "UPDATE cuadrilla_grupos SET activo = false WHERE id = $1", grupo_id)
     return {"ok": True}
@@ -284,7 +309,7 @@ async def _semana_para(pool, fecha_obj: date) -> int:
 
 
 @router.post("/api/sesion/enviar-con-partidas")
-async def enviar_con_partidas(data: dict):
+async def enviar_con_partidas(data: dict, user: dict = Depends(require_role())):
     """
     Flujo nuevo: cada trabajador tiene 1+ asignaciones a partidas con HH.
     Soporta ambos formatos:
@@ -298,6 +323,7 @@ async def enviar_con_partidas(data: dict):
 
     if not supervisor_id or not otm_id:
         raise HTTPException(400, "supervisor_id y otm_id son requeridos")
+    exigir_identidad_supervisor(user, supervisor_id)   # F0.6: anti-suplantación
     if not trabajadores:
         raise HTTPException(400, "Lista de trabajadores vacía")
 
@@ -385,7 +411,7 @@ async def enviar_con_partidas(data: dict):
 
 
 @router.post("/api/tareo-partida/cambio")
-async def cambio_partida_dia(data: dict):
+async def cambio_partida_dia(data: dict, user: dict = Depends(require_role())):
     """
     Registra un cambio de partida a mitad del día.
     La hora queda como el timestamp del request.
@@ -399,6 +425,7 @@ async def cambio_partida_dia(data: dict):
 
     if not trabajador_ids or not partida_id:
         raise HTTPException(400, "trabajador_ids y partida_id son requeridos")
+    exigir_identidad_supervisor(user, supervisor_id)   # F0.6: anti-suplantación
 
     fecha_obj = parse_fecha(fecha_str)
     if not fecha_obj:

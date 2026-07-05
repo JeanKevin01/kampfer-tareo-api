@@ -28,7 +28,7 @@ from routers.presupuesto import router as presupuesto_router
 from routers.ro import router as ro_router
 from routers.tareo import router as tareo_router
 from routers.usuarios import router as usuarios_router
-from routers.valor_ganado import router as ev_router
+from routers.valor_ganado import router as ev_router, router_campo as ev_router_campo
 
 setup_logging()
 log = get_logger("api")
@@ -105,7 +105,10 @@ async def health():
 
 
 # ── Routers ──────────────────────────────────────────────────
-app.include_router(ev_router)
+# F0.6: /ev es de OFICINA, salvo los endpoints del flujo de campo (router_campo),
+# que solo exigen estar autenticado (el supervisor los usa desde la app).
+app.include_router(ev_router, dependencies=[Depends(require_role("oficina"))])
+app.include_router(ev_router_campo, dependencies=[Depends(require_role())])
 # Fase 1: módulo de presupuesto (todos los endpoints son de oficina).
 app.include_router(presupuesto_router, dependencies=[Depends(require_role("oficina"))])
 # Fase 2: Resultado Operativo (oficina).

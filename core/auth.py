@@ -106,6 +106,14 @@ async def current_user(authorization: str = Header(default="")) -> Optional[dict
     return None
 
 
+def exigir_identidad_supervisor(user: Optional[dict], supervisor_id) -> None:
+    """Anti-suplantación (F0.6): un usuario con rol 'supervisor' solo puede operar
+    con SU supervisor_id (claim sup_id del token). Otros roles no se restringen."""
+    if user and user.get("rol") == "supervisor":
+        if str(supervisor_id or "") != str(user.get("sup_id") or ""):
+            raise HTTPException(403, "No puedes operar con la identidad de otro supervisor")
+
+
 def require_role(*roles: str):
     """Dependencia que EXIGE estar autenticado y (opcionalmente) un rol. 'admin' siempre pasa.
     · X-API-Key válida → principal de servicio (n8n): acceso pleno (no rompe integraciones).

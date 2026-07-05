@@ -31,6 +31,9 @@ from core.log import get_logger
 log = get_logger("ev")
 
 router = APIRouter(prefix="/ev", tags=["valor-ganado"])
+# F0.6: endpoints /ev que usa el FLUJO DE CAMPO (app del supervisor). Se montan en
+# main.py con require_role() a secas (autenticado), mientras `router` exige 'oficina'.
+router_campo = APIRouter(prefix="/ev", tags=["valor-ganado-campo"])
 
 # F0.4: zona horaria y semana_de desde core/tiempo (implementación única)
 from core.tiempo import LIMA, semana_de as _semana_de  # noqa: F401,E402
@@ -1047,7 +1050,7 @@ async def _datos_base(semana: int, otm: Optional[str] = None):
     return partidas, hitos, avances, [], tareo, split
 
 
-@router.get("/semanas-auto")
+@router_campo.get("/semanas-auto")
 async def semanas_auto():
     """Semanas reales del proyecto (Lun-Dom) desde el primer registro de tareo.
     Incluye semanas sin actividad para mostrar la línea de tiempo completa."""
@@ -1104,7 +1107,7 @@ async def semanas_auto():
         return result
 
 
-@router.get("/arbol")
+@router_campo.get("/arbol")
 async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
     """Árbol WBS completo (padre + hoja) con valores EV calculados.
     Nodos padre tienen hh_ganadas/gastadas = 0 — el rollup lo hace el frontend."""
@@ -1828,7 +1831,7 @@ async def semana_grid(
         raise HTTPException(500, "Error interno calculando grilla diaria")
 
 
-@router.post("/avance-diario")
+@router_campo.post("/avance-diario")
 async def guardar_avance_diario(data: dict):
     """Guarda o actualiza la cantidad ejecutada de una partida en un día."""
     partida_id   = data.get("partida_id")
@@ -2044,7 +2047,7 @@ async def rendimiento_cuadrillas(
 
 # ── Cuadrillas típicas por OTM ────────────────────────────────
 
-@router.get("/cuadrillas-plantilla")
+@router_campo.get("/cuadrillas-plantilla")
 async def listar_cuadrillas_plantilla(
     supervisor_id: str,
     otm_id: str,
@@ -2077,7 +2080,7 @@ async def listar_cuadrillas_plantilla(
         return plantillas
 
 
-@router.post("/cuadrillas-plantilla")
+@router_campo.post("/cuadrillas-plantilla")
 async def guardar_cuadrilla_plantilla(data: dict):
     """Crea o reemplaza una cuadrilla típica para supervisor+OTM."""
     supervisor_id = data.get("supervisor_id")
