@@ -1,62 +1,51 @@
 # RUNBOOK — Backup y restauración de la BD KAMPFER (F0.2)
 
-## 0. Qué hay HOY en R2 (verificado 2026-07-05)
+## 0. Estado actual (2026-07-05)
 
-En el bucket `kampfer` existe `data/coolify/backups/coolify/coolify-db-hostdockerinternal/` con
-dumps diarios `pg-dump-coolify-*.dmp` (desde mayo 2026). **Eso es el backup de la BD interna de
-COOLIFY** (configuración del servidor), NO de la BD de KAMPFER. El MIME "tcpdump.pcap" que muestra
-Cloudflare es una etiqueta errónea inofensiva.
+- **Configurado por Jean en Coolify (v4.1.2):** recurso `postgres` del proyecto → Copias de
+  seguridad programadas, diario `0 2 * * *` (zona UTC = 21:00 hora Perú), S3 habilitado →
+  storage **"Kampfer"** → bucket R2 **`kampfer-backups`** (endpoint de la cuenta, validado).
+- Retención local (disco del VPS): 1 copia / 2 días. Retención S3: **14 copias** (acordado;
+  0 = ilimitado en Coolify — no dejar en 0 por costo, ni en 2 por seguridad).
+- Los dumps `pg-dump-coolify-*` de mayo 2026 en el bucket viejo `kampfer` eran del **VPS gratuito
+  anterior** (BD interna de aquel Coolify). Sin valor actual; borrables.
+- ⚠️ El token R2 quedó expuesto en una captura durante el setup → **rotarlo** (R2 → API Tokens →
+  Roll) y actualizar las claves del Storage en Coolify una vez validado el flujo.
 
-**Conclusión:** la conexión Coolify→R2 ya funciona (no hay que crear tokens ni buckets), pero
-**la BD de KAMPFER aún no se respalda** → activar la Opción A.
+## 1. Verificaciones pendientes del primer backup ☐
 
-## 1. Opción A (RECOMENDADA) — Backup nativo de Coolify para la BD de KAMPFER
+1. ☐ El campo "Bases de datos para realizar copias de seguridad" coincide con la BD real del
+   `DATABASE_URL` del API (lo que va tras la última `/`). Si hay duda: marcar "todas las bases
+   de datos".
+2. ☐ "Copia de seguridad ahora" → Ejecuciones muestra corrida exitosa.
+3. ☐ El `.dmp` de hoy aparece en el bucket `kampfer-backups` de R2.
+4. ☐ Prueba de restauración local (sección 3) con verificación de que `tareo_partida` contiene
+   los datos reales → registrar en la tabla de la sección 4.
+5. ☐ Token R2 rotado tras validar todo.
 
-En el dashboard de Coolify (10 minutos, una sola vez):
+## 2. Alternativa (solo si el backup nativo fallara) — Contenedor propio
 
-1. Abrir el **recurso de la base de datos** de KAMPFER (el PostgreSQL del proyecto, el mismo cuyo
-   `DATABASE_URL` usa el API).
-2. Entrar a la pestaña **Backups** → **Add / Scheduled Backup**.
-3. Configurar: **Frequency** = `0 2 * * *` (02:00 todos los días) · **Save to S3** = ON →
-   seleccionar el storage S3/R2 ya existente (el mismo que usa el backup de Coolify) ·
-   retención/número de backups a conservar = 14 (si el campo existe).
-4. Botón **Backup Now** para no esperar a las 02:00.
-5. Verificar en Cloudflare R2: debe aparecer una carpeta NUEVA bajo `data/coolify/backups/…`
-   (con el nombre del recurso Postgres de KAMPFER) con un `pg-dump-…dmp` de HOY.
-6. De paso: revisar si el backup de la BD interna de Coolify sigue corriendo (último archivo
-   ¿de mayo o de hoy?). Si se detuvo: Coolify → Settings → Backup → re-habilitar.
-
-> Si el Postgres de KAMPFER NO aparece como recurso propio en Coolify (p. ej. corre embebido en el
-> compose del API), usar la Opción B.
-
-## 2. Opción B (alternativa) — Contenedor de backup propio
-
-Servicio en Coolify desde este repo con `scripts/Dockerfile.backup` (cron 02:00 América/Lima ejecuta
-`scripts/backup_diario.sh`: `pg_dump -Fc` + subida a R2 + retención 14 días). Variables requeridas:
-`DATABASE_URL`, `R2_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `R2_BUCKET` (usar
-`kampfer` o crear `kampfer-backups`). Las credenciales se crean en R2 → *Manage API Tokens* →
-token **Object Read & Write** limitado al bucket.
+Servicio en Coolify desde este repo con `scripts/Dockerfile.backup` (cron 02:00 América/Lima:
+`scripts/backup_diario.sh` = `pg_dump -Fc` + subida a R2 + retención 14 días). Variables:
+`DATABASE_URL`, `R2_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `R2_BUCKET=kampfer-backups`.
 
 ## 3. Restauración (RTO objetivo: < 1 hora)
 
-1. **Descargar el dump** más reciente de KAMPFER: dashboard R2 → bucket → carpeta del backup →
-   click en el archivo → **Descargar**. (Con backup nativo de Coolify también se puede restaurar
-   desde la misma pestaña Backups con un click — preferir esa vía si el servidor está vivo.)
-2. Anotar el conteo de control de la BD destino (si está viva):
+1. **Descargar el dump** más reciente: dashboard R2 → `kampfer-backups` → archivo → Descargar.
+   (Con el servidor vivo, Coolify también permite restaurar desde la pestaña Backups directamente.)
+2. Anotar conteo de control de la BD destino (si está viva):
    `psql "$DATABASE_URL" -c "SELECT count(*) FROM tareo_partida;"`
 3. Restaurar: `pg_restore -d "$DATABASE_URL" --clean --if-exists --no-owner <archivo>.dmp`
-4. Verificar:
-   - `SELECT count(*) FROM tareo_partida;` ≈ valor esperado
-   - `SELECT version_num FROM alembic_version;` = última migración aplicada
-5. Reiniciar el contenedor del API en Coolify y smoke test: login en el panel + `GET /health` +
-   abrir Valor Ganado.
+4. Verificar: conteo de `tareo_partida` ≈ esperado · `SELECT version_num FROM alembic_version;`
+   = última migración.
+5. Reiniciar el contenedor del API en Coolify y smoke test: login panel + `GET /health` + Valor Ganado.
 
-Si la restauración falla a medias: repetir el paso 3 (es `--clean --if-exists`), o restaurar a una
-BD nueva y apuntar el `DATABASE_URL` del API a ella.
+Si falla a medias: repetir paso 3 (es `--clean --if-exists`) o restaurar a una BD nueva y apuntar
+el `DATABASE_URL` del API a ella.
 
 ## 4. Prueba del runbook (obligatoria — un backup no probado no existe)
 
-Con un dump descargado y Docker local (esta prueba la ejecuta Claude en la máquina de Jean):
+Con un dump descargado y Docker local (la ejecuta Claude en la máquina de Jean):
 
 ```bash
 docker run -d --name pg-restore-test -e POSTGRES_PASSWORD=test -p 55433:5432 postgres:16
