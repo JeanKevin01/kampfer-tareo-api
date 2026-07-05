@@ -1,0 +1,15 @@
+# Contenedor de backup diario (F0.2). En Coolify: crear un servicio "Dockerfile" apuntando a
+# scripts/Dockerfile.backup de este repo, con las variables DATABASE_URL, R2_ENDPOINT,
+# AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY (y opcional R2_BUCKET). Corre pg_dump a las 02:00
+# America/Lima todos los días.
+FROM postgres:16-alpine
+
+RUN apk add --no-cache aws-cli tzdata
+ENV TZ=America/Lima
+
+COPY scripts/backup_diario.sh /usr/local/bin/backup_diario.sh
+RUN chmod +x /usr/local/bin/backup_diario.sh \
+    && echo '0 2 * * * /usr/local/bin/backup_diario.sh >> /proc/1/fd/1 2>&1' > /etc/crontabs/root
+
+# crond en primer plano (los logs del backup salen por el log del contenedor)
+CMD ["crond", "-f", "-l", "2"]
