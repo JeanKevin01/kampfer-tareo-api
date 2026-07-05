@@ -637,66 +637,6 @@ async def sesiones_hoy(supervisor_id: str):
     return result
 
 
-@app.post("/api/sesion/{sesion_id}/enviar")
-async def enviar_sesion(sesion_id: int, data: dict):
-    sesion = await database.fetch_one(
-        "SELECT * FROM sesiones WHERE id = :id AND estado = 'borrador'",
-        {"id": sesion_id}
-    )
-    if not sesion:
-        raise HTTPException(404, "Sesión no encontrada o ya enviada")
-    sesion      = dict(sesion)
-    fecha_obj   = sesion["fecha"]
-    fecha_str   = fecha_obj.isoformat() if hasattr(fecha_obj, "isoformat") else str(fecha_obj)
-    hora        = hora_lima_t()
-    trabajadores = data.get("trabajadores", [])
-
-    # Limpiar y volver a insertar trabajadores
-    await database.execute(
-        "DELETE FROM sesion_trabajadores WHERE sesion_id = :sid",
-        {"sid": sesion_id}
-    )
-    for t in trabajadores:
-        hh_ov = t.get("hh_override")
-        await database.execute(
-            "INSERT INTO sesion_trabajadores "
-            "(sesion_id, trab_id, presente, hh_override, agregado_via) "
-            "VALUES (:sid, :tid, :pres, :hh, :via) "
-            "ON CONFLICT (sesion_id, trab_id) DO UPDATE "
-            "SET presente = :pres, hh_override = :hh",
-            {"sid": sesion_id, "tid": t["trab_id"],
-             "pres": t.get("presente", True),
-             "hh": hh_ov, "via": t.get("agregado_via", "busqueda")}
-        )
-
-    # Crear registros de tareo para los presentes
-    enviados = 0
-    for t in trabajadores:
-        if not t.get("presente", True):
-            continue
-        hh = t.get("hh_override") or float(sesion["hh_turno"])
-        try:
-            await database.execute(
-                "INSERT INTO registros "
-                "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-                "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
-                "ON CONFLICT (trab_id, otm_id, fecha) "
-                "DO UPDATE SET hh = :hh, hora = :hra",
-                {"tid": t["trab_id"], "otm": sesion["otm_id"],
-                 "sup": sesion["supervisor_id"], "hh": hh,
-                 "fch": parse_fecha(fecha_str), "hra": hora}
-            )
-            enviados += 1
-        except Exception as e:
-            log.warning(f"[SESION] Error registro trab={t['trab_id']}: {e}")
-
-    await database.execute(
-        "UPDATE sesiones SET estado = 'enviada', enviada_at = now() WHERE id = :id",
-        {"id": sesion_id}
-    )
-    return {"ok": True, "enviados": enviados}
-
-
 # ── HEALTH ───────────────────────────────────────────────────
 @app.get("/health")
 async def health():
@@ -807,164 +747,6 @@ async def buscar(q: str):
     return [dict(r) for r in rows]
 
 # ── REGISTRO BATCH ────────────────────────────────────────────
-@app.post("/api/registro")
-async def registrar(data: dict):
-    supervisor_id     = data.get("supervisor_id", "").strip()
-    otm_id            = data.get("otm_id", "").strip()
-    fecha_raw         = data.get("fecha", fecha_lima().isoformat())
-    fecha_str         = fecha_raw if isinstance(fecha_raw, str) else fecha_raw.isoformat()
-    trabajadores_list = data.get("trabajadores", [])
-
-    if not supervisor_id or not otm_id or not trabajadores_list:
-        raise HTTPException(400, "Faltan campos: supervisor_id, otm_id, trabajadores[]")
-
-    # Verificar supervisor
-    sup = await database.fetch_one(
-        "SELECT id FROM supervisores WHERE id = :id",
-        {"id": supervisor_id}
-    )
-    if not sup:
-        raise HTTPException(400, f"Supervisor '{supervisor_id}' no encontrado")
-
-    # Verificar OTM
-    otm = await database.fetch_one(
-        "SELECT id FROM otms WHERE id = :id",
-        {"id": otm_id}
-    )
-    if not otm:
-        raise HTTPException(400, f"OTM '{otm_id}' no encontrada")
-
-    resultados = []
-
-    for t in trabajadores_list:
-        trab_id  = str(t.get("trab_id", "")).zfill(3)
-        hora_raw = t.get("hora", hora_lima())
-        hora     = hora_raw[:8] if len(hora_raw) >= 8 else hora_raw + ":00"
-        try:
-            hora_t = datetime.strptime(hora, "%H:%M:%S").time()
-        except ValueError:
-            hora_t = hora_lima_t()
-        fch = parse_fecha(fecha_str)
-        nombre   = t.get("nombre", "")
-        cargo    = t.get("cargo",  "")
-
-        # Verificar trabajador
-        trab = await database.fetch_one(
-            "SELECT id, nombre, cargo FROM trabajadores WHERE id = :id AND activo = true",
-            {"id": trab_id}
-        )
-        if not trab:
-            resultados.append({
-                "trab_id": trab_id, "nombre": nombre, "cargo": cargo,
-                "status": "error", "mensaje": f"ID {trab_id} no encontrado o inactivo"
-            })
-            continue
-
-        trab_dict = dict(trab)
-
-        # Verificar duplicado (parámetros tipados: fecha como objeto date)
-        existente = await database.fetch_one(
-            "SELECT id FROM registros "
-            "WHERE trab_id = :trab_id AND otm_id = :otm_id AND fecha = :fch",
-            {"trab_id": trab_id, "otm_id": otm_id, "fch": fch}
-        )
-
-        if existente:
-            resultados.append({
-                "trab_id": trab_id,
-                "nombre":  trab_dict["nombre"],
-                "cargo":   trab_dict["cargo"],
-                "status":  "duplicate",
-                "mensaje": f"Ya registrado en {otm_id} hoy"
-            })
-            continue
-
-        # Insertar — parámetros tipados (fecha date, hora time): sin interpolación ni inyección
-        try:
-            await database.execute(
-                "INSERT INTO registros (trab_id, otm_id, supervisor_id, fecha, hora) "
-                "VALUES (:trab_id, :otm_id, :supervisor_id, :fch, :hra)",
-                {
-                    "trab_id":       trab_id,
-                    "otm_id":        otm_id,
-                    "supervisor_id": supervisor_id,
-                    "fch":           fch,
-                    "hra":           hora_t,
-                }
-            )
-            resultados.append({
-                "trab_id": trab_id,
-                "nombre":  trab_dict["nombre"],
-                "cargo":   trab_dict["cargo"],
-                "status":  "ok"
-            })
-        except Exception as e:
-            log.warning(f"[ERROR] INSERT trab={trab_id} otm={otm_id}: {str(e)}")
-            resultados.append({
-                "trab_id": trab_id, "nombre": nombre, "cargo": cargo,
-                "status": "error", "mensaje": str(e)
-            })
-
-    ok  = len([r for r in resultados if r["status"] == "ok"])
-    dup = len([r for r in resultados if r["status"] == "duplicate"])
-    err = len([r for r in resultados if r["status"] == "error"])
-
-    return {
-        "status":     "ok",
-        "nuevos":     ok,
-        "duplicados": dup,
-        "errores":    err,
-        "resultados": resultados
-    }
-
-
-
-@app.post("/api/sesion/enviar-directo")
-async def enviar_directo(data: dict):
-    """Crea la sesión y crea los registros en un solo paso (sin borrador)."""
-    supervisor_id = str(data.get("supervisor_id", "")).strip()
-    otm_id        = str(data.get("otm_id", "")).strip()
-    fecha_str     = str(data.get("fecha", fecha_lima().isoformat()))
-    hh_turno      = float(data.get("hh_turno", 9.5))
-    trabajadores  = data.get("trabajadores", [])
-    if not supervisor_id or not otm_id:
-        raise HTTPException(400, "supervisor_id y otm_id son requeridos")
-    if not trabajadores:
-        raise HTTPException(400, "La lista de trabajadores está vacía")
-    hora = hora_lima_t()
-    fecha_obj = parse_fecha(fecha_str)
-    row = await database.fetch_one(
-        "INSERT INTO sesiones "
-        "(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
-        "VALUES (:sup, :otm, :fch, :hh, 'enviada', now()) RETURNING id",
-        {"sup": supervisor_id, "otm": otm_id, "hh": hh_turno, "fch": fecha_obj}
-    )
-    sesion_id = row["id"]
-    enviados = 0
-    for t in trabajadores:
-        trab_id = str(t.get("trab_id", "")).zfill(3)
-        hh_ov   = t.get("hh_override")
-        via     = t.get("agregado_via", "busqueda")
-        await database.execute(
-            "INSERT INTO sesion_trabajadores "
-            "(sesion_id, trab_id, presente, hh_override, agregado_via) "
-            "VALUES (:sid, :tid, true, :hh, :via)",
-            {"sid": sesion_id, "tid": trab_id, "hh": hh_ov, "via": via}
-        )
-        hh_real = float(hh_ov) if hh_ov is not None else hh_turno
-        await database.execute(
-            "INSERT INTO registros "
-            "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-            "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
-            "ON CONFLICT (trab_id, otm_id, fecha) DO UPDATE SET hh=:hh, hora=:hra",
-            {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_real,
-             "fch": fecha_obj, "hra": hora}
-        )
-        enviados += 1
-    return {"ok": True, "enviados": enviados, "sesion_id": sesion_id}
-
-# ── CUADRILLAS PRE-ESTABLECIDAS ───────────────────────────────
-
 @app.get("/api/cuadrilla/{supervisor_id}")
 async def get_cuadrilla(supervisor_id: str):
     rows = await database.fetch_all(
@@ -998,18 +780,24 @@ async def quitar_cuadrilla(supervisor_id: str, trab_id: str):
 
 
 # ── REGISTROS DEL DÍA ─────────────────────────────────────────
+# F0.3: estos dos endpoints CONSERVAN su path y shape (los usan 7 páginas del panel)
+# pero ahora leen de tareo_partida (fuente única) en vez de la tabla legacy `registros`.
+# Una fila por (trabajador, OTM, supervisor) con la suma de HH del día — mismo shape
+# que producía la tabla legacy.
+_REGISTROS_DIA_SQL = """
+    SELECT tp.trabajador_id AS trab_id, t.nombre, t.cargo, tp.otm_id,
+           to_char(MIN(tp.hora_registro) AT TIME ZONE 'America/Lima', 'HH24:MI:SS') AS hora,
+           tp.supervisor_id, SUM(tp.hh) AS hh
+    FROM tareo_partida tp
+    JOIN trabajadores t ON t.id = tp.trabajador_id
+    WHERE tp.fecha = :fch AND tp.hh IS NOT NULL
+    GROUP BY tp.trabajador_id, t.nombre, t.cargo, tp.otm_id, tp.supervisor_id
+    ORDER BY trab_id, hora
+"""
+
 @app.get("/api/registros/hoy")
 async def registros_hoy():
-    hoy = fecha_lima()
-    rows = await database.fetch_all(
-        """SELECT r.trab_id, t.nombre, t.cargo,
-                   r.otm_id, r.hora::text, r.supervisor_id, r.hh
-            FROM registros r
-            JOIN trabajadores t ON r.trab_id = t.id
-            WHERE r.fecha = :fch
-            ORDER BY r.trab_id, r.hora""",
-        {"fch": hoy},
-    )
+    rows = await database.fetch_all(_REGISTROS_DIA_SQL, {"fch": fecha_lima()})
     return [dict(r) for r in rows]
 
 # ── REGISTROS POR FECHA ───────────────────────────────────────
@@ -1018,163 +806,8 @@ async def registros_por_fecha(fecha: str):
     f = parse_fecha(fecha)
     if not f:
         raise HTTPException(400, "fecha inválida")
-    rows = await database.fetch_all(
-        """SELECT r.trab_id, t.nombre, t.cargo,
-                   r.otm_id, r.hora::text, r.supervisor_id, r.hh
-            FROM registros r
-            JOIN trabajadores t ON r.trab_id = t.id
-            WHERE r.fecha = :fch
-            ORDER BY r.trab_id, r.hora""",
-        {"fch": f},
-    )
+    rows = await database.fetch_all(_REGISTROS_DIA_SQL, {"fch": f})
     return [dict(r) for r in rows]
-
-# ── CALCULAR HH DEL DÍA (llamado por n8n a las 5:30pm) ───────
-@app.post("/api/calcular-hh")
-async def calcular_hh(data: dict = {}):
-    fecha_str = data.get("fecha", fecha_lima().isoformat())
-
-    # HH totales según la jornada vigente para la fecha (reglas configurables)
-    fecha_obj = date.fromisoformat(fecha_str)
-    total_hh  = await resolver_jornada(fecha_obj)
-
-    # Registros del día ordenados por trabajador y hora
-    rows = await database.fetch_all(
-        """SELECT trab_id, otm_id, hora::text as hora
-            FROM registros
-            WHERE fecha = :fch
-              AND hh IS NULL
-            ORDER BY trab_id, hora""",
-        {"fch": fecha_obj},
-    )
-
-    # Agrupar por trabajador
-    por_trabajador = {}
-    for r in rows:
-        d   = dict(r)
-        tid = d["trab_id"]
-        if tid not in por_trabajador:
-            por_trabajador[tid] = []
-        por_trabajador[tid].append(d)
-
-    INICIO_TURNO = "06:30:00"
-    actualizados = 0
-
-    for trab_id, registros in por_trabajador.items():
-        n = len(registros)
-
-        if n == 1:
-            # Una sola OTM → todas las HH del día
-            await database.execute(
-                """UPDATE registros SET hh = :hh
-                    WHERE trab_id = :tid
-                      AND fecha   = :fch
-                      AND otm_id  = :otm""",
-                {"hh": total_hh, "tid": trab_id, "fch": fecha_obj, "otm": registros[0]["otm_id"]}
-            )
-            actualizados += 1
-        else:
-            # Múltiples OTMs → calcular por tramos
-            hh_acumulado = 0.0
-            t_inicio_turno = datetime.strptime(f"{fecha_str} {INICIO_TURNO}", "%Y-%m-%d %H:%M:%S")
-
-            for i in range(len(registros)):
-                if i < len(registros) - 1:
-                    # Tramos intermedios: desde hora de registro hasta el siguiente
-                    if i == 0:
-                        t_desde = t_inicio_turno
-                    else:
-                        t_desde = datetime.strptime(
-                            f"{fecha_str} {registros[i-1]['hora']}", "%Y-%m-%d %H:%M:%S"
-                        )
-                    t_hasta = datetime.strptime(
-                        f"{fecha_str} {registros[i]['hora']}", "%Y-%m-%d %H:%M:%S"
-                    )
-                    diff_h  = (t_hasta - t_desde).total_seconds() / 3600
-                    # Redondear a 0.5H
-                    hh_tramo = max(round(diff_h * 2) / 2, 0.0)
-                    hh_acumulado += hh_tramo
-
-                    await database.execute(
-                        """UPDATE registros SET hh = :hh
-                            WHERE trab_id = :tid
-                              AND fecha   = :fch
-                              AND otm_id  = :otm""",
-                        {"hh": hh_tramo, "tid": trab_id, "fch": fecha_obj, "otm": registros[i]["otm_id"]}
-                    )
-                    actualizados += 1
-                else:
-                    # Último tramo: absorbe el restante exacto (nunca negativo)
-                    hh_restante = max(round(total_hh - hh_acumulado, 1), 0.0)
-                    await database.execute(
-                        """UPDATE registros SET hh = :hh
-                            WHERE trab_id = :tid
-                              AND fecha   = :fch
-                              AND otm_id  = :otm""",
-                        {"hh": hh_restante, "tid": trab_id, "fch": fecha_obj, "otm": registros[i]["otm_id"]}
-                    )
-                    actualizados += 1
-
-    return {
-        "status":                 "ok",
-        "fecha":                  fecha_str,
-        "total_hh_dia":           total_hh,
-        "trabajadores_procesados": len(por_trabajador),
-        "registros_actualizados":  actualizados
-    }
-
-# ── RESUMEN DÍA para Google Sheets via n8n ───────────────────
-@app.get("/api/resumen/{fecha}")
-async def resumen_dia(fecha: str):
-    f = parse_fecha(fecha)
-    if not f:
-        raise HTTPException(400, "fecha inválida")
-    rows = await database.fetch_all(
-        """SELECT r.trab_id, t.nombre, t.cargo,
-                   r.otm_id, o.centro_costo,
-                   r.hora::text, r.hh,
-                   r.supervisor_id, s.nombre as supervisor_nombre
-            FROM registros r
-            JOIN trabajadores t ON r.trab_id = t.id
-            JOIN otms o         ON r.otm_id  = o.id
-            JOIN supervisores s ON r.supervisor_id = s.id
-            WHERE r.fecha = :fch
-            ORDER BY r.otm_id, t.nombre""",
-        {"fch": f},
-    )
-    return [dict(r) for r in rows]
-
-# ── CONTEO ALMUERZOS para email 8am ──────────────────────────
-@app.get("/api/almuerzos/{fecha}")
-async def almuerzos(fecha: str):
-    f = parse_fecha(fecha)
-    if not f:
-        raise HTTPException(400, "fecha inválida")
-    rows = await database.fetch_all(
-        """SELECT DISTINCT ON (r.trab_id)
-                   r.trab_id, t.nombre, t.cargo,
-                   r.otm_id, r.supervisor_id
-            FROM registros r
-            JOIN trabajadores t ON r.trab_id = t.id
-            WHERE r.fecha = :fch
-            ORDER BY r.trab_id, r.hora""",
-        {"fch": f},
-    )
-    data = [dict(r) for r in rows]
-
-    # Agrupar por OTM para el email
-    por_otm = {}
-    for r in data:
-        otm = r["otm_id"]
-        if otm not in por_otm:
-            por_otm[otm] = []
-        por_otm[otm].append(r)
-
-    return {
-        "fecha":           fecha,
-        "total_almuerzos": len(data),
-        "por_otm":         por_otm
-    }
 
 # ── ADMIN: CREAR TRABAJADOR ───────────────────────────────────
 @app.post("/admin/trabajador")
@@ -1532,7 +1165,6 @@ async def enviar_con_partidas(data: dict):
         base = base - timedelta(days=base.weekday())   # alinear a lunes (consistente con _semana_de)
         semana = max(1, (fecha_obj - base).days // 7 + 1)
 
-    hora = hora_lima_t()
     enviados = 0
     fallidos = 0
 
@@ -1576,15 +1208,8 @@ async def enviar_con_partidas(data: dict):
                     {"sid": sesion_id, "tid": trab_id, "via": via}
                 )
 
-                await database.execute(
-                    "INSERT INTO registros "
-                    "(trab_id, otm_id, supervisor_id, fecha, hora, hh) "
-                    "VALUES (:tid, :otm, :sup, :fch, :hra, :hh) "
-                    "ON CONFLICT (trab_id, otm_id, fecha) "
-                    "DO UPDATE SET hh=:hh, hora=:hra",
-                    {"tid": trab_id, "otm": otm_id, "sup": supervisor_id, "hh": hh_total,
-                     "fch": fecha_obj, "hra": hora}
-                )
+                # F0.3: se retiró la doble escritura a `registros` (tabla congelada como
+                # histórico). tareo_partida es la única fuente de HH del tareo.
 
                 # tareo_partida — una fila por cada asignación a partida
                 for asig in asignaciones:

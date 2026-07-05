@@ -8,9 +8,8 @@
 #     histórico de avances y HH) en una sola transacción
 #   - GET/POST /ev/plantillas: catálogo de rules of credit por tipo
 #     de actividad
-#   - HH automáticas desde el tareo QR (vista ev_hh_tareo) sumadas a
-#     las HH manuales; mapeo fecha->semana vía ev_config.fecha_base
-#   - POST /ev/asignar-hh: etiquetar registros del tareo con partida
+#   - HH del tareo QR leídas DIRECTO de tareo_partida (fuente única desde F0.3);
+#     mapeo fecha->semana vía ev_config.fecha_base (auto-derivada del primer tareo)
 #   - GET /ev/curva-fase: tendencia de PF por disciplina
 #
 # Integración en main.py (sin cambios respecto a v1):
@@ -188,12 +187,6 @@ class TarifaIn(BaseModel):
     costo_hh: float = Field(ge=0)
 
 
-class AsignarHHIn(BaseModel):
-    otm_id: str
-    fecha: date
-    partida_id: int
-
-
 def _validar_pesos(hitos: list[HitoIn]):
     total = round(sum(h.peso for h in hitos), 4)
     if abs(total - 1.0) > 0.0001:
@@ -207,15 +200,27 @@ def _validar_pesos(hitos: list[HitoIn]):
 
 # ---------------------- Config (fecha base) ----------------------
 async def _fecha_base(con) -> Optional[date]:
+    """Lunes que ancla la semana 1 del proyecto.
+
+    F0.3 + decisión de Jean (2026-07-05): si no está configurada, se AUTO-DERIVA
+    del primer día con HH del tareo QR (tareo_partida) alineado a lunes, y se
+    PERSISTE para que la numeración de semanas quede estable aunque después se
+    cargue data anterior. Si está configurada, se alinea SIEMPRE a lunes (fix del
+    bug de semana inconsistente entre main.py y este módulo)."""
     v = await con.fetchval("SELECT valor FROM ev_config WHERE clave='fecha_base'")
     if v:
-        return date.fromisoformat(v)
-    # Auto: lunes de la semana del primer registro de tareo con HH
+        base = date.fromisoformat(v)
+        return base - timedelta(days=base.weekday())
     f = await con.fetchval(
-        "SELECT MIN(fecha) FROM registros WHERE hh IS NOT NULL AND hh > 0"
+        "SELECT MIN(fecha) FROM tareo_partida WHERE hh IS NOT NULL AND hh > 0"
     )
     if f:
-        return f - timedelta(days=f.weekday())
+        base = f - timedelta(days=f.weekday())
+        await con.execute(
+            "INSERT INTO ev_config (clave, valor) VALUES ('fecha_base', $1) "
+            "ON CONFLICT (clave) DO NOTHING", base.isoformat()
+        )
+        return base
     return None
 
 
@@ -543,44 +548,6 @@ async def importar(body: ImportarIn):
 
 
 # ---------------------- Tareo QR → partida ----------------------
-@router.get("/hh-sin-asignar")
-async def hh_sin_asignar(desde: Optional[date] = None):
-    """Días × OTM con HH del tareo aún sin partida asignada."""
-    pool = await db()
-    async with pool.acquire() as con:
-        rows = await con.fetch(
-            """SELECT otm_id, fecha, SUM(hh) AS hh, COUNT(*) AS registros
-               FROM registros
-               WHERE partida_id IS NULL AND hh IS NOT NULL
-                 AND ($1::date IS NULL OR fecha >= $1)
-               GROUP BY otm_id, fecha ORDER BY fecha DESC, otm_id""",
-            desde,
-        )
-    return [
-        {"otm_id": r["otm_id"], "fecha": r["fecha"].isoformat(),
-         "hh": float(r["hh"]), "registros": r["registros"]}
-        for r in rows
-    ]
-
-
-@router.post("/asignar-hh")
-async def asignar_hh(body: AsignarHHIn):
-    """Etiqueta los registros del tareo de una OTM en una fecha con la partida trabajada."""
-    pool = await db()
-    async with pool.acquire() as con:
-        ok = await con.fetchval(
-            "SELECT id FROM ev_partidas WHERE id=$1 AND activo", body.partida_id
-        )
-        if not ok:
-            raise HTTPException(404, "Partida no encontrada")
-        res = await con.execute(
-            "UPDATE registros SET partida_id=$1 WHERE otm_id=$2 AND fecha=$3",
-            body.partida_id, body.otm_id, body.fecha,
-        )
-    return {"ok": True, "registros_actualizados": int(res.split()[-1])}
-
-
-# ---------------------- Captura semanal ----------------------
 @router.get("/semanas")
 async def semanas():
     pool = await db()
@@ -594,61 +561,12 @@ async def semanas():
         )
         sem = {r["semana"] for r in rows}
         if base:
-            tareo = await con.fetch("SELECT DISTINCT fecha FROM ev_hh_tareo")
+            tareo = await con.fetch(
+                "SELECT DISTINCT fecha FROM tareo_partida WHERE hh IS NOT NULL AND hh > 0"
+            )
             for t in tareo:
                 sem.add(_semana_de(t["fecha"], base))
     return sorted(sem)
-
-
-async def _hh_tareo_por_semana(con) -> dict:
-    """{(partida_id, semana): hh} — auto-distribuido desde registros por OTM.
-    Distribuye las HH de cada OTM proporcionalmente al presupuesto de cada partida.
-    Si no hay partidas para un OTM, sus HH no se asignan (no cuentan en EV).
-    """
-    base = await _fecha_base(con)
-    out: dict = defaultdict(float)
-    if not base:
-        return out
-
-    # HH registradas por OTM por día
-    rows_reg = await con.fetch("""
-        SELECT otm_id, fecha, SUM(hh) AS hh_total
-        FROM registros
-        WHERE hh IS NOT NULL AND hh > 0
-        GROUP BY otm_id, fecha
-    """)
-
-    # Peso de cada partida activa dentro de su OTM (proporcional a hh_presup)
-    rows_peso = await con.fetch("""
-        WITH hoja AS (
-            -- Solo nodos hoja: su codigo NO aparece como parent_codigo de nadie
-            SELECT id, otm_id, hh_presup
-            FROM ev_partidas p
-            WHERE activo = true AND hh_presup > 0
-              AND NOT EXISTS (
-                  SELECT 1 FROM ev_partidas ch
-                  WHERE ch.parent_codigo = p.codigo
-                    AND ch.otm_id = p.otm_id
-                    AND ch.activo = true
-              )
-        )
-        SELECT id AS partida_id, otm_id,
-               hh_presup::float /
-               NULLIF(SUM(hh_presup) OVER (PARTITION BY otm_id), 0.0) AS peso
-        FROM hoja
-    """)
-
-    otm_pesos: dict = defaultdict(list)
-    for p in rows_peso:
-        otm_pesos[p['otm_id']].append((p['partida_id'], float(p['peso'] or 0)))
-
-    for r in rows_reg:
-        hh      = float(r['hh_total'])
-        semana  = _semana_de(r['fecha'], base)
-        for pid, peso in otm_pesos.get(r['otm_id'], []):
-            out[(pid, semana)] += round(hh * peso, 4)
-
-    return out
 
 
 async def _hh_real_por_semana(con) -> dict:
@@ -705,16 +623,13 @@ async def _hh_gastadas_unificada(con) -> dict:
       1. override manual del residente  (ev_hh_gastadas fuente 'manual'/'distribucion')
       2. tareo_partida REAL              (lo que captura la app — fuente principal)
       3. migración histórica             (ev_hh_gastadas fuente 'historico'/'importado')
-      4. estimación proporcional         (desde registros, fallback legacy)
+    (F0.3: el nivel 4 proporcional desde `registros` fue retirado — flujo legacy congelado)
 
     Las filas 'diario'/'tareo' de ev_hh_gastadas (que producía el botón
     "Volcar al ISP") se IGNORAN: ahora se lee tareo_partida directamente, así que
     el volcado manual ya no es necesario y no hay doble conteo.
     """
     out: dict = {}
-    # 4) proporcional (más bajo)
-    for k, v in (await _hh_tareo_por_semana(con)).items():
-        out[k] = v
     # separar overrides y migración de ev_hh_gastadas
     rows = await con.fetch("SELECT partida_id, semana, hh, fuente FROM ev_hh_gastadas")
     migr, override = {}, {}
@@ -755,7 +670,9 @@ async def captura(semana: int, otm: Optional[str] = None):
         hh_man = await con.fetch(
             "SELECT partida_id, semana, hh FROM ev_hh_gastadas WHERE semana = $1", semana
         )
-        tareo = await _hh_tareo_por_semana(con)
+        # F0.3 (fix inconsistencia #10): hh_tareo ahora son las HH EXACTAS del tareo QR
+        # (antes mostraba la distribución proporcional y difería del reporte)
+        tareo = await _hh_real_por_semana(con)
 
     ult_av, av_actual = {}, {}
     for a in avances:
@@ -1154,7 +1071,7 @@ async def semanas_auto():
 
         hh_rows = await con.fetch("""
             SELECT DATE_TRUNC('week', fecha)::date AS lunes, SUM(hh) AS hh_total
-            FROM registros WHERE hh IS NOT NULL AND hh > 0
+            FROM tareo_partida WHERE hh IS NOT NULL AND hh > 0
             GROUP BY DATE_TRUNC('week', fecha)::date
             ORDER BY lunes
         """)
@@ -1318,45 +1235,6 @@ async def monitor_anomalias(otm: Optional[str] = None, semana: int = 1,
     except Exception:
         log.exception("error en monitor de anomalías")
         raise HTTPException(500, "Error interno en monitor de anomalías")
-
-
-@router.post("/distribuir-hh")
-async def distribuir_hh(body: dict):
-    """Distribuye las HH de un OTM/fecha entre múltiples partidas.
-    Reemplaza la distribución automática proporcional para ese OTM/fecha/semana.
-    
-    Body: {otm_id, fecha, distribuciones: [{partida_id, hh}]}
-    """
-    otm_id       = str(body.get("otm_id", "")).strip()
-    fecha_str    = str(body.get("fecha", _hoy_lima().isoformat()))
-    distribs     = body.get("distribuciones", [])
-    if not otm_id or not distribs:
-        raise HTTPException(400, "otm_id y distribuciones son requeridos")
-
-    pool = await db()
-    async with pool.acquire() as con:
-        base = await _fecha_base(con)
-        if not base:
-            raise HTTPException(400, "No hay semanas configuradas")
-        from datetime import date
-        fecha = date.fromisoformat(fecha_str)
-        semana = _semana_de(fecha, base)
-
-        asignados = 0
-        for d in distribs:
-            pid = int(d.get("partida_id", 0))
-            hh  = float(d.get("hh", 0))
-            if pid <= 0 or hh <= 0:
-                continue
-            await con.execute(
-                """INSERT INTO ev_hh_gastadas (partida_id, semana, hh, fuente)
-                   VALUES ($1, $2, $3, 'distribucion')
-                   ON CONFLICT (partida_id, semana) DO UPDATE SET hh=$3, fuente='distribucion'""",
-                pid, semana, hh
-            )
-            asignados += 1
-
-    return {"ok": True, "semana": semana, "asignados": asignados}
 
 
 @router.get("/isp")
