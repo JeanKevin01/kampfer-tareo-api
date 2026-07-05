@@ -14,6 +14,7 @@ import secrets
 from contextlib import asynccontextmanager
 from fastapi.responses import JSONResponse
 from core.log import setup_logging, get_logger
+from core.db import db as core_db, close_pool
 from routers.valor_ganado import router as ev_router
 from routers.presupuesto import router as presupuesto_router
 from routers.ro import router as ro_router
@@ -152,37 +153,8 @@ def require_role(*roles: str):
         return user
     return dep
 
-# Zona horaria de Peru (UTC-5)
-LIMA = timezone(timedelta(hours=-5))
-def ahora_lima(): return datetime.now(LIMA)
-def fecha_lima(): return ahora_lima().date()
-def hora_lima(): return ahora_lima().strftime("%H:%M:%S")
-def hora_lima_t(): return ahora_lima().time().replace(microsecond=0)  # objeto time para columnas SQL time
-
-def parse_fecha(v):
-    """Convierte v a un objeto date (o None). Acepta date/datetime, 'YYYY-MM-DD'
-    y 'DD/MM/YYYY'. Necesario porque asyncpg exige date, no str, en columnas date."""
-    if v is None or v == "":
-        return None
-    if isinstance(v, datetime):
-        return v.date()
-    if isinstance(v, date):
-        return v
-    s = str(v).strip()
-    if not s:
-        return None
-    try:
-        return date.fromisoformat(s[:10])
-    except ValueError:
-        pass
-    m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$", s)
-    if m:
-        d, mo, y = m.groups()
-        try:
-            return date(int(y), int(mo), int(d))
-        except ValueError:
-            return None
-    return None
+# F0.4: los helpers de tiempo/fecha viven en core/tiempo.py (implementación única).
+from core.tiempo import LIMA, ahora_lima, fecha_lima, hora_lima, hora_lima_t, parse_fecha  # noqa: F401
 
 # EPIC 0.4.1: aborta el arranque en prod si los secretos están por defecto o la API quedaría abierta.
 validar_secretos_arranque()
@@ -193,6 +165,7 @@ async def lifespan(app: FastAPI):
     # EPIC 0.2.4: el esquema lo gobiernan las migraciones (Alembic). Aquí NO hay DDL,
     # solo conexión y semillas idempotentes (datos) para una BD recién creada.
     await database.connect()
+    await core_db()   # F0.4: calienta el pool asyncpg compartido (falla rápido si no hay BD)
     # Semilla de jornada base (si no hay reglas semanales): Miércoles 10 HH, resto 9.5.
     row = await database.fetch_one(
         "SELECT COUNT(*) AS n FROM ev_jornada_reglas WHERE tipo = 'semanal'"
@@ -213,6 +186,7 @@ async def lifespan(app: FastAPI):
             {"p": _hash_pw(ADMIN_PASSWORD)},
         )
     yield
+    await close_pool()   # F0.4: antes el pool de valor_ganado nunca se cerraba
     await database.disconnect()
 
 

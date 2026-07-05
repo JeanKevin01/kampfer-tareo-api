@@ -32,8 +32,8 @@ log = get_logger("ev")
 
 router = APIRouter(prefix="/ev", tags=["valor-ganado"])
 
-# Zona horaria de Perú (UTC-5) — sin dependencias externas (no usar pytz)
-LIMA = timezone(timedelta(hours=-5))
+# F0.4: zona horaria y semana_de desde core/tiempo (implementación única)
+from core.tiempo import LIMA, semana_de as _semana_de  # noqa: F401,E402
 def _hoy_lima() -> date:
     return datetime.now(LIMA).date()
 
@@ -68,16 +68,8 @@ def _norm_naturaleza(v) -> str:
     t = str(v or "CONTRACTUAL").strip().upper()
     return "ADICIONAL" if t in ("ADICIONAL", "ADICIONALES", "ADIC") else "CONTRACTUAL"
 
-_pool: Optional[asyncpg.Pool] = None
-
-
-async def db() -> asyncpg.Pool:
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(
-            os.environ["DATABASE_URL"], min_size=1, max_size=5
-        )
-    return _pool
+# F0.4: el pool privado de este módulo fue reemplazado por el pool ÚNICO del API.
+from core.db import db  # noqa: E402
 
 
 # ---------------------- Modelos ----------------------
@@ -222,10 +214,6 @@ async def _fecha_base(con) -> Optional[date]:
         )
         return base
     return None
-
-
-def _semana_de(fecha: date, base: date) -> int:
-    return (fecha - base).days // 7 + 1
 
 
 @router.get("/config")
