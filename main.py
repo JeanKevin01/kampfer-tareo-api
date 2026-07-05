@@ -1,10 +1,8 @@
 from fastapi import FastAPI, HTTPException, Header, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from database import database
-from datetime import date, datetime, timezone, timedelta
+from datetime import date, timedelta
 from typing import Optional
 import os
-import re
 import hmac
 import hashlib
 import base64
@@ -15,7 +13,7 @@ from contextlib import asynccontextmanager
 from fastapi.responses import JSONResponse
 from core.log import setup_logging, get_logger
 from core.db import db as core_db, close_pool
-from routers.valor_ganado import router as ev_router
+from routers.valor_ganado import router as ev_router, _fecha_base
 from routers.presupuesto import router as presupuesto_router
 from routers.ro import router as ro_router
 
@@ -164,30 +162,26 @@ validar_secretos_arranque()
 async def lifespan(app: FastAPI):
     # EPIC 0.2.4: el esquema lo gobiernan las migraciones (Alembic). Aquí NO hay DDL,
     # solo conexión y semillas idempotentes (datos) para una BD recién creada.
-    await database.connect()
-    await core_db()   # F0.4: calienta el pool asyncpg compartido (falla rápido si no hay BD)
+    pool = await core_db()   # F0.4: pool asyncpg ÚNICO (falla rápido si no hay BD)
     # Semilla de jornada base (si no hay reglas semanales): Miércoles 10 HH, resto 9.5.
-    row = await database.fetch_one(
-        "SELECT COUNT(*) AS n FROM ev_jornada_reglas WHERE tipo = 'semanal'"
-    )
-    if not row or (row["n"] or 0) == 0:
+    n = await pool.fetchval("SELECT COUNT(*) FROM ev_jornada_reglas WHERE tipo = 'semanal'")
+    if not n:
         for dow in range(7):
-            await database.execute(
+            await pool.execute(
                 "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota) "
-                "VALUES ('semanal', '2000-01-01', :d, :h, 'base inicial')",
-                {"d": dow, "h": 10.0 if dow == 2 else 9.5},
+                "VALUES ('semanal', '2000-01-01', $1, $2, 'base inicial')",
+                dow, 10.0 if dow == 2 else 9.5,
             )
     # Semilla de usuario admin (si la tabla está vacía).
-    urow = await database.fetch_one("SELECT COUNT(*) AS n FROM usuarios")
-    if not urow or (urow["n"] or 0) == 0:
-        await database.execute(
+    nu = await pool.fetchval("SELECT COUNT(*) FROM usuarios")
+    if not nu:
+        await pool.execute(
             "INSERT INTO usuarios (username, password_hash, rol, nombre) "
-            "VALUES ('admin', :p, 'admin', 'Administrador')",
-            {"p": _hash_pw(ADMIN_PASSWORD)},
+            "VALUES ('admin', $1, 'admin', 'Administrador')",
+            _hash_pw(ADMIN_PASSWORD),
         )
     yield
     await close_pool()   # F0.4: antes el pool de valor_ganado nunca se cerraba
-    await database.disconnect()
 
 
 app = FastAPI(title="Kampfer Tareo API", version=APP_VERSION, lifespan=lifespan, dependencies=[Depends(require_key)])
@@ -234,30 +228,31 @@ async def resolver_jornada(fecha: date, otm_id: Optional[str] = None) -> float:
     2) regla semanal del día-de-semana con la mayor 'desde' <= fecha,
     3) fallback (Miércoles 10, resto 9.5)."""
     dow = fecha.weekday()
+    pool = await core_db()
     # 1) Puntual: OTM específica → global
     if otm_id:
-        r = await database.fetch_one(
-            "SELECT hh FROM ev_jornada_reglas WHERE tipo='puntual' AND desde=:f AND otm_id=:o "
-            "ORDER BY id DESC LIMIT 1", {"f": fecha, "o": otm_id})
-        if r:
-            return float(r["hh"])
-    r = await database.fetch_one(
-        "SELECT hh FROM ev_jornada_reglas WHERE tipo='puntual' AND desde=:f AND otm_id IS NULL "
-        "ORDER BY id DESC LIMIT 1", {"f": fecha})
-    if r:
-        return float(r["hh"])
+        v = await pool.fetchval(
+            "SELECT hh FROM ev_jornada_reglas WHERE tipo='puntual' AND desde=$1 AND otm_id=$2 "
+            "ORDER BY id DESC LIMIT 1", fecha, otm_id)
+        if v is not None:
+            return float(v)
+    v = await pool.fetchval(
+        "SELECT hh FROM ev_jornada_reglas WHERE tipo='puntual' AND desde=$1 AND otm_id IS NULL "
+        "ORDER BY id DESC LIMIT 1", fecha)
+    if v is not None:
+        return float(v)
     # 2) Semanal: OTM específica → global
     if otm_id:
-        r = await database.fetch_one(
-            "SELECT hh FROM ev_jornada_reglas WHERE tipo='semanal' AND dia_semana=:d AND desde<=:f "
-            "AND otm_id=:o ORDER BY desde DESC, id DESC LIMIT 1", {"d": dow, "f": fecha, "o": otm_id})
-        if r:
-            return float(r["hh"])
-    r = await database.fetch_one(
-        "SELECT hh FROM ev_jornada_reglas WHERE tipo='semanal' AND dia_semana=:d AND desde<=:f "
-        "AND otm_id IS NULL ORDER BY desde DESC, id DESC LIMIT 1", {"d": dow, "f": fecha})
-    if r:
-        return float(r["hh"])
+        v = await pool.fetchval(
+            "SELECT hh FROM ev_jornada_reglas WHERE tipo='semanal' AND dia_semana=$1 AND desde<=$2 "
+            "AND otm_id=$3 ORDER BY desde DESC, id DESC LIMIT 1", dow, fecha, otm_id)
+        if v is not None:
+            return float(v)
+    v = await pool.fetchval(
+        "SELECT hh FROM ev_jornada_reglas WHERE tipo='semanal' AND dia_semana=$1 AND desde<=$2 "
+        "AND otm_id IS NULL ORDER BY desde DESC, id DESC LIMIT 1", dow, fecha)
+    if v is not None:
+        return float(v)
     return 10.0 if dow == 2 else 9.5
 
 
@@ -270,7 +265,8 @@ DIAS_SEM = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Do
 async def jornada_listar(otm: Optional[str] = None):
     """Reglas + HH resueltas para los 7 días de hoy. 'otm' (opcional) calcula
     los vigentes para esa OTM (regla de la OTM gana sobre la global)."""
-    reglas = await database.fetch_all(
+    pool = await core_db()
+    reglas = await pool.fetch(
         "SELECT id, tipo, desde::text AS desde, dia_semana, hh, nota, otm_id, "
         "       creado_en::text AS creado_en "
         "FROM ev_jornada_reglas ORDER BY tipo, otm_id NULLS FIRST, desde DESC, dia_semana"
@@ -317,10 +313,11 @@ async def jornada_guardar(data: dict, _u: dict = Depends(require_role("oficina")
         hh = float(data.get("hh", 0))
         if hh <= 0:
             raise HTTPException(400, "hh debe ser > 0")
-        await database.execute(
+        pool = await core_db()
+        await pool.execute(
             "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota, otm_id) "
-            "VALUES ('puntual', :f, NULL, :h, :n, :o)",
-            {"f": f, "h": hh, "n": data.get("nota"), "o": otm_id},
+            "VALUES ('puntual', $1, NULL, $2, $3, $4)",
+            f, hh, data.get("nota"), otm_id,
         )
         return {"ok": True}
 
@@ -331,6 +328,7 @@ async def jornada_guardar(data: dict, _u: dict = Depends(require_role("oficina")
         raise HTTPException(400, "dias requerido (ej. {\"0\":9.5,\"2\":10})")
     nota = data.get("nota")
     n = 0
+    pool = await core_db()
     for dow, hh in dias.items():
         try:
             dow_i = int(dow); hh_f = float(hh)
@@ -338,10 +336,10 @@ async def jornada_guardar(data: dict, _u: dict = Depends(require_role("oficina")
             continue
         if dow_i < 0 or dow_i > 6 or hh_f <= 0:
             continue
-        await database.execute(
+        await pool.execute(
             "INSERT INTO ev_jornada_reglas (tipo, desde, dia_semana, hh, nota, otm_id) "
-            "VALUES ('semanal', :d, :dw, :h, :n, :o)",
-            {"d": desde, "dw": dow_i, "h": hh_f, "n": nota, "o": otm_id},
+            "VALUES ('semanal', $1, $2, $3, $4, $5)",
+            desde, dow_i, hh_f, nota, otm_id,
         )
         n += 1
     return {"ok": True, "reglas_creadas": n}
@@ -349,7 +347,8 @@ async def jornada_guardar(data: dict, _u: dict = Depends(require_role("oficina")
 
 @app.delete("/api/jornada/{regla_id}")
 async def jornada_eliminar(regla_id: int, _u: dict = Depends(require_role("oficina"))):
-    await database.execute("DELETE FROM ev_jornada_reglas WHERE id = :id", {"id": regla_id})
+    pool = await core_db()
+    await pool.execute("DELETE FROM ev_jornada_reglas WHERE id = $1", regla_id)
     return {"ok": True}
 
 
@@ -361,15 +360,16 @@ async def monitor_hh_diario(fecha: Optional[str] = None):
     detectar errores en el tareo (sub-registro o horas extra)."""
     f = parse_fecha(fecha) or fecha_lima()
     jornada = await resolver_jornada(f)
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         "SELECT tp.trabajador_id, t.nombre, tp.otm_id, "
         "       SUM(tp.hh) AS hh, COUNT(*) AS n "
         "FROM tareo_partida tp "
         "LEFT JOIN trabajadores t ON t.id = tp.trabajador_id "
-        "WHERE tp.fecha = :f "
+        "WHERE tp.fecha = $1 "
         "GROUP BY tp.trabajador_id, t.nombre, tp.otm_id "
         "ORDER BY t.nombre, tp.otm_id",
-        {"f": f},
+        f,
     )
     por_trab: dict = {}
     for r in rows:
@@ -410,7 +410,8 @@ async def monitor_duplicados_hh(fecha: Optional[str] = None):
     """Trabajadores con HH registradas en más de una sesión el mismo día
     (posible doble envío entre supervisores)."""
     f = parse_fecha(fecha) or fecha_lima()
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         "SELECT tp.trabajador_id, t.nombre, "
         "       COUNT(DISTINCT tp.sesion_id)    AS n_sesiones, "
         "       COUNT(DISTINCT tp.supervisor_id) AS n_supervisores, "
@@ -418,11 +419,11 @@ async def monitor_duplicados_hh(fecha: Optional[str] = None):
         "       SUM(tp.hh)                       AS total_hh "
         "FROM tareo_partida tp "
         "LEFT JOIN trabajadores t ON t.id = tp.trabajador_id "
-        "WHERE tp.fecha = :f "
+        "WHERE tp.fecha = $1 "
         "GROUP BY tp.trabajador_id, t.nombre "
         "HAVING COUNT(DISTINCT tp.sesion_id) > 1 "
         "ORDER BY SUM(tp.hh) DESC",
-        {"f": f},
+        f,
     )
     filas = [{
         "trab_id": r["trabajador_id"], "nombre": r["nombre"] or r["trabajador_id"],
@@ -442,7 +443,8 @@ def _norm_nombre(s: Optional[str]) -> str:
 async def trabajadores_duplicados():
     """Agrupa trabajadores con el mismo nombre normalizado pero distinto id,
     con su actividad (para decidir cuál conservar)."""
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         "SELECT t.id, t.nombre, t.cargo, t.activo, "
         "  (SELECT COUNT(*) FROM tareo_partida tp WHERE tp.trabajador_id = t.id) AS n_tareo, "
         "  (SELECT COUNT(*) FROM registros r WHERE r.trab_id = t.id)             AS n_reg "
@@ -469,26 +471,31 @@ async def trabajadores_merge(data: dict, _u: dict = Depends(require_role("oficin
     if not origen or not destino or origen == destino:
         raise HTTPException(400, "from_id y to_id deben ser válidos y distintos")
 
-    cols = await database.fetch_all(
+    pool = await core_db()
+    cols = await pool.fetch(
         "SELECT table_name, column_name FROM information_schema.columns "
         "WHERE table_schema='public' AND table_name <> 'trabajadores' "
         "AND column_name IN ('trab_id','trabajador_id','miembro_id')"
     )
-    async with database.transaction():
-        for c in cols:
-            tn, cn = c["table_name"], c["column_name"]
-            try:
-                await database.execute(
-                    f'UPDATE "{tn}" SET "{cn}" = :d WHERE "{cn}" = :o',
-                    {"d": destino, "o": origen},
-                )
-            except Exception as e:
-                raise HTTPException(
-                    409, f"Colisión al reasignar {tn}.{cn} ({e}). "
-                         f"El trabajador {origen} ya tiene datos que chocan con {destino} "
-                         f"en esa tabla. Revisa/elimina ese registro y reintenta.")
-        await database.execute(
-            "UPDATE trabajadores SET activo = false WHERE id = :o", {"o": origen})
+    async with pool.acquire() as con:
+        async with con.transaction():
+            for c in cols:
+                tn, cn = c["table_name"], c["column_name"]
+                try:
+                    # Savepoint por tabla: una colisión no aborta la transacción entera
+                    # hasta decidir el mensaje (el raise de abajo revierte todo igual).
+                    async with con.transaction():
+                        await con.execute(
+                            f'UPDATE "{tn}" SET "{cn}" = $1 WHERE "{cn}" = $2',
+                            destino, origen,
+                        )
+                except Exception as e:
+                    raise HTTPException(
+                        409, f"Colisión al reasignar {tn}.{cn} ({e}). "
+                             f"El trabajador {origen} ya tiene datos que chocan con {destino} "
+                             f"en esa tabla. Revisa/elimina ese registro y reintenta.")
+            await con.execute(
+                "UPDATE trabajadores SET activo = false WHERE id = $1", origen)
     return {"ok": True, "fusionado": origen, "en": destino, "tablas": len(cols)}
 
 
@@ -499,10 +506,11 @@ async def auth_login(data: dict):
     password = str(data.get("password", ""))
     if not username or not password:
         raise HTTPException(400, "Usuario y contraseña requeridos")
-    row = await database.fetch_one(
+    pool = await core_db()
+    row = await pool.fetchrow(
         "SELECT username, password_hash, rol, nombre FROM usuarios "
-        "WHERE lower(username) = lower(:u) AND activo = true",
-        {"u": username},
+        "WHERE lower(username) = lower($1) AND activo = true",
+        username,
     )
     if not row or not _check_pw(password, row["password_hash"]):
         raise HTTPException(401, "Usuario o contraseña inválidos")
@@ -519,7 +527,8 @@ async def auth_me(user: Optional[dict] = Depends(current_user)):
 
 @app.get("/api/admin/usuarios")
 async def usuarios_listar(_u: dict = Depends(require_role("admin"))):
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         "SELECT id, username, rol, nombre, activo, creado_en::text AS creado_en "
         "FROM usuarios ORDER BY username"
     )
@@ -535,11 +544,12 @@ async def usuarios_crear(data: dict, _u: dict = Depends(require_role("admin"))):
         raise HTTPException(400, "username y password requeridos")
     if rol not in ("admin", "oficina", "supervisor"):
         rol = "oficina"
+    pool = await core_db()
     try:
-        await database.execute(
+        await pool.execute(
             "INSERT INTO usuarios (username, password_hash, rol, nombre) "
-            "VALUES (:u, :p, :r, :n)",
-            {"u": username, "p": _hash_pw(password), "r": rol, "n": data.get("nombre")},
+            "VALUES ($1, $2, $3, $4)",
+            username, _hash_pw(password), rol, data.get("nombre"),
         )
     except Exception:
         raise HTTPException(409, "El usuario ya existe")
@@ -551,16 +561,16 @@ async def usuarios_password(uid: int, data: dict, _u: dict = Depends(require_rol
     password = str(data.get("password", ""))
     if len(password) < 4:
         raise HTTPException(400, "La contraseña debe tener al menos 4 caracteres")
-    await database.execute(
-        "UPDATE usuarios SET password_hash = :p WHERE id = :id",
-        {"p": _hash_pw(password), "id": uid},
-    )
+    pool = await core_db()
+    await pool.execute(
+        "UPDATE usuarios SET password_hash = $1 WHERE id = $2", _hash_pw(password), uid)
     return {"ok": True}
 
 
 @app.put("/api/admin/usuarios/{uid}/baja")
 async def usuarios_baja(uid: int, _u: dict = Depends(require_role("admin"))):
-    await database.execute("UPDATE usuarios SET activo = false WHERE id = :id", {"id": uid})
+    pool = await core_db()
+    await pool.execute("UPDATE usuarios SET activo = false WHERE id = $1", uid)
     return {"ok": True}
 
 
@@ -574,37 +584,39 @@ async def crear_sesion(data: dict):
     hh_turno      = float(data.get("hh_turno", 9.5))
     if not supervisor_id or not otm_id:
         raise HTTPException(400, "supervisor_id y otm_id son requeridos")
-    row = await database.fetch_one(
+    pool = await core_db()
+    sid = await pool.fetchval(
         "INSERT INTO sesiones (supervisor_id, otm_id, fecha, hh_turno) "
-        "VALUES (:sup, :otm, :fch, :hh) RETURNING id",
-        {"sup": supervisor_id, "otm": otm_id, "fch": parse_fecha(fecha_str), "hh": hh_turno}
+        "VALUES ($1, $2, $3, $4) RETURNING id",
+        supervisor_id, otm_id, parse_fecha(fecha_str), hh_turno,
     )
-    return {"id": row["id"], "ok": True}
+    return {"id": sid, "ok": True}
 
 
 @app.get("/api/sesion/hoy/{supervisor_id}")
 async def sesiones_hoy(supervisor_id: str):
-    sesiones = await database.fetch_all(
+    pool = await core_db()
+    sesiones = await pool.fetch(
         "SELECT s.id, s.supervisor_id, s.otm_id, s.estado, "
         "       s.hh_turno, s.created_at, "
         "       COUNT(st.id) AS total, "
         "       COUNT(st.id) FILTER (WHERE st.presente) AS presentes "
         "FROM sesiones s "
         "LEFT JOIN sesion_trabajadores st ON st.sesion_id = s.id "
-        "WHERE s.supervisor_id = :sup AND s.fecha = :fch "
+        "WHERE s.supervisor_id = $1 AND s.fecha = $2 "
         "GROUP BY s.id ORDER BY s.created_at DESC",
-        {"sup": supervisor_id, "fch": fecha_lima()}
+        supervisor_id, fecha_lima(),
     )
     result = []
     for s in sesiones:
         d = dict(s)
-        trabs = await database.fetch_all(
+        trabs = await pool.fetch(
             "SELECT st.trab_id, st.presente, st.hh_override, st.agregado_via, "
             "       t.nombre, t.cargo "
             "FROM sesion_trabajadores st "
             "JOIN trabajadores t ON t.id = st.trab_id "
-            "WHERE st.sesion_id = :sid ORDER BY t.nombre",
-            {"sid": d["id"]}
+            "WHERE st.sesion_id = $1 ORDER BY t.nombre",
+            d["id"],
         )
         d["trabajadores"] = [dict(t) for t in trabs]
         result.append(d)
@@ -619,7 +631,8 @@ async def health():
 # ── SUPERVISORES ─────────────────────────────────────────────
 @app.get("/api/supervisores")
 async def get_supervisores():
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         "SELECT id, nombre, email FROM supervisores WHERE activo = true ORDER BY nombre"
     )
     return [dict(r) for r in rows]
@@ -628,8 +641,11 @@ async def get_supervisores():
 # ── ADMIN: SUPERVISORES (CRUD) ────────────────────────────────
 @app.get("/admin/supervisores")
 async def listar_supervisores_admin():
-    rows = await database.fetch_all(
-        "SELECT id, nombre, email, activo FROM supervisores ORDER BY CAST(id AS INTEGER)"
+    pool = await core_db()
+    # Orden numérico solo para ids numéricos (un id atípico no debe romper el listado).
+    rows = await pool.fetch(
+        "SELECT id, nombre, email, activo FROM supervisores "
+        r"ORDER BY (CASE WHEN id ~ '^\d+$' THEN CAST(id AS INTEGER) END) NULLS LAST, id"
     )
     return [dict(r) for r in rows]
 
@@ -642,45 +658,37 @@ async def crear_supervisor(data: dict, _u: dict = Depends(require_role("oficina"
     if not nombre:
         raise HTTPException(400, "Nombre es requerido")
 
-    row = await database.fetch_one(
-        "SELECT MAX(CAST(id AS INTEGER)) as max_id FROM supervisores"
-    )
-    next_id = str((row["max_id"] or 0) + 1).zfill(2)
+    pool = await core_db()
+    max_id = await pool.fetchval(
+        r"SELECT MAX(CAST(id AS INTEGER)) FROM supervisores WHERE id ~ '^\d+$'")
+    next_id = str((max_id or 0) + 1).zfill(2)
 
-    await database.execute(
-        "INSERT INTO supervisores (id, nombre, email, activo) "
-        "VALUES (:id, :nombre, :email, true)",
-        {"id": next_id, "nombre": nombre, "email": email}
+    await pool.execute(
+        "INSERT INTO supervisores (id, nombre, email, activo) VALUES ($1, $2, $3, true)",
+        next_id, nombre, email,
     )
     return {"status": "ok", "id": next_id, "nombre": nombre}
 
 
 @app.put("/admin/supervisor/{sup_id}")
 async def editar_supervisor(sup_id: str, data: dict, _u: dict = Depends(require_role("oficina"))):
-    row = await database.fetch_one(
-        "SELECT id FROM supervisores WHERE id = :id", {"id": sup_id}
-    )
+    pool = await core_db()
+    row = await pool.fetchrow("SELECT id FROM supervisores WHERE id = $1", sup_id)
     if not row:
         raise HTTPException(404, "Supervisor no encontrado")
-    await database.execute(
-        "UPDATE supervisores SET nombre = :nombre, email = :email WHERE id = :id",
-        {
-            "id": sup_id,
-            "nombre": data.get("nombre", "").upper().strip(),
-            "email":  data.get("email", "").strip(),
-        }
+    await pool.execute(
+        "UPDATE supervisores SET nombre = $1, email = $2 WHERE id = $3",
+        data.get("nombre", "").upper().strip(), data.get("email", "").strip(), sup_id,
     )
-    updated = await database.fetch_one(
-        "SELECT id, nombre, email FROM supervisores WHERE id = :id", {"id": sup_id}
-    )
+    updated = await pool.fetchrow(
+        "SELECT id, nombre, email FROM supervisores WHERE id = $1", sup_id)
     return dict(updated)
 
 
 @app.put("/admin/supervisor/{sup_id}/baja")
 async def dar_baja_supervisor(sup_id: str, _u: dict = Depends(require_role("oficina"))):
-    await database.execute(
-        "UPDATE supervisores SET activo = false WHERE id = :id", {"id": sup_id}
-    )
+    pool = await core_db()
+    await pool.execute("UPDATE supervisores SET activo = false WHERE id = $1", sup_id)
     return {"status": "ok"}
 
 # ── OTMs ─────────────────────────────────────────────────────
@@ -691,7 +699,8 @@ async def get_otms(activas: bool = False):
     # vocabulario real de estados es abierto (ej. 'CULMINADO', 'GENERAR NUEVO SDP')
     # y no queremos ocultar OTMs por un estado no previsto.
     where = "WHERE estado = 'EJECUCION'" if activas else ""
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         f"SELECT id, descripcion, area, estado, centro_costo, sdp, plazo, "
         f"       fecha_inicio, fecha_fin, monto_contractual, monto_valorizado "
         f"FROM otms {where} ORDER BY id"
@@ -701,7 +710,8 @@ async def get_otms(activas: bool = False):
 # ── TRABAJADORES ─────────────────────────────────────────────
 @app.get("/api/trabajadores")
 async def get_trabajadores():
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         "SELECT id, nombre, cargo FROM trabajadores WHERE activo = true ORDER BY nombre"
     )
     return [dict(r) for r in rows]
@@ -711,44 +721,48 @@ async def get_trabajadores():
 async def buscar(q: str):
     if len(q) < 2:
         return []
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         """SELECT id, nombre, cargo FROM trabajadores
            WHERE activo = true AND (
-             nombre ILIKE :q OR cargo ILIKE :q OR id = :id
+             nombre ILIKE $1 OR cargo ILIKE $1 OR id = $2
            ) ORDER BY nombre LIMIT 8""",
-        {"q": f"%{q}%", "id": q.zfill(3)}
+        f"%{q}%", q.zfill(3),
     )
     return [dict(r) for r in rows]
 
 # ── REGISTRO BATCH ────────────────────────────────────────────
 @app.get("/api/cuadrilla/{supervisor_id}")
 async def get_cuadrilla(supervisor_id: str):
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         "SELECT c.trab_id, t.nombre, t.cargo "
         "FROM cuadrillas c "
         "JOIN trabajadores t ON t.id = c.trab_id "
-        "WHERE c.supervisor_id = :sup AND t.activo = true "
+        "WHERE c.supervisor_id = $1 AND t.activo = true "
         "ORDER BY t.nombre",
-        {"sup": supervisor_id}
+        supervisor_id,
     )
     return [dict(r) for r in rows]
 
 
 @app.post("/api/cuadrilla/{supervisor_id}/{trab_id}")
 async def agregar_cuadrilla(supervisor_id: str, trab_id: str):
-    await database.execute(
+    pool = await core_db()
+    await pool.execute(
         "INSERT INTO cuadrillas (supervisor_id, trab_id) "
-        "VALUES (:sup, :tid) ON CONFLICT DO NOTHING",
-        {"sup": supervisor_id, "tid": trab_id.zfill(3)}
+        "VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        supervisor_id, trab_id.zfill(3),
     )
     return {"ok": True}
 
 
 @app.delete("/api/cuadrilla/{supervisor_id}/{trab_id}")
 async def quitar_cuadrilla(supervisor_id: str, trab_id: str):
-    await database.execute(
-        "DELETE FROM cuadrillas WHERE supervisor_id = :sup AND trab_id = :tid",
-        {"sup": supervisor_id, "tid": trab_id.zfill(3)}
+    pool = await core_db()
+    await pool.execute(
+        "DELETE FROM cuadrillas WHERE supervisor_id = $1 AND trab_id = $2",
+        supervisor_id, trab_id.zfill(3),
     )
     return {"ok": True}
 
@@ -764,14 +778,15 @@ _REGISTROS_DIA_SQL = """
            tp.supervisor_id, SUM(tp.hh) AS hh
     FROM tareo_partida tp
     JOIN trabajadores t ON t.id = tp.trabajador_id
-    WHERE tp.fecha = :fch AND tp.hh IS NOT NULL
+    WHERE tp.fecha = $1 AND tp.hh IS NOT NULL
     GROUP BY tp.trabajador_id, t.nombre, t.cargo, tp.otm_id, tp.supervisor_id
     ORDER BY trab_id, hora
 """
 
 @app.get("/api/registros/hoy")
 async def registros_hoy():
-    rows = await database.fetch_all(_REGISTROS_DIA_SQL, {"fch": fecha_lima()})
+    pool = await core_db()
+    rows = await pool.fetch(_REGISTROS_DIA_SQL, fecha_lima())
     return [dict(r) for r in rows]
 
 # ── REGISTROS POR FECHA ───────────────────────────────────────
@@ -780,7 +795,8 @@ async def registros_por_fecha(fecha: str):
     f = parse_fecha(fecha)
     if not f:
         raise HTTPException(400, "fecha inválida")
-    rows = await database.fetch_all(_REGISTROS_DIA_SQL, {"fch": f})
+    pool = await core_db()
+    rows = await pool.fetch(_REGISTROS_DIA_SQL, f)
     return [dict(r) for r in rows]
 
 # ── ADMIN: CREAR TRABAJADOR ───────────────────────────────────
@@ -797,37 +813,71 @@ async def crear_trabajador(data: dict, _u: dict = Depends(require_role("oficina"
     if tipo not in ("DIRECTO", "INDIRECTO"):
         tipo = "DIRECTO"
 
-    row = await database.fetch_one(
-        "SELECT MAX(CAST(id AS INTEGER)) as max_id FROM trabajadores"
-    )
-    next_id = str((row["max_id"] or 0) + 1).zfill(3)
+    pool = await core_db()
+    max_id = await pool.fetchval(
+        r"SELECT MAX(CAST(id AS INTEGER)) FROM trabajadores WHERE id ~ '^\d+$'")
+    next_id = str((max_id or 0) + 1).zfill(3)
 
-    await database.execute(
+    await pool.execute(
         "INSERT INTO trabajadores (id, nombre, cargo, dni, tipo) "
-        "VALUES (:id, :nombre, :cargo, :dni, :tipo)",
-        {"id": next_id, "nombre": nombre, "cargo": cargo, "dni": dni, "tipo": tipo}
+        "VALUES ($1, $2, $3, $4, $5)",
+        next_id, nombre, cargo, dni, tipo,
     )
     return {"status": "ok", "id": next_id, "nombre": nombre, "cargo": cargo, "tipo": tipo}
 
 # ── ADMIN: LISTAR TRABAJADORES ────────────────────────────────
 @app.get("/admin/trabajadores")
 async def listar_trabajadores():
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         "SELECT id, nombre, cargo, dni, COALESCE(tipo,'DIRECTO') AS tipo, activo "
-        "FROM trabajadores ORDER BY CAST(id AS INTEGER)"
+        r"FROM trabajadores ORDER BY (CASE WHEN id ~ '^\d+$' THEN CAST(id AS INTEGER) END) "
+        "NULLS LAST, id"
     )
     return [dict(r) for r in rows]
 
 # ── ADMIN: DAR DE BAJA ────────────────────────────────────────
 @app.put("/admin/trabajador/{trab_id}/baja")
 async def dar_baja(trab_id: str, _u: dict = Depends(require_role("oficina"))):
-    await database.execute(
-        "UPDATE trabajadores SET activo = false WHERE id = :id",
-        {"id": trab_id.zfill(3)}
-    )
+    pool = await core_db()
+    await pool.execute(
+        "UPDATE trabajadores SET activo = false WHERE id = $1", trab_id.zfill(3))
     return {"status": "ok"}
 
 # ── ADMIN: AGREGAR / ACTUALIZAR OTM ──────────────────────────
+_OTM_UPSERT_SQL = """
+    INSERT INTO otms (id, sdp, descripcion, centro_costo, area, estado,
+                      plazo, fecha_inicio, fecha_fin, monto_contractual, monto_valorizado)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+    ON CONFLICT (id) DO UPDATE SET
+      estado = EXCLUDED.estado,
+      descripcion = EXCLUDED.descripcion,
+      area = EXCLUDED.area,
+      sdp = EXCLUDED.sdp,
+      centro_costo = EXCLUDED.centro_costo,
+      plazo = COALESCE(EXCLUDED.plazo, otms.plazo),
+      fecha_inicio = COALESCE(EXCLUDED.fecha_inicio, otms.fecha_inicio),
+      fecha_fin = COALESCE(EXCLUDED.fecha_fin, otms.fecha_fin),
+      monto_contractual = COALESCE(EXCLUDED.monto_contractual, otms.monto_contractual),
+      monto_valorizado = COALESCE(EXCLUDED.monto_valorizado, otms.monto_valorizado)
+"""
+
+
+def _num(v) -> Optional[float]:
+    """Coerción segura a número (asyncpg no acepta strings en columnas numéricas)."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(str(v).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _entero(v) -> Optional[int]:
+    n = _num(v)
+    return int(n) if n is not None else None
+
+
 @app.post("/admin/otm")
 async def crear_otm(data: dict, _u: dict = Depends(require_role("oficina"))):
     otm_id      = data.get("id", "").strip().upper()
@@ -836,35 +886,20 @@ async def crear_otm(data: dict, _u: dict = Depends(require_role("oficina"))):
     estado      = data.get("estado", "POR INICIAR").strip()
     sdp         = data.get("sdp", "").strip()
     cc          = data.get("centro_costo", "").strip()
-    plazo       = data.get("plazo") or None
+    plazo       = _entero(data.get("plazo"))
     f_inicio    = parse_fecha(data.get("fecha_inicio"))
     f_fin       = parse_fecha(data.get("fecha_fin"))
-    monto_c     = data.get("monto_contractual") or None
-    monto_v     = data.get("monto_valorizado") or 0
+    monto_c     = _num(data.get("monto_contractual"))
+    monto_v     = _num(data.get("monto_valorizado")) or 0
 
     if not otm_id or not descripcion:
         raise HTTPException(400, "ID y descripción son requeridos")
 
-    await database.execute(
-        """INSERT INTO otms (id, sdp, descripcion, centro_costo, area, estado,
-                              plazo, fecha_inicio, fecha_fin, monto_contractual, monto_valorizado)
-           VALUES (:id, :sdp, :desc, :cc, :area, :estado,
-                   :plazo, :f_inicio, :f_fin, :monto_c, :monto_v)
-           ON CONFLICT (id) DO UPDATE SET
-             estado = EXCLUDED.estado,
-             descripcion = EXCLUDED.descripcion,
-             area = EXCLUDED.area,
-             sdp = EXCLUDED.sdp,
-             centro_costo = EXCLUDED.centro_costo,
-             plazo = COALESCE(EXCLUDED.plazo, otms.plazo),
-             fecha_inicio = COALESCE(EXCLUDED.fecha_inicio, otms.fecha_inicio),
-             fecha_fin = COALESCE(EXCLUDED.fecha_fin, otms.fecha_fin),
-             monto_contractual = COALESCE(EXCLUDED.monto_contractual, otms.monto_contractual),
-             monto_valorizado = COALESCE(EXCLUDED.monto_valorizado, otms.monto_valorizado)""",
-        {"id": otm_id, "sdp": sdp, "desc": descripcion, "cc": cc,
-         "area": area, "estado": estado, "plazo": plazo,
-         "f_inicio": f_inicio, "f_fin": f_fin,
-         "monto_c": monto_c, "monto_v": monto_v}
+    pool = await core_db()
+    await pool.execute(
+        _OTM_UPSERT_SQL,
+        otm_id, sdp, descripcion, cc, area, estado, plazo, f_inicio, f_fin,
+        monto_c, monto_v,
     )
     return {"status": "ok", "id": otm_id}
 
@@ -878,6 +913,7 @@ async def crear_otms_bulk(data: dict, _u: dict = Depends(require_role("oficina")
         raise HTTPException(400, "Lista de OTMs vacía")
 
     creadas, errores = [], []
+    pool = await core_db()
 
     for o in otms:
         otm_id      = str(o.get("id", "")).strip().upper()
@@ -889,37 +925,21 @@ async def crear_otms_bulk(data: dict, _u: dict = Depends(require_role("oficina")
         estado      = str(o.get("estado", "")).strip().upper() or "POR INICIAR"
         sdp         = str(o.get("sdp", "")).strip()
         cc          = str(o.get("centro_costo", "")).strip()
-        plazo       = o.get("plazo") or None
+        plazo       = _entero(o.get("plazo"))
         f_inicio    = parse_fecha(o.get("fecha_inicio"))
         f_fin       = parse_fecha(o.get("fecha_fin"))
-        monto_c     = o.get("monto_contractual") or None
-        monto_v     = o.get("monto_valorizado") or 0
+        monto_c     = _num(o.get("monto_contractual"))
+        monto_v     = _num(o.get("monto_valorizado")) or 0
 
         if not otm_id or not descripcion:
             errores.append({"id": otm_id or "—", "error": "ID o descripción vacíos"})
             continue
 
         try:
-            await database.execute(
-                """INSERT INTO otms (id, sdp, descripcion, centro_costo, area, estado,
-                                      plazo, fecha_inicio, fecha_fin, monto_contractual, monto_valorizado)
-                   VALUES (:id, :sdp, :desc, :cc, :area, :estado,
-                           :plazo, :f_inicio, :f_fin, :monto_c, :monto_v)
-                   ON CONFLICT (id) DO UPDATE SET
-                     descripcion = EXCLUDED.descripcion,
-                     area = EXCLUDED.area,
-                     estado = EXCLUDED.estado,
-                     sdp = EXCLUDED.sdp,
-                     centro_costo = EXCLUDED.centro_costo,
-                     plazo = COALESCE(EXCLUDED.plazo, otms.plazo),
-                     fecha_inicio = COALESCE(EXCLUDED.fecha_inicio, otms.fecha_inicio),
-                     fecha_fin = COALESCE(EXCLUDED.fecha_fin, otms.fecha_fin),
-                     monto_contractual = COALESCE(EXCLUDED.monto_contractual, otms.monto_contractual),
-                     monto_valorizado = COALESCE(EXCLUDED.monto_valorizado, otms.monto_valorizado)""",
-                {"id": otm_id, "sdp": sdp, "desc": descripcion, "cc": cc,
-                 "area": area, "estado": estado, "plazo": plazo,
-                 "f_inicio": f_inicio, "f_fin": f_fin,
-                 "monto_c": monto_c, "monto_v": monto_v}
+            await pool.execute(
+                _OTM_UPSERT_SQL,
+                otm_id, sdp, descripcion, cc, area, estado, plazo, f_inicio, f_fin,
+                monto_c, monto_v,
             )
             creadas.append(otm_id)
         except Exception as e:
@@ -934,40 +954,36 @@ async def actualizar_estado_otm(otm_id: str, data: dict, _u: dict = Depends(requ
     validos = ["EJECUCION", "POR INICIAR", "CERRADO", "CONCLUIDO", "STAND BY"]
     if estado not in validos:
         raise HTTPException(400, f"Estado inválido. Válidos: {validos}")
-    await database.execute(
-        "UPDATE otms SET estado = :estado WHERE id = :id",
-        {"estado": estado, "id": otm_id}
-    )
+    pool = await core_db()
+    await pool.execute("UPDATE otms SET estado = $1 WHERE id = $2", estado, otm_id)
     return {"status": "ok"}
 
 # ── EDITAR TRABAJADOR ─────────────────────────────────────────
 @app.put("/admin/trabajador/{trab_id}")
 async def editar_trabajador(trab_id: str, data: dict, _u: dict = Depends(require_role("oficina"))):
-    row = await database.fetch_one(
-        "SELECT id FROM trabajadores WHERE id = :id",
-        {"id": trab_id}
-    )
+    pool = await core_db()
+    row = await pool.fetchrow("SELECT id FROM trabajadores WHERE id = $1", trab_id)
     if not row:
         raise HTTPException(status_code=404, detail="Trabajador no encontrado")
     tipo = data.get("tipo", "").strip().upper()
     if tipo not in ("DIRECTO", "INDIRECTO"):
         tipo = None
-    await database.execute(
-        "UPDATE trabajadores SET nombre = :nombre, cargo = :cargo, dni = :dni"
-        + (", tipo = :tipo" if tipo else "") +
-        " WHERE id = :id",
-        {
-            "id":     trab_id,
-            "nombre": data.get("nombre", "").upper().strip(),
-            "cargo":  data.get("cargo",  "").upper().strip(),
-            "dni":    data.get("dni",    ""),
-            **({"tipo": tipo} if tipo else {}),
-        }
-    )
-    updated = await database.fetch_one(
-        "SELECT id, nombre, cargo, dni, COALESCE(tipo,'DIRECTO') AS tipo FROM trabajadores WHERE id = :id",
-        {"id": trab_id}
-    )
+    nombre = data.get("nombre", "").upper().strip()
+    cargo  = data.get("cargo",  "").upper().strip()
+    dni    = data.get("dni",    "")
+    if tipo:
+        await pool.execute(
+            "UPDATE trabajadores SET nombre = $1, cargo = $2, dni = $3, tipo = $4 WHERE id = $5",
+            nombre, cargo, dni, tipo, trab_id,
+        )
+    else:
+        await pool.execute(
+            "UPDATE trabajadores SET nombre = $1, cargo = $2, dni = $3 WHERE id = $4",
+            nombre, cargo, dni, trab_id,
+        )
+    updated = await pool.fetchrow(
+        "SELECT id, nombre, cargo, dni, COALESCE(tipo,'DIRECTO') AS tipo "
+        "FROM trabajadores WHERE id = $1", trab_id)
     return dict(updated)
 
 
@@ -982,15 +998,16 @@ async def get_partidas_otm(otm_id: str):
     """Devuelve el árbol completo (nodos padre + hojas) de una OTM, para que
     la app muestre la jerarquía con color, pero solo las hojas (fase != null)
     son seleccionables para registrar tareo."""
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         """SELECT p.id, p.codigo, p.descripcion, p.fase, p.sub_fase,
                   p.unidad, p.hh_presup, p.metrado_presup,
                   p.nivel, p.parent_codigo,
                   (p.fase IS NOT NULL) AS es_hoja
            FROM ev_partidas p
-           WHERE p.otm_id = :otm AND p.activo = true
+           WHERE p.otm_id = $1 AND p.activo = true
            ORDER BY p.codigo""",
-        {"otm": otm_id}
+        otm_id,
     )
     return [dict(r) for r in rows]
 
@@ -998,13 +1015,14 @@ async def get_partidas_otm(otm_id: str):
 @app.get("/api/partidas-otm/{otm_id}/hojas")
 async def get_partidas_otm_hojas(otm_id: str):
     """Solo las partidas hoja — compat con clientes que no necesitan el árbol."""
-    rows = await database.fetch_all(
+    pool = await core_db()
+    rows = await pool.fetch(
         """SELECT p.id, p.codigo, p.descripcion, p.fase, p.sub_fase,
                   p.unidad, p.hh_presup, p.metrado_presup
            FROM ev_partidas p
-           WHERE p.otm_id = :otm AND p.activo = true AND p.fase IS NOT NULL
+           WHERE p.otm_id = $1 AND p.activo = true AND p.fase IS NOT NULL
            ORDER BY p.codigo""",
-        {"otm": otm_id}
+        otm_id,
     )
     return [dict(r) for r in rows]
 
@@ -1014,24 +1032,25 @@ async def get_partidas_otm_hojas(otm_id: str):
 @app.get("/api/cuadrillas/{supervisor_id}")
 async def listar_cuadrilla_grupos(supervisor_id: str):
     """Lista todos los grupos de cuadrilla del supervisor con sus miembros."""
-    grupos = await database.fetch_all(
+    pool = await core_db()
+    grupos = await pool.fetch(
         """SELECT g.id, g.nombre, g.activo, g.creado_en,
                   COUNT(m.trab_id) AS total
            FROM cuadrilla_grupos g
            LEFT JOIN cuadrilla_grupo_miembros m ON m.grupo_id = g.id
-           WHERE g.supervisor_id = :sup AND g.activo = true
+           WHERE g.supervisor_id = $1 AND g.activo = true
            GROUP BY g.id ORDER BY g.creado_en""",
-        {"sup": supervisor_id}
+        supervisor_id,
     )
     result = []
     for g in grupos:
         gd = dict(g)
-        miembros = await database.fetch_all(
+        miembros = await pool.fetch(
             """SELECT m.trab_id, t.nombre, t.cargo
                FROM cuadrilla_grupo_miembros m
                JOIN trabajadores t ON t.id = m.trab_id AND t.activo = true
-               WHERE m.grupo_id = :gid ORDER BY t.nombre""",
-            {"gid": gd["id"]}
+               WHERE m.grupo_id = $1 ORDER BY t.nombre""",
+            gd["id"],
         )
         gd["miembros"] = [dict(m) for m in miembros]
         gd["total"]    = int(gd["total"])
@@ -1046,18 +1065,18 @@ async def crear_cuadrilla_grupo(supervisor_id: str, data: dict):
     trab_ids = data.get("trab_ids", [])
     if not nombre:
         raise HTTPException(400, "El nombre es requerido")
-    row = await database.fetch_one(
+    pool = await core_db()
+    grupo_id = await pool.fetchval(
         "INSERT INTO cuadrilla_grupos (supervisor_id, nombre) "
-        "VALUES (:sup, :nombre) ON CONFLICT (supervisor_id, nombre) "
+        "VALUES ($1, $2) ON CONFLICT (supervisor_id, nombre) "
         "DO UPDATE SET activo = true RETURNING id",
-        {"sup": supervisor_id, "nombre": nombre}
+        supervisor_id, nombre,
     )
-    grupo_id = row["id"]
     for tid in trab_ids:
-        await database.execute(
+        await pool.execute(
             "INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id) "
-            "VALUES (:gid, :tid) ON CONFLICT DO NOTHING",
-            {"gid": grupo_id, "tid": str(tid).zfill(3)}
+            "VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            grupo_id, str(tid).zfill(3),
         )
     return {"ok": True, "id": grupo_id, "nombre": nombre}
 
@@ -1066,48 +1085,60 @@ async def crear_cuadrilla_grupo(supervisor_id: str, data: dict):
 async def reemplazar_miembros_grupo(grupo_id: int, data: dict):
     """Reemplaza la lista completa de miembros del grupo."""
     trab_ids = data.get("trab_ids", [])
-    await database.execute(
-        "DELETE FROM cuadrilla_grupo_miembros WHERE grupo_id = :gid",
-        {"gid": grupo_id}
-    )
-    for tid in trab_ids:
-        await database.execute(
-            "INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id) "
-            "VALUES (:gid, :tid) ON CONFLICT DO NOTHING",
-            {"gid": grupo_id, "tid": str(tid).zfill(3)}
-        )
+    pool = await core_db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            await con.execute(
+                "DELETE FROM cuadrilla_grupo_miembros WHERE grupo_id = $1", grupo_id)
+            for tid in trab_ids:
+                await con.execute(
+                    "INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id) "
+                    "VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    grupo_id, str(tid).zfill(3),
+                )
     return {"ok": True, "total": len(trab_ids)}
 
 
 @app.post("/api/cuadrilla-grupo/{grupo_id}/miembro/{trab_id}")
 async def agregar_miembro_grupo(grupo_id: int, trab_id: str):
-    await database.execute(
+    pool = await core_db()
+    await pool.execute(
         "INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id) "
-        "VALUES (:gid, :tid) ON CONFLICT DO NOTHING",
-        {"gid": grupo_id, "tid": trab_id.zfill(3)}
+        "VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        grupo_id, trab_id.zfill(3),
     )
     return {"ok": True}
 
 
 @app.delete("/api/cuadrilla-grupo/{grupo_id}/miembro/{trab_id}")
 async def quitar_miembro_grupo(grupo_id: int, trab_id: str):
-    await database.execute(
-        "DELETE FROM cuadrilla_grupo_miembros WHERE grupo_id = :gid AND trab_id = :tid",
-        {"gid": grupo_id, "tid": trab_id.zfill(3)}
+    pool = await core_db()
+    await pool.execute(
+        "DELETE FROM cuadrilla_grupo_miembros WHERE grupo_id = $1 AND trab_id = $2",
+        grupo_id, trab_id.zfill(3),
     )
     return {"ok": True}
 
 
 @app.delete("/api/cuadrilla-grupo/{grupo_id}")
 async def eliminar_cuadrilla_grupo(grupo_id: int):
-    await database.execute(
-        "UPDATE cuadrilla_grupos SET activo = false WHERE id = :gid",
-        {"gid": grupo_id}
-    )
+    pool = await core_db()
+    await pool.execute(
+        "UPDATE cuadrilla_grupos SET activo = false WHERE id = $1", grupo_id)
     return {"ok": True}
 
 
 # ── ENVIAR CON PARTIDAS (nuevo flujo) ─────────────────────────
+
+async def _semana_para(pool, fecha_obj: date) -> int:
+    """Semana del proyecto para una fecha. Usa la MISMA fecha_base del motor EV
+    (auto-derivada del primer tareo y persistida — F0.3), alineada a lunes."""
+    async with pool.acquire() as con:
+        base = await _fecha_base(con)
+    if not base:
+        return 1
+    return max(1, (fecha_obj - base).days // 7 + 1)
+
 
 @app.post("/api/sesion/enviar-con-partidas")
 async def enviar_con_partidas(data: dict):
@@ -1132,12 +1163,8 @@ async def enviar_con_partidas(data: dict):
         raise HTTPException(400, "fecha inválida")
     hh_dia = await resolver_jornada(fecha_obj, otm_id)
 
-    row_cfg = await database.fetch_one("SELECT valor FROM ev_config WHERE clave = :k", {"k": "fecha_base"})
-    semana = 1
-    if row_cfg and row_cfg["valor"]:
-        base = date.fromisoformat(str(row_cfg["valor"]))
-        base = base - timedelta(days=base.weekday())   # alinear a lunes (consistente con _semana_de)
-        semana = max(1, (fecha_obj - base).days // 7 + 1)
+    pool = await core_db()
+    semana = await _semana_para(pool, fecha_obj)
 
     enviados = 0
     fallidos = 0
@@ -1145,68 +1172,64 @@ async def enviar_con_partidas(data: dict):
     try:
         # Todo el registro va en UNA transacción: o entra completo o no entra nada
         # (evita estados a medias y condiciones de carrera en el reenvío).
-        async with database.transaction():
-            # Idempotencia: un reenvío del mismo supervisor/OTM/día REEMPLAZA el anterior.
-            await database.execute(
-                "DELETE FROM tareo_partida WHERE supervisor_id=:sup AND otm_id=:otm AND fecha=:fch",
-                {"sup": supervisor_id, "otm": otm_id, "fch": fecha_obj}
-            )
-
-            row = await database.fetch_one(
-                "INSERT INTO sesiones "
-                "(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
-                "VALUES (:sup, :otm, :fch, :hh, 'enviada', now()) RETURNING id",
-                {"sup": supervisor_id, "otm": otm_id, "hh": hh_dia, "fch": fecha_obj}
-            )
-            sesion_id = row["id"]
-
-            for t in trabajadores:
-                trab_id = str(t.get("trab_id", "")).zfill(3)
-                via     = t.get("via", "app")
-
-                # Normalizar asignaciones — soportar ambos formatos
-                asignaciones = t.get("asignaciones")
-                if asignaciones is None:
-                    pid_old = t.get("partida_id")
-                    asignaciones = [{"partida_id": pid_old, "hh": hh_dia}] if pid_old else []
-
-                # HH total del trabajador = suma de asignaciones (o hh_dia si no hay partidas)
-                hh_total = sum(float(a.get("hh", 0)) for a in asignaciones) if asignaciones else hh_dia
-                if hh_total <= 0:
-                    hh_total = hh_dia
-
-                await database.execute(
-                    "INSERT INTO sesion_trabajadores "
-                    "(sesion_id, trab_id, presente, hh_override, agregado_via) "
-                    "VALUES (:sid, :tid, true, null, :via)",
-                    {"sid": sesion_id, "tid": trab_id, "via": via}
+        async with pool.acquire() as con:
+            async with con.transaction():
+                # Idempotencia: un reenvío del mismo supervisor/OTM/día REEMPLAZA el anterior.
+                await con.execute(
+                    "DELETE FROM tareo_partida WHERE supervisor_id=$1 AND otm_id=$2 AND fecha=$3",
+                    supervisor_id, otm_id, fecha_obj,
                 )
 
-                # F0.3: se retiró la doble escritura a `registros` (tabla congelada como
-                # histórico). tareo_partida es la única fuente de HH del tareo.
+                sesion_id = await con.fetchval(
+                    "INSERT INTO sesiones "
+                    "(supervisor_id, otm_id, fecha, hh_turno, estado, enviada_at) "
+                    "VALUES ($1, $2, $3, $4, 'enviada', now()) RETURNING id",
+                    supervisor_id, otm_id, fecha_obj, hh_dia,
+                )
 
-                # tareo_partida — una fila por cada asignación a partida
-                for asig in asignaciones:
-                    pid = asig.get("partida_id")
-                    hh  = float(asig.get("hh", hh_dia))
-                    if not pid or hh <= 0:
-                        continue
-                    try:
-                        await database.execute(
-                            "INSERT INTO tareo_partida "
-                            "(trabajador_id, partida_id, otm_id, fecha, semana, "
-                            " hora_registro, hh, supervisor_id, sesion_id, fuente) "
-                            "VALUES (:tid, :pid, :otm, :fch, :sem, "
-                            "        NOW(), :hh, :sup, :sid, 'tareo')",
-                            {"tid": trab_id, "pid": pid, "otm": otm_id, "fch": fecha_obj,
-                             "sem": semana, "hh": hh,
-                             "sup": supervisor_id, "sid": sesion_id}
-                        )
-                    except Exception as e:
-                        fallidos += 1
-                        log.warning(f"[tareo_partida] trab={trab_id} pid={pid}: {e}")
+                for t in trabajadores:
+                    trab_id = str(t.get("trab_id", "")).zfill(3)
+                    via     = t.get("via", "app")
 
-                enviados += 1
+                    # Normalizar asignaciones — soportar ambos formatos
+                    asignaciones = t.get("asignaciones")
+                    if asignaciones is None:
+                        pid_old = t.get("partida_id")
+                        asignaciones = [{"partida_id": pid_old, "hh": hh_dia}] if pid_old else []
+
+                    await con.execute(
+                        "INSERT INTO sesion_trabajadores "
+                        "(sesion_id, trab_id, presente, hh_override, agregado_via) "
+                        "VALUES ($1, $2, true, null, $3)",
+                        sesion_id, trab_id, via,
+                    )
+
+                    # F0.3: se retiró la doble escritura a `registros` (tabla congelada como
+                    # histórico). tareo_partida es la única fuente de HH del tareo.
+
+                    # tareo_partida — una fila por cada asignación a partida.
+                    # Savepoint por fila (transacción anidada): una asignación inválida no
+                    # aborta el envío completo, solo se cuenta en `fallidos`.
+                    for asig in asignaciones:
+                        pid = asig.get("partida_id")
+                        hh  = float(asig.get("hh", hh_dia))
+                        if not pid or hh <= 0:
+                            continue
+                        try:
+                            async with con.transaction():
+                                await con.execute(
+                                    "INSERT INTO tareo_partida "
+                                    "(trabajador_id, partida_id, otm_id, fecha, semana, "
+                                    " hora_registro, hh, supervisor_id, sesion_id, fuente) "
+                                    "VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, 'tareo')",
+                                    trab_id, pid, otm_id, fecha_obj, semana, hh,
+                                    supervisor_id, sesion_id,
+                                )
+                        except Exception as e:
+                            fallidos += 1
+                            log.warning(f"[tareo_partida] trab={trab_id} pid={pid}: {e}")
+
+                    enviados += 1
     except HTTPException:
         raise
     except Exception as e:
@@ -1234,25 +1257,21 @@ async def cambio_partida_dia(data: dict):
     if not trabajador_ids or not partida_id:
         raise HTTPException(400, "trabajador_ids y partida_id son requeridos")
 
-    row_cfg2 = await database.fetch_one("SELECT valor FROM ev_config WHERE clave = :k", {"k": "fecha_base"})
-    semana = 1
-    if row_cfg2 and row_cfg2["valor"]:
-        base = date.fromisoformat(str(row_cfg2["valor"]))
-        base = base - timedelta(days=base.weekday())   # alinear a lunes (consistente con _semana_de)
-        semana = max(1, (date.fromisoformat(fecha_str) - base).days // 7 + 1)
-
     fecha_obj = parse_fecha(fecha_str)
+    if not fecha_obj:
+        raise HTTPException(400, "fecha inválida")
+    pool = await core_db()
+    semana = await _semana_para(pool, fecha_obj)
+
     creados = 0
     for tid in trabajador_ids:
         trab_id = str(tid).zfill(3)
-        await database.execute(
+        await pool.execute(
             "INSERT INTO tareo_partida "
             "(trabajador_id, partida_id, otm_id, fecha, semana, "
             " hora_registro, supervisor_id, fuente) "
-            "VALUES (:tid, :pid, :otm, :fch, :sem, "
-            "        NOW(), :sup, 'cambio')",
-            {"tid": trab_id, "pid": partida_id, "otm": otm_id, "fch": fecha_obj,
-             "sem": semana, "sup": supervisor_id}
+            "VALUES ($1, $2, $3, $4, $5, NOW(), $6, 'cambio')",
+            trab_id, partida_id, otm_id, fecha_obj, semana, supervisor_id,
         )
         creados += 1
 
