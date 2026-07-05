@@ -27,6 +27,10 @@ import asyncpg
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
+from core.log import get_logger
+
+log = get_logger("ev")
+
 router = APIRouter(prefix="/ev", tags=["valor-ganado"])
 
 # Zona horaria de Perú (UTC-5) — sin dependencias externas (no usar pytz)
@@ -1235,8 +1239,10 @@ async def arbol_wbs(otm: Optional[str] = None, semana: int = 1):
         return {"semana": semana, "otm": otm, "filas": result}
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(500, f"Error calculando árbol WBS: {e}")
+    except Exception:
+        # F0.8: traceback al log; al cliente solo mensaje genérico (antes filtraba str(e))
+        log.exception("error calculando árbol WBS")
+        raise HTTPException(500, "Error interno calculando árbol WBS")
 
 
 @router.get("/monitor/anomalias")
@@ -1293,8 +1299,9 @@ async def monitor_anomalias(otm: Optional[str] = None, semana: int = 1,
         return {"otm": otm, "semana": semana, "total": len(anomalias), "anomalias": anomalias}
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(500, f"Error en monitor de anomalías: {e}")
+    except Exception:
+        log.exception("error en monitor de anomalías")
+        raise HTTPException(500, "Error interno en monitor de anomalías")
 
 
 @router.post("/distribuir-hh")
@@ -1422,8 +1429,9 @@ async def isp_reporte(otm: Optional[str] = None):
         return {"semanas": semanas_out, "partidas": list(result_por_partida.values())}
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(500, f"Error calculando ISP: {e}")
+    except Exception:
+        log.exception("error calculando ISP")
+        raise HTTPException(500, "Error interno calculando ISP")
 
 
 @router.get("/reporte")
@@ -1933,8 +1941,9 @@ async def semana_grid(
             }
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(500, f"Error calculando grilla diaria: {e}")
+    except Exception:
+        log.exception("error calculando grilla diaria")
+        raise HTTPException(500, "Error interno calculando grilla diaria")
 
 
 @router.post("/avance-diario")

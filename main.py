@@ -12,9 +12,16 @@ import json
 import time
 import secrets
 from contextlib import asynccontextmanager
+from fastapi.responses import JSONResponse
+from core.log import setup_logging, get_logger
 from routers.valor_ganado import router as ev_router
 from routers.presupuesto import router as presupuesto_router
 from routers.ro import router as ro_router
+
+setup_logging()
+log = get_logger("api")
+
+APP_VERSION = "1.5.0"   # única fuente de la versión (app y /health)
 
 # ── Seguridad Fase 1+3: compuerta global (retrocompatible) ──
 # Mientras API_KEY no esté seteada, NO se exige nada (despliegue sin cortar la operación).
@@ -209,7 +216,7 @@ async def lifespan(app: FastAPI):
     await database.disconnect()
 
 
-app = FastAPI(title="Kampfer Tareo API", version="1.5.0", lifespan=lifespan, dependencies=[Depends(require_key)])
+app = FastAPI(title="Kampfer Tareo API", version=APP_VERSION, lifespan=lifespan, dependencies=[Depends(require_key)])
 
 app.add_middleware(
     CORSMiddleware,
@@ -218,6 +225,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Observabilidad (F0.8) ────────────────────────────────────
+@app.exception_handler(Exception)
+async def _error_no_controlado(request: Request, exc: Exception):
+    """Cualquier excepción no manejada: traceback al log, mensaje genérico al cliente
+    (antes varios endpoints devolvían str(e) y filtraban internals)."""
+    log.error("error no controlado", exc_info=exc, extra={"path": request.url.path})
+    return JSONResponse(status_code=500, content={"detail": "Error interno"})
+
+
+@app.middleware("http")
+async def _medir_requests(request: Request, call_next):
+    """Loguea requests lentos (>1s) o con 5xx, con path y duración en ms."""
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    ms = round((time.perf_counter() - t0) * 1000)
+    if ms > 1000 or response.status_code >= 500:
+        log.info("request", extra={"path": request.url.path, "ms": ms,
+                                   "status": response.status_code})
+    return response
 
 app.include_router(ev_router)
 # Fase 1: módulo de presupuesto (todos los endpoints son de oficina).
@@ -660,7 +688,7 @@ async def enviar_sesion(sesion_id: int, data: dict):
             )
             enviados += 1
         except Exception as e:
-            print(f"[SESION] Error registro trab={t['trab_id']}: {e}")
+            log.warning(f"[SESION] Error registro trab={t['trab_id']}: {e}")
 
     await database.execute(
         "UPDATE sesiones SET estado = 'enviada', enviada_at = now() WHERE id = :id",
@@ -672,7 +700,7 @@ async def enviar_sesion(sesion_id: int, data: dict):
 # ── HEALTH ───────────────────────────────────────────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.2.0"}
+    return {"status": "ok", "version": APP_VERSION}
 
 # ── SUPERVISORES ─────────────────────────────────────────────
 @app.get("/api/supervisores")
@@ -871,7 +899,7 @@ async def registrar(data: dict):
                 "status":  "ok"
             })
         except Exception as e:
-            print(f"[ERROR] INSERT trab={trab_id} otm={otm_id}: {str(e)}")
+            log.warning(f"[ERROR] INSERT trab={trab_id} otm={otm_id}: {str(e)}")
             resultados.append({
                 "trab_id": trab_id, "nombre": nombre, "cargo": cargo,
                 "status": "error", "mensaje": str(e)
@@ -1577,7 +1605,7 @@ async def enviar_con_partidas(data: dict):
                         )
                     except Exception as e:
                         fallidos += 1
-                        print(f"[tareo_partida] trab={trab_id} pid={pid}: {e}")
+                        log.warning(f"[tareo_partida] trab={trab_id} pid={pid}: {e}")
 
                 enviados += 1
     except HTTPException:
