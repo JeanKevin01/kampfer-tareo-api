@@ -15,7 +15,8 @@ from typing import Optional, List
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from database import database
+# F0.4: este router usa el pool asyncpg único (core.db); la lib `databases` salió de aquí.
+from core.db import db
 
 router = APIRouter(prefix="/ev/ro", tags=["resultado-operativo"])
 
@@ -132,7 +133,7 @@ _HH_FASE_CARGO_SQL = """
     JOIN ev_partidas ev ON ev.id = tp.partida_id
     LEFT JOIN trabajadores t ON t.id = tp.trabajador_id
     WHERE tp.hh IS NOT NULL AND ev.fase IS NOT NULL
-      AND ev.otm_id IN (SELECT id FROM otms WHERE proyecto_id = :pid)
+      AND ev.otm_id IN (SELECT id FROM otms WHERE proyecto_id = $1)
     GROUP BY ev.fase, t.cargo
 """
 # SQL: venta real por fase = Σ(cantidad valorizada × PU).
@@ -141,7 +142,7 @@ _VENTA_FASE_SQL = """
     FROM ev_valorizado v
     JOIN ev_partidas ev ON ev.id = v.partida_id
     WHERE ev.fase IS NOT NULL
-      AND ev.otm_id IN (SELECT id FROM otms WHERE proyecto_id = :pid)
+      AND ev.otm_id IN (SELECT id FROM otms WHERE proyecto_id = $1)
     GROUP BY ev.fase
 """
 
@@ -149,74 +150,84 @@ _VENTA_FASE_SQL = """
 # ── Endpoints ─────────────────────────────────────────────────
 @router.get("")
 async def resultado_operativo(proyecto_id: int = 1):
-    hh_rows = await database.fetch_all(_HH_FASE_CARGO_SQL, {"pid": proyecto_id})
-    tar_rows = await database.fetch_all("SELECT cargo, costo_hh FROM ev_tarifas_cargo")
+    pool = await db()
+    async with pool.acquire() as con:
+        hh_rows = await con.fetch(_HH_FASE_CARGO_SQL, proyecto_id)
+        tar_rows = await con.fetch("SELECT cargo, costo_hh FROM ev_tarifas_cargo")
+        costos = [dict(r) for r in await con.fetch(
+            "SELECT fase, tipo_recurso, directo, SUM(monto) AS monto FROM costos "
+            "WHERE proyecto_id = $1 GROUP BY fase, tipo_recurso, directo", proyecto_id)]
+        venta_rows = await con.fetch(_VENTA_FASE_SQL, proyecto_id)
+        ajustes = [dict(r) for r in await con.fetch(
+            "SELECT fase, tipo, SUM(monto) AS monto FROM venta_ajustes "
+            "WHERE proyecto_id = $1 GROUP BY fase, tipo", proyecto_id)]
+        fases_rows = await con.fetch(
+            "SELECT codigo AS fase, descripcion FROM ev_partidas WHERE codigo IN "
+            "(SELECT DISTINCT fase FROM ev_partidas WHERE fase IS NOT NULL)")
+
     tarifas = {r["cargo"]: float(r["costo_hh"]) for r in tar_rows}
     default = tarifas.get("(Default)")
     mo = _calc_mo_por_fase([dict(r) for r in hh_rows], tarifas, default)
-
-    costos = [dict(r) for r in await database.fetch_all(
-        "SELECT fase, tipo_recurso, directo, SUM(monto) AS monto FROM costos "
-        "WHERE proyecto_id = :pid GROUP BY fase, tipo_recurso, directo", {"pid": proyecto_id})]
-    venta_real = {r["fase"]: float(r["venta"] or 0)
-                  for r in await database.fetch_all(_VENTA_FASE_SQL, {"pid": proyecto_id})}
-    ajustes = [dict(r) for r in await database.fetch_all(
-        "SELECT fase, tipo, SUM(monto) AS monto FROM venta_ajustes "
-        "WHERE proyecto_id = :pid GROUP BY fase, tipo", {"pid": proyecto_id})]
-    fases_desc = {r["fase"]: r["descripcion"] for r in await database.fetch_all(
-        "SELECT codigo AS fase, descripcion FROM ev_partidas WHERE codigo IN "
-        "(SELECT DISTINCT fase FROM ev_partidas WHERE fase IS NOT NULL)")}
+    venta_real = {r["fase"]: float(r["venta"] or 0) for r in venta_rows}
+    fases_desc = {r["fase"]: r["descripcion"] for r in fases_rows}
 
     return _armar_ro(mo, costos, venta_real, ajustes, fases_desc)
 
 
 @router.get("/costos")
 async def listar_costos(proyecto_id: int = 1):
-    rows = await database.fetch_all(
-        "SELECT * FROM costos WHERE proyecto_id = :pid ORDER BY periodo DESC, fase", {"pid": proyecto_id})
+    pool = await db()
+    rows = await pool.fetch(
+        "SELECT * FROM costos WHERE proyecto_id = $1 ORDER BY periodo DESC, fase", proyecto_id)
     return [dict(r) for r in rows]
 
 
 @router.post("/costos")
 async def cargar_costos(body: CostosIn):
-    async with database.transaction():
-        for c in body.costos:
-            await database.execute(
-                """INSERT INTO costos (proyecto_id, fase, tipo_recurso, directo, periodo, monto, fuente, nota)
-                   VALUES (:p,:f,:t,:d,:per,:m,:fu,:n)""",
-                {"p": body.proyecto_id, "f": c.fase, "t": c.tipo_recurso, "d": c.directo,
-                 "per": _d(c.periodo), "m": c.monto, "fu": c.fuente, "n": c.nota},
-            )
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            for c in body.costos:
+                await con.execute(
+                    """INSERT INTO costos (proyecto_id, fase, tipo_recurso, directo, periodo, monto, fuente, nota)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
+                    body.proyecto_id, c.fase, c.tipo_recurso, c.directo,
+                    _d(c.periodo), c.monto, c.fuente, c.nota,
+                )
     return {"ok": True, "cargados": len(body.costos)}
 
 
 @router.delete("/costos/{cid}")
 async def borrar_costo(cid: int):
-    await database.execute("DELETE FROM costos WHERE id = :id", {"id": cid})
+    pool = await db()
+    await pool.execute("DELETE FROM costos WHERE id = $1", cid)
     return {"ok": True}
 
 
 @router.get("/venta-ajustes")
 async def listar_ajustes(proyecto_id: int = 1):
-    rows = await database.fetch_all(
-        "SELECT * FROM venta_ajustes WHERE proyecto_id = :pid ORDER BY id DESC", {"pid": proyecto_id})
+    pool = await db()
+    rows = await pool.fetch(
+        "SELECT * FROM venta_ajustes WHERE proyecto_id = $1 ORDER BY id DESC", proyecto_id)
     return [dict(r) for r in rows]
 
 
 @router.post("/venta-ajustes")
 async def cargar_ajustes(body: AjustesIn):
-    async with database.transaction():
-        for a in body.ajustes:
-            await database.execute(
-                """INSERT INTO venta_ajustes (proyecto_id, fase, tipo, periodo, monto, nota)
-                   VALUES (:p,:f,:t,:per,:m,:n)""",
-                {"p": body.proyecto_id, "f": a.fase, "t": a.tipo, "per": _d(a.periodo),
-                 "m": a.monto, "n": a.nota},
-            )
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            for a in body.ajustes:
+                await con.execute(
+                    """INSERT INTO venta_ajustes (proyecto_id, fase, tipo, periodo, monto, nota)
+                       VALUES ($1,$2,$3,$4,$5,$6)""",
+                    body.proyecto_id, a.fase, a.tipo, _d(a.periodo), a.monto, a.nota,
+                )
     return {"ok": True, "cargados": len(body.ajustes)}
 
 
 @router.delete("/venta-ajustes/{aid}")
 async def borrar_ajuste(aid: int):
-    await database.execute("DELETE FROM venta_ajustes WHERE id = :id", {"id": aid})
+    pool = await db()
+    await pool.execute("DELETE FROM venta_ajustes WHERE id = $1", aid)
     return {"ok": True}
