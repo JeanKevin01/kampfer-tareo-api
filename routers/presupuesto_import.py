@@ -63,8 +63,8 @@ async def importar_pu(proyecto_id: int = 1, confirmar: bool = False,
         return {"resumen": resumen, "muestra": muestra}
 
     if res.errores:
-        raise HTTPException(409, {"detail": "El archivo tiene errores; corrige y reintenta",
-                                  "errores": res.errores})
+        raise HTTPException(409, "El archivo tiene errores; corrige y reintenta:\n· "
+                                 + "\n· ".join(res.errores[:10]))
 
     pool = await db()
     async with pool.acquire() as con:
