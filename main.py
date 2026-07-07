@@ -25,6 +25,7 @@ from routers.monitor import router as monitor_router
 from routers.otms import router as otms_router
 from routers.padron import router as padron_router
 from routers.presupuesto import router as presupuesto_router
+from routers.presupuesto_import import router as presupuesto_import_router
 from routers.ro import router as ro_router
 from routers.tareo import router as tareo_router
 from routers.usuarios import router as usuarios_router
@@ -111,6 +112,7 @@ app.include_router(ev_router, dependencies=[Depends(require_role("oficina"))])
 app.include_router(ev_router_campo, dependencies=[Depends(require_role())])
 # Fase 1: módulo de presupuesto (todos los endpoints son de oficina).
 app.include_router(presupuesto_router, dependencies=[Depends(require_role("oficina"))])
+app.include_router(presupuesto_import_router, dependencies=[Depends(require_role("oficina"))])
 # Fase 2: Resultado Operativo (oficina).
 app.include_router(ro_router, dependencies=[Depends(require_role("oficina"))])
 # F0.5: dominios que antes vivían en este archivo.

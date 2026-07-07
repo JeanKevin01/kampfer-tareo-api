@@ -58,33 +58,38 @@ def _clasificar_codigos(presup_codigos, ev_codigos):
 
 # ── Endpoints ─────────────────────────────────────────────────
 @router.get("")
-async def listar(proyecto_id: int = 1):
+async def listar(proyecto_id: int = 1, tipo: Optional[str] = None):
+    """Versiones del proyecto. `tipo` opcional: META | CONTRACTUAL (F1: dos líneas base)."""
     pool = await db()
+    filtro = "AND p.tipo = $2" if tipo else ""
+    args = [proyecto_id] + ([tipo.upper()] if tipo else [])
     rows = await pool.fetch(
-        """SELECT p.*,
+        f"""SELECT p.*,
                   (SELECT count(*) FROM presupuesto_partidas pp WHERE pp.presupuesto_id = p.id) AS lineas
            FROM presupuestos p
-           WHERE p.proyecto_id = $1
-           ORDER BY p.version DESC""",
-        proyecto_id,
+           WHERE p.proyecto_id = $1 {filtro}
+           ORDER BY p.tipo, p.version DESC""",
+        *args,
     )
     return [dict(r) for r in rows]
 
 
 @router.post("")
 async def crear(body: CrearIn):
-    """Crea una versión nueva en BORRADOR. Si sembrar=True, copia las partidas
-    activas del proyecto desde ev_partidas como punto de partida."""
+    """Crea una versión nueva CONTRACTUAL en BORRADOR (la META nace del import de
+    la plantilla PU). Si sembrar=True, copia las partidas activas del proyecto
+    desde ev_partidas como punto de partida."""
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
             vrows = await con.fetch(
-                "SELECT version FROM presupuestos WHERE proyecto_id = $1", body.proyecto_id
+                "SELECT version FROM presupuestos WHERE proyecto_id = $1 AND tipo = 'CONTRACTUAL'",
+                body.proyecto_id
             )
             version = _siguiente_version([r["version"] for r in vrows])
             pid = await con.fetchval(
-                """INSERT INTO presupuestos (proyecto_id, version, estado, vigente, nota)
-                   VALUES ($1, $2, 'BORRADOR', false, $3) RETURNING id""",
+                """INSERT INTO presupuestos (proyecto_id, version, estado, vigente, nota, tipo)
+                   VALUES ($1, $2, 'BORRADOR', false, $3, 'CONTRACTUAL') RETURNING id""",
                 body.proyecto_id, version, body.nota,
             )
             sembradas = 0
@@ -165,23 +170,88 @@ async def borrar_linea(pid: int, codigo: str):
     return {"ok": True}
 
 
+@router.get("/partida/{ppid}/apu")
+async def apu_de_partida(ppid: int):
+    """Recursos del APU de una línea del presupuesto (F1: lo usa el expandible
+    del panel). Incluye el código de la subpartida enlazada si aplica."""
+    pool = await db()
+    rows = await pool.fetch(
+        """SELECT ar.*, sp.codigo AS sub_codigo, sp.descripcion AS sub_descripcion
+           FROM apu_recursos ar
+           LEFT JOIN presupuesto_partidas sp ON sp.id = ar.sub_partida_id
+           WHERE ar.presupuesto_partida_id = $1
+           ORDER BY ar.orden""", ppid)
+    return [dict(r) for r in rows]
+
+
+async def _materializar_costo_meta(con, pid: int) -> int:
+    """F1.3: recalcula presupuesto_costo_meta (delete + insert) desde el APU.
+    Expande subpartidas a sus tipos reales vía las funciones puras de derivados."""
+    from routers.presupuesto_derivados import costo_meta_por_fase_recurso
+
+    pps = await con.fetch(
+        "SELECT id, fase, metrado, nivel, precio_unitario "
+        "FROM presupuesto_partidas WHERE presupuesto_id = $1", pid)
+    recs = await con.fetch(
+        """SELECT ar.presupuesto_partida_id AS pp_id, ar.tipo, ar.cantidad::float AS cantidad,
+                  ar.precio::float AS precio, ar.parcial::float AS parcial, ar.sub_partida_id
+           FROM apu_recursos ar
+           JOIN presupuesto_partidas pp ON pp.id = ar.presupuesto_partida_id
+           WHERE pp.presupuesto_id = $1 ORDER BY ar.orden""", pid)
+    por_pp: dict = {}
+    for r in recs:
+        por_pp.setdefault(r["pp_id"], []).append(
+            {"tipo": r["tipo"], "cantidad": r["cantidad"], "parcial": r["parcial"],
+             "sub": r["sub_partida_id"]})
+    partidas = [{"fase": p["fase"], "metrado": float(p["metrado"] or 0),
+                 "pu": float(p["precio_unitario"] or 0),
+                 "recursos": por_pp.get(p["id"], [])}
+                for p in pps if (p["nivel"] or 1) >= 1]     # nivel 0 = subpartidas
+    costos = costo_meta_por_fase_recurso(
+        partidas, obtener_sub=lambda rec: por_pp.get(rec.get("sub")))
+
+    await con.execute("DELETE FROM presupuesto_costo_meta WHERE presupuesto_id = $1", pid)
+    # El esquema modela EQ y SUB por separado; tras la expansión solo quedan SUB
+    # cuando la subpartida no se pudo resolver (se conservan visibles como SUB).
+    for (fase, tipo), monto in sorted(costos.items(), key=lambda kv: (str(kv[0][0]), kv[0][1])):
+        await con.execute(
+            """INSERT INTO presupuesto_costo_meta (presupuesto_id, fase, tipo_recurso, monto)
+               VALUES ($1, $2, $3, $4)""", pid, fase, tipo, round(monto, 2))
+    return len(costos)
+
+
+@router.get("/{pid}/costo-meta")
+async def costo_meta(pid: int):
+    """Costo meta materializado por (fase, tipo de recurso) — columna 'Meta' del RO."""
+    pool = await db()
+    rows = await pool.fetch(
+        "SELECT fase, tipo_recurso, monto::float AS monto FROM presupuesto_costo_meta "
+        "WHERE presupuesto_id = $1 ORDER BY fase, tipo_recurso", pid)
+    return [dict(r) for r in rows]
+
+
 @router.post("/{pid}/congelar")
 async def congelar(pid: int):
-    """Congela la versión, la marca vigente (desactivando la anterior) y SINCRONIZA
-    metrado/HH meta/PU hacia ev_partidas (match por código dentro del proyecto)."""
+    """Congela la versión, la marca vigente (desactivando la anterior DE SU TIPO)
+    y sincroniza hacia ev_partidas según el tipo (F1.3):
+      · META        → hh_presup (HH meta del APU) + materializa presupuesto_costo_meta.
+      · CONTRACTUAL → metrado_presup + precio_unitario (la venta del RO)."""
     pool = await db()
     p = await pool.fetchrow("SELECT * FROM presupuestos WHERE id = $1", pid)
     if not p:
         raise HTTPException(404, "Presupuesto no encontrado")
     if p["estado"] == "CONGELADO":
         raise HTTPException(409, "El presupuesto ya está congelado.")
-    proyecto_id = p["proyecto_id"]
+    proyecto_id, tipo = p["proyecto_id"], p["tipo"]
+    celdas_costo = 0
     async with pool.acquire() as con:
         async with con.transaction():
-            # 1) desactivar la versión vigente anterior (respeta el índice 'un solo vigente')
+            # 1) desactivar la versión vigente anterior DE ESTE TIPO
+            #    (el índice parcial de 0012 garantiza un vigente por tipo)
             await con.execute(
-                "UPDATE presupuestos SET vigente = false WHERE proyecto_id = $1 AND vigente",
-                proyecto_id,
+                "UPDATE presupuestos SET vigente = false "
+                "WHERE proyecto_id = $1 AND vigente AND tipo = $2",
+                proyecto_id, tipo,
             )
             # 2) congelar + activar esta
             await con.execute(
@@ -190,17 +260,28 @@ async def congelar(pid: int):
             )
             # 3) sincronizar a ev_partidas (match por código, SOLO en OTMs del proyecto —
             #    con unicidad por OTM (0008) el mismo código puede existir en otros proyectos)
-            await con.execute(
-                """UPDATE ev_partidas ev SET
-                      metrado_presup  = pp.metrado,
-                      hh_presup       = pp.hh_meta,
-                      precio_unitario = pp.precio_unitario
-                   FROM presupuesto_partidas pp
-                   WHERE pp.presupuesto_id = $1 AND pp.codigo = ev.codigo
-                     AND (ev.otm_id IN (SELECT id FROM otms WHERE proyecto_id = $2)
-                          OR ev.otm_id IS NULL)""",
-                pid, proyecto_id,
-            )
+            if tipo == "META":
+                await con.execute(
+                    """UPDATE ev_partidas ev SET hh_presup = pp.hh_meta
+                       FROM presupuesto_partidas pp
+                       WHERE pp.presupuesto_id = $1 AND pp.codigo = ev.codigo
+                         AND COALESCE(pp.nivel, 1) >= 1
+                         AND (ev.otm_id IN (SELECT id FROM otms WHERE proyecto_id = $2)
+                              OR ev.otm_id IS NULL)""",
+                    pid, proyecto_id,
+                )
+                celdas_costo = await _materializar_costo_meta(con, pid)
+            else:
+                await con.execute(
+                    """UPDATE ev_partidas ev SET
+                          metrado_presup  = pp.metrado,
+                          precio_unitario = pp.precio_unitario
+                       FROM presupuesto_partidas pp
+                       WHERE pp.presupuesto_id = $1 AND pp.codigo = ev.codigo
+                         AND (ev.otm_id IN (SELECT id FROM otms WHERE proyecto_id = $2)
+                              OR ev.otm_id IS NULL)""",
+                    pid, proyecto_id,
+                )
             total = await con.fetchval(
                 "SELECT count(*) FROM presupuesto_partidas WHERE presupuesto_id = $1", pid
             )
@@ -214,7 +295,8 @@ async def congelar(pid: int):
                 pid, proyecto_id,
             )
     return {
-        "ok": True, "estado": "CONGELADO", "vigente": True,
+        "ok": True, "estado": "CONGELADO", "vigente": True, "tipo": tipo,
         "lineas": total, "sincronizadas": sincronizadas,
         "no_encontradas": (total or 0) - (sincronizadas or 0),
+        "celdas_costo_meta": celdas_costo,
     }
