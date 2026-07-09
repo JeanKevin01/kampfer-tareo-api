@@ -4,6 +4,8 @@ asyncpg==0.29.0
 python-multipart==0.0.9
 # F1.2: la plantilla PU del ex-gerente es .xls (BIFF) - xlrd 2.x solo lee ese formato.
 xlrd==2.0.1
+# F2.2/F2.7: import de costos (.xlsx) y export del RO a Excel.
+openpyxl==3.1.5
 # Migraciones (EPIC 0.2): Alembic usa un driver SINCRONO (psycopg2); la app sigue async con asyncpg.
 alembic==1.13.2
 SQLAlchemy==2.0.31
