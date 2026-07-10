@@ -28,6 +28,9 @@ from routers.periodos import router as periodos_router
 from routers.presupuesto import router as presupuesto_router
 from routers.presupuesto_import import router as presupuesto_import_router
 from routers.ro import router as ro_router
+from routers.ro_mensual import router as ro_mensual_router
+from routers.ro_proyeccion import router as ro_proyeccion_router
+from routers.valorizaciones import router as valorizaciones_router
 from routers.tareo import router as tareo_router
 from routers.usuarios import router as usuarios_router
 from routers.valor_ganado import router as ev_router, router_campo as ev_router_campo
@@ -114,9 +117,12 @@ app.include_router(ev_router_campo, dependencies=[Depends(require_role())])
 # Fase 1: módulo de presupuesto (todos los endpoints son de oficina).
 app.include_router(presupuesto_router, dependencies=[Depends(require_role("oficina"))])
 app.include_router(presupuesto_import_router, dependencies=[Depends(require_role("oficina"))])
-# Fase 2: Resultado Operativo (oficina) + periodos contables.
+# Fase 2: Resultado Operativo (oficina) + periodos, RO mensual, proyección y valorización.
 app.include_router(ro_router, dependencies=[Depends(require_role("oficina"))])
 app.include_router(periodos_router, dependencies=[Depends(require_role("oficina"))])
+app.include_router(ro_mensual_router, dependencies=[Depends(require_role("oficina"))])
+app.include_router(ro_proyeccion_router, dependencies=[Depends(require_role("oficina"))])
+app.include_router(valorizaciones_router, dependencies=[Depends(require_role("oficina"))])
 # F0.5: dominios que antes vivían en este archivo.
 app.include_router(tareo_router)
 app.include_router(padron_router)
