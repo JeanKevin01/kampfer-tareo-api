@@ -41,6 +41,7 @@ def check(nombre, cond, detalle=""):
 
 
 def limpiar_y_sembrar(cur):
+    cur.execute("DELETE FROM fases WHERE codigo LIKE 'E2E-%'")
     cur.execute("DELETE FROM tareo_partida WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM registros WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM sesion_trabajadores WHERE sesion_id IN "
@@ -51,6 +52,11 @@ def limpiar_y_sembrar(cur):
     cur.execute("DELETE FROM ev_hh_gastadas WHERE partida_id IN "
                 "(SELECT id FROM ev_partidas WHERE codigo LIKE 'E2E-%')")
     cur.execute("DELETE FROM ev_hitos WHERE partida_id IN "
+                "(SELECT id FROM ev_partidas WHERE codigo LIKE 'E2E-%')")
+    # Residuos de smokes de F2 en BDs locales reutilizadas:
+    cur.execute("DELETE FROM valorizacion_lineas WHERE partida_id IN "
+                "(SELECT id FROM ev_partidas WHERE codigo LIKE 'E2E-%')")
+    cur.execute("DELETE FROM ev_valorizado WHERE partida_id IN "
                 "(SELECT id FROM ev_partidas WHERE codigo LIKE 'E2E-%')")
     cur.execute("DELETE FROM ev_partidas WHERE codigo LIKE 'E2E-%'")
 
@@ -158,6 +164,34 @@ def main():
     cods = [p.get("codigo") for p in r.json().get("partidas", [])] if ok else []
     check("T7 /ev/isp incluye E2E-001 y E2E-002",
           ok and "E2E-001" in cods and "E2E-002" in cods, f"status={r.status_code} codigos={cods[:5]}")
+
+    # F-FASES — catálogo de fases (migración 0018 + CRUD)
+    r = c.get(f"{API}/ev/fases", params={"proyecto_id": 1})
+    fases = r.json() if r.status_code == 200 else []
+    check("F1 /ev/fases con seed de disciplinas (>=11, incluye FAB)",
+          r.status_code == 200 and len(fases) >= 11
+          and any(f["codigo"] == "FAB" for f in fases),
+          f"status={r.status_code} n={len(fases)}")
+
+    r = c.post(f"{API}/ev/fases", json={"codigo": " e2e-99 ", "nombre": "Fase E2E"})
+    fase_nueva = r.json() if r.status_code == 200 else {}
+    check("F2 POST /ev/fases crea y normaliza el codigo a E2E-99",
+          r.status_code == 200 and fase_nueva.get("codigo") == "E2E-99",
+          f"status={r.status_code} body={r.text[:120]}")
+
+    r = c.post(f"{API}/ev/fases", json={"codigo": "E2E-99", "nombre": "Duplicada"})
+    check("F3 POST fase duplicada -> 409", r.status_code == 409, f"status={r.status_code}")
+
+    r = c.put(f"{API}/ev/fases/{fase_nueva.get('id', 0)}", json={"activo": False})
+    r2 = c.get(f"{API}/ev/fases", params={"proyecto_id": 1})
+    activas = [f["codigo"] for f in r2.json()] if r2.status_code == 200 else []
+    check("F4 PUT desactiva y el GET por defecto la oculta",
+          r.status_code == 200 and "E2E-99" not in activas, f"activas={len(activas)}")
+
+    r = c.get(f"{API}/ev/presupuesto/plantilla-pu")
+    check("F5 plantilla PU descarga .xls (magic bytes BIFF)",
+          r.status_code == 200 and r.content[:4] == b"\xd0\xcf\x11\xe0",
+          f"status={r.status_code}")
 
     print()
     if _fallas:

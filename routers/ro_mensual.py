@@ -120,9 +120,9 @@ async def _insumos(con, proyecto_id: int, anio: int, mes: int) -> dict:
     contingencia = await con.fetchval(
         "SELECT contingencia FROM proyectos WHERE id=$1", proyecto_id) or 0
 
+    from routers.fases import FASES_DESC_SQL
     fases_desc = {r["fase"]: r["descripcion"] for r in await con.fetch(
-        "SELECT codigo AS fase, descripcion FROM ev_partidas WHERE codigo IN "
-        "(SELECT DISTINCT fase FROM ev_partidas WHERE fase IS NOT NULL)")}
+        FASES_DESC_SQL, proyecto_id)}
 
     return dict(periodos=periodos, corte_id=corte["id"], docs=docs,
                 mo_tareo_mes={k: dict(v) for k, v in mo_tareo_mes.items()},

@@ -20,6 +20,7 @@ from core import config
 from core.auth import require_key, require_role, _hash_pw
 from core.db import db as core_db, close_pool
 from core.log import setup_logging, get_logger
+from routers.fases import router as fases_router
 from routers.jornada import router as jornada_router
 from routers.monitor import router as monitor_router
 from routers.otms import router as otms_router
@@ -115,14 +116,18 @@ async def health():
 app.include_router(ev_router, dependencies=[Depends(require_role("oficina"))])
 app.include_router(ev_router_campo, dependencies=[Depends(require_role())])
 # Fase 1: módulo de presupuesto (todos los endpoints son de oficina).
-app.include_router(presupuesto_router, dependencies=[Depends(require_role("oficina"))])
+# El router de import va PRIMERO: sus rutas literales (/plantilla-pu) deben
+# ganar al comodín GET /{pid} del router principal.
 app.include_router(presupuesto_import_router, dependencies=[Depends(require_role("oficina"))])
+app.include_router(presupuesto_router, dependencies=[Depends(require_role("oficina"))])
 # Fase 2: Resultado Operativo (oficina) + periodos, RO mensual, proyección y valorización.
 app.include_router(ro_router, dependencies=[Depends(require_role("oficina"))])
 app.include_router(periodos_router, dependencies=[Depends(require_role("oficina"))])
 app.include_router(ro_mensual_router, dependencies=[Depends(require_role("oficina"))])
 app.include_router(ro_proyeccion_router, dependencies=[Depends(require_role("oficina"))])
 app.include_router(valorizaciones_router, dependencies=[Depends(require_role("oficina"))])
+# Mejoras UX pre-F4: catálogo de fases (oficina).
+app.include_router(fases_router, dependencies=[Depends(require_role("oficina"))])
 # F0.5: dominios que antes vivían en este archivo.
 app.include_router(tareo_router)
 app.include_router(padron_router)

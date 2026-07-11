@@ -180,9 +180,8 @@ async def resultado_operativo(proyecto_id: int = 1):
         ajustes = [dict(r) for r in await con.fetch(
             "SELECT fase, tipo, SUM(monto) AS monto FROM venta_ajustes "
             "WHERE proyecto_id = $1 GROUP BY fase, tipo", proyecto_id)]
-        fases_rows = await con.fetch(
-            "SELECT codigo AS fase, descripcion FROM ev_partidas WHERE codigo IN "
-            "(SELECT DISTINCT fase FROM ev_partidas WHERE fase IS NOT NULL)")
+        from routers.fases import FASES_DESC_SQL
+        fases_rows = await con.fetch(FASES_DESC_SQL, proyecto_id)
 
     tarifas = {r["cargo"]: float(r["costo_hh"]) for r in tar_rows}
     default = tarifas.get("(Default)")
