@@ -281,19 +281,59 @@ def main():
           f"status={r.status_code}/{r2.status_code} n={len(mias)}")
 
     r = c.post(f"{API}/campo/actividades/{act2.get('id')}/no-cumplida",
-               json={"supervisor_id": "SUPE2E", "causa": "Falta de materiales"})
+               json={"supervisor_id": "SUPE2E", "causa_cat": "MATERIALES",
+                     "causa": "No llegó el acero"})
     r2 = c.get(f"{API}/ev/programacion/semana", params={"proyecto_id": 1, "lunes": FECHA_TAREO})
     a2 = next((a for a in r2.json().get("actividades", []) if a["id"] == act2.get("id")), {})
-    check("P10 no-cumplida registra estado y causa",
+    check("P10 no-cumplida registra estado, categoría CNC y detalle",
           r.status_code == 200 and a2.get("estado") == "NO_CUMPLIDA"
-          and a2.get("causa_nc") == "Falta de materiales",
-          f"status={r.status_code} act={a2.get('estado')}/{a2.get('causa_nc')}")
+          and a2.get("causa_nc_cat") == "MATERIALES"
+          and a2.get("causa_nc") == "No llegó el acero",
+          f"status={r.status_code} act={a2.get('estado')}/{a2.get('causa_nc_cat')}")
 
     r = c.post(f"{API}/ev/programacion/actividades", json={
         "proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-NO-EXISTE-99",
         "titulo": "E2E OTM inválida"})
     check("P11 OTM inexistente -> 400 claro (no 500 sin CORS)",
           r.status_code == 400, f"status={r.status_code}")
+
+    # Last Planner: partida + restricciones (lookahead) + PPC/CNC (0021)
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-E2E",
+        "titulo": "E2E Con partida y restricción", "partida_id": p1["id"],
+        "supervisor_id": "SUPE2E"})
+    act3 = r.json() if r.status_code == 200 else {}
+    r2 = c.post(f"{API}/ev/programacion/actividades/{act3.get('id')}/restricciones",
+                json={"descripcion": "Llega el acero", "tipo": "MATERIALES",
+                      "responsable": "Logística"})
+    rest = r2.json() if r2.status_code == 200 else {}
+    r3 = c.get(f"{API}/ev/programacion/lookahead",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 3})
+    la = r3.json() if r3.status_code == 200 else {}
+    a3 = next((a for s in la.get("semanas", []) for a in s["actividades"]
+               if a["id"] == act3.get("id")), {})
+    check("P12 lookahead: actividad con partida y 1 restricción pendiente",
+          a3.get("rest_pend") == 1 and a3.get("partida_codigo") == "E2E-001"
+          and len(la.get("semanas", [])) == 3,
+          f"act={a3.get('rest_pend')}/{a3.get('partida_codigo')} sem={len(la.get('semanas', []))}")
+
+    r = c.put(f"{API}/ev/programacion/restricciones/{rest.get('id')}", json={"liberada": True})
+    r2 = c.get(f"{API}/ev/programacion/lookahead",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    a3 = next((a for s in r2.json().get("semanas", []) for a in s["actividades"]
+               if a["id"] == act3.get("id")), {})
+    check("P13 liberar la restricción deja la actividad lista (0 pendientes)",
+          r.status_code == 200 and r.json().get("liberada") is True
+          and a3.get("rest_pend") == 0, f"rest={a3.get('rest_pend')}")
+
+    r = c.get(f"{API}/ev/programacion/ppc", params={"proyecto_id": 1, "semanas": 26})
+    d = r.json() if r.status_code == 200 else {}
+    cnc_mat = next((x for x in d.get("cnc", []) if x["causa"] == "MATERIALES"), None)
+    sem_ppc = next((x for x in d.get("semanal", []) if x["comprometidas"] >= 3), None)
+    check("P14 PPC: Pareto registra MATERIALES y la semana calcula su PPC",
+          r.status_code == 200 and cnc_mat is not None and cnc_mat["n"] >= 1
+          and sem_ppc is not None and sem_ppc["ppc"] is not None,
+          f"cnc={d.get('cnc')} sem={sem_ppc}")
 
     print()
     if _fallas:

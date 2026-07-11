@@ -99,6 +99,43 @@ def test_no_cumplida_sin_causa_400():
     assert r.status_code == 400
 
 
+def test_no_cumplida_categoria_invalida_422():
+    r = _client().post("/campo/actividades/1/no-cumplida",
+                       json={"supervisor_id": "01", "causa_cat": "FLOJERA"},
+                       headers=_hdr("supervisor", "01"))
+    assert r.status_code == 422
+
+
+# ── Last Planner: lookahead / restricciones / PPC ────────────
+def test_lookahead_supervisor_403():
+    r = _client().get("/ev/programacion/lookahead", headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_ppc_supervisor_403():
+    r = _client().get("/ev/programacion/ppc", headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_restriccion_supervisor_no_crea_403():
+    r = _client().post("/ev/programacion/actividades/1/restricciones",
+                       json={"descripcion": "x"}, headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_restriccion_tipo_invalido_422():
+    r = _client().post("/ev/programacion/actividades/1/restricciones",
+                       json={"descripcion": "acero", "tipo": "MAGIA"},
+                       headers=_hdr("oficina"))
+    assert r.status_code == 422
+
+
+def test_restriccion_sin_descripcion_400():
+    r = _client().post("/ev/programacion/actividades/1/restricciones",
+                       json={"tipo": "MATERIALES"}, headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
 # ── Media firmada ────────────────────────────────────────────
 def test_media_sin_firma_403():
     # /media/* no exige token (la firma es la credencial) pero la firma inválida corta.
