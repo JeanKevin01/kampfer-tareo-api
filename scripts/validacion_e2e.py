@@ -197,6 +197,25 @@ def main():
           r.status_code == 200 and r.content[:4] == b"\xd0\xcf\x11\xe0",
           f"status={r.status_code}")
 
+    # M — matriz histórica (fechas × partidas/trabajadores)
+    r = c.get(f"{API}/ev/matriz", params={"desde": FECHA_BASE, "hasta": "2026-06-07",
+                                          "modo": "partidas", "otm": "OTM-E2E"})
+    mz = r.json() if r.status_code == 200 else {}
+    fila_p1 = next((f for f in mz.get("filas", []) if f["etiqueta"].startswith("E2E-001")), None)
+    check("M1 matriz partidas: E2E-001 con 11.5 HH el martes y total de columna 13.5",
+          r.status_code == 200 and fila_p1 is not None
+          and abs(fila_p1["celdas"].get(FECHA_TAREO, 0) - 11.5) < 0.01
+          and abs(mz.get("tot_col", {}).get(FECHA_TAREO, 0) - 13.5) < 0.01,
+          f"status={r.status_code} fila={fila_p1} tot={mz.get('tot_col')}")
+
+    r = c.get(f"{API}/ev/matriz", params={"desde": FECHA_BASE, "hasta": "2026-06-07",
+                                          "modo": "trabajadores", "otm": "OTM-E2E"})
+    mz = r.json() if r.status_code == 200 else {}
+    check("M2 matriz trabajadores: 2 filas y semanas etiquetadas",
+          r.status_code == 200 and len(mz.get("filas", [])) == 2
+          and len(mz.get("semanas", [])) >= 1,
+          f"filas={len(mz.get('filas', []))}")
+
     # F-PROG — calendario de programación + reportes de campo con fotos (0019)
     r = c.post(f"{API}/ev/programacion/actividades", json={
         "proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-E2E",
