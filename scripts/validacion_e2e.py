@@ -41,6 +41,10 @@ def check(nombre, cond, detalle=""):
 
 
 def limpiar_y_sembrar(cur):
+    cur.execute("DELETE FROM campo_fotos WHERE reporte_id IN "
+                "(SELECT id FROM campo_reportes WHERE otm_id='OTM-E2E')")
+    cur.execute("DELETE FROM campo_reportes WHERE otm_id='OTM-E2E'")
+    cur.execute("DELETE FROM prog_actividades WHERE titulo LIKE 'E2E %'")
     cur.execute("DELETE FROM fases WHERE codigo LIKE 'E2E-%'")
     cur.execute("DELETE FROM tareo_partida WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM registros WHERE otm_id='OTM-E2E'")
@@ -192,6 +196,58 @@ def main():
     check("F5 plantilla PU descarga .xls (magic bytes BIFF)",
           r.status_code == 200 and r.content[:4] == b"\xd0\xcf\x11\xe0",
           f"status={r.status_code}")
+
+    # F-PROG — calendario de programación + reportes de campo con fotos (0019)
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-E2E",
+        "titulo": "E2E Hormigonado losa", "responsable": "Cuadrilla 1"})
+    act = r.json() if r.status_code == 200 else {}
+    check("P1 crear actividad programada", r.status_code == 200 and act.get("estado") == "PROGRAMADO",
+          f"status={r.status_code} body={r.text[:150]}")
+
+    from io import BytesIO
+    from PIL import Image
+    buf = BytesIO()
+    Image.new("RGB", (900, 600), (180, 90, 30)).save(buf, "JPEG")
+    r = c.post(f"{API}/campo/reportes",
+               data={"proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-E2E",
+                     "supervisor_id": "SUPE2E", "descripcion": "Losa vaciada al 100%",
+                     "actividad_id": act.get("id")},
+               files=[("fotos", ("losa.jpg", buf.getvalue(), "image/jpeg"))])
+    check("P2 reporte de campo con foto", r.status_code == 200 and r.json().get("fotos") == 1,
+          f"status={r.status_code} body={r.text[:150]}")
+
+    r = c.get(f"{API}/ev/programacion/semana", params={"proyecto_id": 1, "lunes": FECHA_TAREO})
+    sem = r.json() if r.status_code == 200 else {}
+    act_sem = next((a for a in sem.get("actividades", []) if a["id"] == act.get("id")), None)
+    rep_sem = next((x for x in sem.get("reportes", []) if x["otm_id"] == "OTM-E2E"), None)
+    check("P3 semana: actividad EJECUTADO (reporte la ejecuta) + reporte con foto",
+          act_sem is not None and act_sem["estado"] == "EJECUTADO"
+          and rep_sem is not None and len(rep_sem["fotos"]) == 1
+          and rep_sem["fotos"][0]["url"], f"act={act_sem and act_sem.get('estado')}")
+
+    url_foto = rep_sem["fotos"][0]["url"] if rep_sem and rep_sem["fotos"] else ""
+    r = c.get(f"{API}{url_foto}")
+    check("P4 URL firmada sirve el JPEG", r.status_code == 200 and r.content[:2] == b"\xff\xd8",
+          f"status={r.status_code}")
+    r = c.get(f"{API}{url_foto[:-4]}0000")
+    check("P5 firma corrupta -> 403", r.status_code == 403, f"status={r.status_code}")
+
+    r = c.get(f"{API}/ev/programacion/media-uso", params={"proyecto_id": 1})
+    uso = r.json() if r.status_code == 200 else []
+    sem_iso = next((u for u in uso if u["n_fotos"] >= 1 and u["bytes_en_disco"] > 0), None)
+    check("P6 media-uso reporta bytes por semana", sem_iso is not None, f"uso={uso}")
+
+    r = c.delete(f"{API}/ev/programacion/actividades/{act.get('id')}")
+    check("P7 DELETE actividad con reporte -> 409", r.status_code == 409, f"status={r.status_code}")
+
+    r = c.post(f"{API}/ev/programacion/purgar",
+               json={"proyecto_id": 1, "semana_iso": sem_iso["semana_iso"] if sem_iso else ""})
+    purga = r.json() if r.status_code == 200 else {}
+    r2 = c.get(f"{API}{url_foto}")
+    check("P8 purga libera bytes y la foto ya no se sirve",
+          r.status_code == 200 and purga.get("fotos_purgadas", 0) >= 1 and r2.status_code == 404,
+          f"purga={purga} get={r2.status_code}")
 
     print()
     if _fallas:

@@ -41,6 +41,10 @@ async def require_key(
         return
     if request.url.path in _PUBLIC_PATHS or request.method == "OPTIONS":
         return
+    # /media/*: la credencial es la URL FIRMADA (HMAC + expiración, ver core/media.py);
+    # el router valida la firma. Los <img> del panel no pueden mandar headers.
+    if request.url.path.startswith("/media/"):
+        return
     # 1) Integraciones (n8n): API key compartida en X-API-Key
     if _api_key_ok(x_api_key):
         return

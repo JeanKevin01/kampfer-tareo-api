@@ -5,3 +5,6 @@ __pycache__/
 .env
 .env.*
 *.log
+
+# Fotos de reportes de campo en dev (en prod = volumen MEDIA_DIR)
+media/

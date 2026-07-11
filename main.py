@@ -22,6 +22,9 @@ from core.db import db as core_db, close_pool
 from core.log import setup_logging, get_logger
 from routers.fases import router as fases_router
 from routers.jornada import router as jornada_router
+from routers.media import router as media_router
+from routers.programacion import (router as programacion_router,
+                                  router_campo as programacion_router_campo)
 from routers.monitor import router as monitor_router
 from routers.otms import router as otms_router
 from routers.padron import router as padron_router
@@ -128,6 +131,11 @@ app.include_router(ro_proyeccion_router, dependencies=[Depends(require_role("ofi
 app.include_router(valorizaciones_router, dependencies=[Depends(require_role("oficina"))])
 # Mejoras UX pre-F4: catálogo de fases (oficina).
 app.include_router(fases_router, dependencies=[Depends(require_role("oficina"))])
+# Mejoras UX pre-F4: calendario de programación (oficina) + reportes de campo
+# (supervisor autenticado) + media firmada (la firma es la credencial).
+app.include_router(programacion_router, dependencies=[Depends(require_role("oficina"))])
+app.include_router(programacion_router_campo, dependencies=[Depends(require_role())])
+app.include_router(media_router)
 # F0.5: dominios que antes vivían en este archivo.
 app.include_router(tareo_router)
 app.include_router(padron_router)

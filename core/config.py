@@ -19,6 +19,11 @@ JWT_SECRET = (os.getenv("JWT_SECRET", "").strip() or _DEFAULT_JWT_SECRET)
 TOKEN_TTL  = int(os.getenv("TOKEN_TTL_SEG", str(60 * 60 * 12)))   # 12 h por defecto
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", _DEFAULT_ADMIN_PW)   # solo para el seed inicial
 
+# ── Media (fotos de reportes de campo) ────────────────────────
+# En prod = volumen persistente de Coolify (p. ej. /data/media). Sin el volumen,
+# las fotos viven en el filesystem efímero del contenedor y mueren al redeploy.
+MEDIA_DIR = os.getenv("MEDIA_DIR", "./media").strip() or "./media"
+
 
 def validar_secretos_arranque():
     """Fail-closed (EPIC 0.4.1): en producción NO arrancar con secretos por defecto
