@@ -9,7 +9,10 @@
 # Toda fila ilegible se reporta con su número; con errores NO se permite
 # confirmar (no hay import parcial). Se monta en main.py con rol oficina.
 # ============================================================
+from pathlib import Path
+
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 
 from core.db import db
 from core.log import get_logger
@@ -37,6 +40,16 @@ def _resumen(res) -> dict:
         "errores": res.errores,
         "avisos": res.avisos,
     }
+
+
+@router.get("/plantilla-pu")
+async def plantilla_pu():
+    """Plantilla .xls de ejemplo del formato PU (hojas PtoMeta y PU-Meta)."""
+    ruta = Path(__file__).resolve().parent.parent / "static" / "plantilla_pu.xls"
+    if not ruta.exists():
+        raise HTTPException(404, "Plantilla no disponible en este despliegue")
+    return FileResponse(ruta, media_type="application/vnd.ms-excel",
+                        filename="plantilla_pu.xls")
 
 
 @router.post("/importar-pu")
