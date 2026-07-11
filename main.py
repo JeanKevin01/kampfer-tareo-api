@@ -70,7 +70,12 @@ async def lifespan(app: FastAPI):
             "VALUES ('admin', $1, 'admin', 'Administrador')",
             _hash_pw(config.ADMIN_PASSWORD),
         )
+    # Purga automática de fotos por retención (mejoras UX pre-F4): diaria.
+    import asyncio
+    from routers.programacion import purga_automatica_loop
+    _purga_task = asyncio.create_task(purga_automatica_loop())
     yield
+    _purga_task.cancel()
     await close_pool()   # F0.4: antes el pool de valor_ganado nunca se cerraba
 
 

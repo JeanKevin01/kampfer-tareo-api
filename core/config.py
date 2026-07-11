@@ -23,6 +23,10 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", _DEFAULT_ADMIN_PW)   # solo para el
 # En prod = volumen persistente de Coolify (p. ej. /data/media). Sin el volumen,
 # las fotos viven en el filesystem efímero del contenedor y mueren al redeploy.
 MEDIA_DIR = os.getenv("MEDIA_DIR", "./media").strip() or "./media"
+# Retención de fotos en disco (decisión de Jean: ~2 meses para que el ingeniero
+# de costos pueda revisar; el PDF semanal es el archivo permanente). La purga
+# automática corre a diario y borra las semanas más viejas que esto.
+MEDIA_RETENCION_SEMANAS = int(os.getenv("MEDIA_RETENCION_SEMANAS", "9"))
 
 
 def validar_secretos_arranque():

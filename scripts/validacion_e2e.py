@@ -268,6 +268,33 @@ def main():
           r.status_code == 200 and purga.get("fotos_purgadas", 0) >= 1 and r2.status_code == 404,
           f"purga={purga} get={r2.status_code}")
 
+    # Flujo del supervisor: actividad asignada + causa de no cumplimiento (0020)
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-E2E",
+        "titulo": "E2E Montaje faja", "supervisor_id": "SUPE2E"})
+    act2 = r.json() if r.status_code == 200 else {}
+    r2 = c.get(f"{API}/campo/mis-actividades",
+               params={"fecha": FECHA_TAREO, "supervisor_id": "SUPE2E"})
+    mias = r2.json() if r2.status_code == 200 else []
+    check("P9 actividad asignada aparece en mis-actividades del supervisor",
+          r.status_code == 200 and any(a["id"] == act2.get("id") for a in mias),
+          f"status={r.status_code}/{r2.status_code} n={len(mias)}")
+
+    r = c.post(f"{API}/campo/actividades/{act2.get('id')}/no-cumplida",
+               json={"supervisor_id": "SUPE2E", "causa": "Falta de materiales"})
+    r2 = c.get(f"{API}/ev/programacion/semana", params={"proyecto_id": 1, "lunes": FECHA_TAREO})
+    a2 = next((a for a in r2.json().get("actividades", []) if a["id"] == act2.get("id")), {})
+    check("P10 no-cumplida registra estado y causa",
+          r.status_code == 200 and a2.get("estado") == "NO_CUMPLIDA"
+          and a2.get("causa_nc") == "Falta de materiales",
+          f"status={r.status_code} act={a2.get('estado')}/{a2.get('causa_nc')}")
+
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-NO-EXISTE-99",
+        "titulo": "E2E OTM inválida"})
+    check("P11 OTM inexistente -> 400 claro (no 500 sin CORS)",
+          r.status_code == 400, f"status={r.status_code}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")

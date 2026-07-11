@@ -83,3 +83,13 @@ def test_semana_iso():
     assert semana_iso_de(date(2026, 7, 6)) == "2026-W28"    # lunes
     assert semana_iso_de(date(2026, 7, 12)) == "2026-W28"   # domingo de la misma
     assert semana_iso_de(date(2026, 1, 1)) == "2026-W01"
+
+
+def test_semana_iso_a_lunes_ida_y_vuelta():
+    from core.media import semana_iso_a_lunes
+    assert semana_iso_a_lunes("2026-W28") == date(2026, 7, 6)
+    for f in (date(2026, 7, 9), date(2026, 1, 1)):
+        lunes = semana_iso_a_lunes(semana_iso_de(f))
+        assert lunes is not None and lunes <= f and (f - lunes).days < 7
+    assert semana_iso_a_lunes("basura") is None
+    assert semana_iso_a_lunes("") is None

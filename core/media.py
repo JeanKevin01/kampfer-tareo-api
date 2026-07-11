@@ -39,6 +39,15 @@ def semana_iso_de(fecha: date) -> str:
     return f"{y}-W{w:02d}"
 
 
+def semana_iso_a_lunes(semana_iso: str) -> Optional[date]:
+    """'2026-W28' → el lunes de esa semana (None si el formato no es válido)."""
+    try:
+        y, w = semana_iso.split("-W")
+        return date.fromisocalendar(int(y), int(w), 1)
+    except (ValueError, AttributeError):
+        return None
+
+
 # ── Procesado de imagen (Pillow) ─────────────────────────────
 def procesar_imagen(data: bytes) -> Tuple[bytes, bytes, int, int]:
     """(jpg_principal, jpg_thumb, ancho, alto). ValueError si no es imagen válida."""

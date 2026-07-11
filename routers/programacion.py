@@ -9,16 +9,18 @@
 # Regla del calendario combinado: cuando llega un reporte vinculado a una
 # actividad PROGRAMADO, la actividad pasa sola a EJECUTADO.
 # ============================================================
+import asyncio
 from datetime import date, timedelta
 from typing import List, Optional
 
+import asyncpg
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from core.auth import exigir_identidad_supervisor, require_role
 from core.db import db
 from core.log import get_logger
 from core.media import (MAX_FOTO_BYTES, MAX_FOTOS_POR_REPORTE, guardar_foto,
-                        media_dir, url_firmada)
+                        media_dir, semana_iso_a_lunes, url_firmada)
 from core.tiempo import fecha_lima, parse_fecha
 
 log = get_logger("programacion")
@@ -26,7 +28,12 @@ log = get_logger("programacion")
 router = APIRouter(prefix="/ev/programacion", tags=["programacion"])
 router_campo = APIRouter(prefix="/campo", tags=["programacion"])
 
-_ESTADOS = ("PROGRAMADO", "EJECUTADO", "CANCELADO")
+_ESTADOS = ("PROGRAMADO", "EJECUTADO", "CANCELADO", "NO_CUMPLIDA")
+
+# Errores de datos del usuario (FK inexistente, texto demasiado largo…): deben
+# responder 400 — un 500 del handler global sale sin headers CORS y el panel
+# lo muestra como "Failed to fetch".
+_ERRORES_DATO = (asyncpg.IntegrityConstraintViolationError, asyncpg.DataError)
 
 
 def _lunes_de(fecha: date) -> date:
@@ -49,8 +56,10 @@ async def semana(proyecto_id: int = 1, lunes: str = ""):
     pool = await db()
     async with pool.acquire() as con:
         acts = [dict(r) for r in await con.fetch(
-            """SELECT a.*, o.descripcion AS otm_desc
-               FROM prog_actividades a LEFT JOIN otms o ON o.id = a.otm_id
+            """SELECT a.*, o.descripcion AS otm_desc, s.nombre AS supervisor_nombre
+               FROM prog_actividades a
+               LEFT JOIN otms o ON o.id = a.otm_id
+               LEFT JOIN supervisores s ON s.id = a.supervisor_id
                WHERE a.proyecto_id = $1 AND a.fecha BETWEEN $2 AND $3
                ORDER BY a.fecha, a.id""", proyecto_id, fechas[0], fechas[6])]
         reps = [dict(r) for r in await con.fetch(
@@ -87,15 +96,20 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
     if not fecha or not titulo:
         raise HTTPException(400, "fecha y titulo son obligatorios")
     pool = await db()
-    row = await pool.fetchrow(
-        """INSERT INTO prog_actividades
-           (proyecto_id, fecha, otm_id, partida_id, titulo, descripcion, responsable, creado_por)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *""",
-        int(data.get("proyecto_id") or 1), fecha,
-        (str(data["otm_id"]).strip() or None) if data.get("otm_id") else None,
-        int(data["partida_id"]) if data.get("partida_id") else None,
-        titulo, data.get("descripcion") or None, data.get("responsable") or None,
-        user.get("sub"))
+    try:
+        row = await pool.fetchrow(
+            """INSERT INTO prog_actividades
+               (proyecto_id, fecha, otm_id, partida_id, titulo, descripcion,
+                responsable, supervisor_id, creado_por)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *""",
+            int(data.get("proyecto_id") or 1), fecha,
+            (str(data["otm_id"]).strip() or None) if data.get("otm_id") else None,
+            int(data["partida_id"]) if data.get("partida_id") else None,
+            titulo, data.get("descripcion") or None, data.get("responsable") or None,
+            (str(data["supervisor_id"]).strip() or None) if data.get("supervisor_id") else None,
+            user.get("sub"))
+    except _ERRORES_DATO:
+        raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
     return dict(row)
 
 
@@ -111,7 +125,7 @@ async def editar_actividad(act_id: int, data: dict):
         if not f:
             raise HTTPException(400, "fecha inválida")
         campos.append("fecha"); valores.append(f)
-    for k in ("titulo", "descripcion", "responsable", "otm_id"):
+    for k in ("titulo", "descripcion", "responsable", "otm_id", "supervisor_id", "causa_nc"):
         if k in data:
             v = str(data[k]).strip() if data[k] is not None else None
             if k == "titulo" and not v:
@@ -124,9 +138,12 @@ async def editar_actividad(act_id: int, data: dict):
         raise HTTPException(400, "Nada que actualizar")
     sets = ", ".join(f"{c} = ${i + 2}" for i, c in enumerate(campos))
     pool = await db()
-    row = await pool.fetchrow(
-        f"UPDATE prog_actividades SET {sets}, actualizado_en = now() "
-        f"WHERE id = $1 RETURNING *", act_id, *valores)
+    try:
+        row = await pool.fetchrow(
+            f"UPDATE prog_actividades SET {sets}, actualizado_en = now() "
+            f"WHERE id = $1 RETURNING *", act_id, *valores)
+    except _ERRORES_DATO:
+        raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
     if not row:
         raise HTTPException(404, "Actividad no encontrada")
     return dict(row)
@@ -177,20 +194,62 @@ async def purgar_semana(data: dict, user: dict = Depends(require_role("oficina")
                JOIN campo_reportes r ON r.id = f.reporte_id
                WHERE r.proyecto_id = $1 AND f.semana_iso = $2 AND NOT f.purgada""",
             proyecto_id, semana_iso)
-        liberados = 0
-        for f in fotos:
-            for ruta in (f["ruta"], f["ruta_thumb"]):
-                p = media_dir() / ruta
-                if p.is_file():
-                    liberados += p.stat().st_size
-                    p.unlink()
-        if fotos:
-            await con.execute(
-                "UPDATE campo_fotos SET purgada = true WHERE id = ANY($1::int[])",
-                [f["id"] for f in fotos])
-    log.info("purga de media", extra={"semana": semana_iso, "fotos": len(fotos),
+        n, liberados = await _purgar_fotos(con, fotos)
+    log.info("purga de media", extra={"semana": semana_iso, "fotos": n,
                                       "bytes": liberados, "por": user.get("sub")})
-    return {"fotos_purgadas": len(fotos), "bytes_liberados": liberados}
+    return {"fotos_purgadas": n, "bytes_liberados": liberados}
+
+
+async def _purgar_fotos(con, fotos) -> tuple:
+    """Borra del disco (original + thumb) y marca purgada. Devuelve (n, bytes)."""
+    liberados = 0
+    for f in fotos:
+        for ruta in (f["ruta"], f["ruta_thumb"]):
+            p = media_dir() / ruta
+            if p.is_file():
+                liberados += p.stat().st_size
+                p.unlink()
+    if fotos:
+        await con.execute(
+            "UPDATE campo_fotos SET purgada = true WHERE id = ANY($1::int[])",
+            [f["id"] for f in fotos])
+    return len(fotos), liberados
+
+
+async def purgar_semanas_antiguas() -> dict:
+    """Purga AUTOMÁTICA por retención (decisión de Jean: conservar ~2 meses para
+    que el ingeniero de costos pueda revisar; el PDF semanal es el archivo
+    permanente). Purga las semanas ISO cuyo lunes es más viejo que
+    MEDIA_RETENCION_SEMANAS. La corre el loop diario del lifespan."""
+    from core import config
+    corte = fecha_lima() - timedelta(weeks=config.MEDIA_RETENCION_SEMANAS)
+    pool = await db()
+    total_n, total_b = 0, 0
+    async with pool.acquire() as con:
+        semanas = [r["semana_iso"] for r in await con.fetch(
+            "SELECT DISTINCT semana_iso FROM campo_fotos WHERE NOT purgada")]
+        for semana in semanas:
+            lunes = semana_iso_a_lunes(semana)
+            if lunes is None or lunes >= corte:
+                continue
+            fotos = await con.fetch(
+                "SELECT id, ruta, ruta_thumb FROM campo_fotos "
+                "WHERE semana_iso = $1 AND NOT purgada", semana)
+            n, b = await _purgar_fotos(con, fotos)
+            total_n += n
+            total_b += b
+            log.info("purga automática", extra={"semana": semana, "fotos": n, "bytes": b})
+    return {"fotos_purgadas": total_n, "bytes_liberados": total_b}
+
+
+async def purga_automatica_loop():
+    """Tarea de fondo (lifespan): purga por retención al arrancar y cada 24 h."""
+    while True:
+        try:
+            await purgar_semanas_antiguas()
+        except Exception:
+            log.exception("purga automática falló (reintenta en 24h)")
+        await asyncio.sleep(24 * 3600)
 
 
 # ── Campo: el supervisor reporta con fotos ───────────────────
@@ -205,6 +264,43 @@ async def programacion_dia(fecha: str = "", otm_id: str = ""):
              AND (otm_id = $2 OR otm_id IS NULL)
            ORDER BY id""", f, otm_id or None)
     return [dict(r) for r in rows]
+
+
+@router_campo.get("/mis-actividades")
+async def mis_actividades(supervisor_id: str, fecha: str = "",
+                          user: dict = Depends(require_role())):
+    """Las actividades del día asignadas a ESTE supervisor (todas sus OTMs) —
+    el flujo A de la app de campo: la agenda que el planner le dejó."""
+    exigir_identidad_supervisor(user, supervisor_id)
+    f = parse_fecha(fecha) or fecha_lima()
+    pool = await db()
+    rows = await pool.fetch(
+        """SELECT a.id, a.titulo, a.descripcion, a.estado, a.causa_nc,
+                  a.otm_id, o.descripcion AS otm_desc, a.responsable
+           FROM prog_actividades a LEFT JOIN otms o ON o.id = a.otm_id
+           WHERE a.fecha = $1 AND a.supervisor_id = $2 AND a.estado <> 'CANCELADO'
+           ORDER BY a.id""", f, supervisor_id)
+    return [dict(r) for r in rows]
+
+
+@router_campo.post("/actividades/{act_id}/no-cumplida")
+async def marcar_no_cumplida(act_id: int, data: dict,
+                             user: dict = Depends(require_role())):
+    """El supervisor registra la CAUSA DE NO CUMPLIMIENTO de una actividad
+    programada que no se ejecutó (estilo Last Planner)."""
+    supervisor_id = str(data.get("supervisor_id") or "").strip()
+    causa = str(data.get("causa") or "").strip()
+    exigir_identidad_supervisor(user, supervisor_id)
+    if not causa:
+        raise HTTPException(400, "Indica la causa de no cumplimiento")
+    pool = await db()
+    row = await pool.fetchrow(
+        """UPDATE prog_actividades
+           SET estado = 'NO_CUMPLIDA', causa_nc = $2, actualizado_en = now()
+           WHERE id = $1 AND estado = 'PROGRAMADO' RETURNING id""", act_id, causa)
+    if not row:
+        raise HTTPException(409, "La actividad no existe o ya no está PROGRAMADO")
+    return {"ok": True, "estado": "NO_CUMPLIDA"}
 
 
 @router_campo.post("/reportes")
@@ -239,12 +335,15 @@ async def crear_reporte(
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
-            rid = await con.fetchval(
-                """INSERT INTO campo_reportes
-                   (proyecto_id, fecha, otm_id, actividad_id, supervisor_id, descripcion)
-                   VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
-                proyecto_id, f_rep, otm_id.strip(), actividad_id,
-                supervisor_id.strip(), descripcion.strip() or None)
+            try:
+                rid = await con.fetchval(
+                    """INSERT INTO campo_reportes
+                       (proyecto_id, fecha, otm_id, actividad_id, supervisor_id, descripcion)
+                       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
+                    proyecto_id, f_rep, otm_id.strip(), actividad_id,
+                    supervisor_id.strip(), descripcion.strip() or None)
+            except _ERRORES_DATO:
+                raise HTTPException(400, "OTM, actividad o supervisor inválido: revisa los datos")
             for g in guardadas:
                 await con.execute(
                     """INSERT INTO campo_fotos

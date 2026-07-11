@@ -79,6 +79,26 @@ def test_reporte_vacio_400():
     assert r.status_code == 400
 
 
+def test_mis_actividades_suplantado_403():
+    r = _client().get("/campo/mis-actividades?supervisor_id=02",
+                      headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_no_cumplida_suplantado_403():
+    r = _client().post("/campo/actividades/1/no-cumplida",
+                       json={"supervisor_id": "02", "causa": "lluvia"},
+                       headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_no_cumplida_sin_causa_400():
+    r = _client().post("/campo/actividades/1/no-cumplida",
+                       json={"supervisor_id": "01", "causa": "  "},
+                       headers=_hdr("supervisor", "01"))
+    assert r.status_code == 400
+
+
 # ── Media firmada ────────────────────────────────────────────
 def test_media_sin_firma_403():
     # /media/* no exige token (la firma es la credencial) pero la firma inválida corta.
