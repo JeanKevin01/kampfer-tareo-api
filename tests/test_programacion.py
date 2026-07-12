@@ -136,6 +136,74 @@ def test_restriccion_sin_descripcion_400():
     assert r.status_code == 400
 
 
+# ── Lookahead-grid / metrado diario (vista Excel del ex-gerente) ──
+def test_lookahead_grid_supervisor_403():
+    r = _client().get("/ev/programacion/lookahead-grid", headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_metrado_dias_sin_dias_400():
+    r = _client().put("/ev/programacion/actividades/1/metrado-dias",
+                      json={}, headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_metrado_dias_fecha_invalida_400():
+    r = _client().put("/ev/programacion/actividades/1/metrado-dias",
+                      json={"dias": {"no-es-fecha": 5}}, headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_metrado_dias_cantidad_negativa_400():
+    r = _client().put("/ev/programacion/actividades/1/metrado-dias",
+                      json={"dias": {"2026-07-13": -1}}, headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_avance_dia_sin_partida_400():
+    r = _client().post("/ev/programacion/avance-dia",
+                       json={"fecha": "2026-07-13", "cantidad": 5}, headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_avance_dia_supervisor_403():
+    r = _client().post("/ev/programacion/avance-dia",
+                       json={"partida_id": 1, "fecha": "2026-07-13", "cantidad": 5},
+                       headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_crear_actividad_rango_invertido_400():
+    r = _client().post("/ev/programacion/actividades",
+                       json={"fecha": "2026-07-15", "fecha_fin": "2026-07-13", "titulo": "x"},
+                       headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_crear_actividad_metrado_negativo_400():
+    r = _client().post("/ev/programacion/actividades",
+                       json={"fecha": "2026-07-13", "titulo": "x", "metrado_prog": -3},
+                       headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_distribuir_uniforme_suma_exacta():
+    from datetime import date
+    from routers.programacion import _distribuir
+    d = _distribuir(100.0, date(2026, 7, 13), date(2026, 7, 15))
+    assert len(d) == 3
+    assert d[date(2026, 7, 13)] == 33.333
+    assert d[date(2026, 7, 15)] == 33.334          # el último día absorbe el redondeo
+    assert round(sum(d.values()), 3) == 100.0
+
+
+def test_distribuir_un_dia():
+    from datetime import date
+    from routers.programacion import _distribuir
+    d = _distribuir(87.593, date(2026, 7, 13), date(2026, 7, 13))
+    assert d == {date(2026, 7, 13): 87.593}
+
+
 # ── Media firmada ────────────────────────────────────────────
 def test_media_sin_firma_403():
     # /media/* no exige token (la firma es la credencial) pero la firma inválida corta.

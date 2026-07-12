@@ -58,6 +58,8 @@ def limpiar_y_sembrar(cur):
     cur.execute("DELETE FROM ev_hitos WHERE partida_id IN "
                 "(SELECT id FROM ev_partidas WHERE codigo LIKE 'E2E-%')")
     # Residuos de smokes de F2 en BDs locales reutilizadas:
+    cur.execute("DELETE FROM ev_avances_diarios WHERE partida_id IN "
+                "(SELECT id FROM ev_partidas WHERE codigo LIKE 'E2E-%')")
     cur.execute("DELETE FROM valorizacion_lineas WHERE partida_id IN "
                 "(SELECT id FROM ev_partidas WHERE codigo LIKE 'E2E-%')")
     cur.execute("DELETE FROM ev_valorizado WHERE partida_id IN "
@@ -334,6 +336,44 @@ def main():
           r.status_code == 200 and cnc_mat is not None and cnc_mat["n"] >= 1
           and sem_ppc is not None and sem_ppc["ppc"] is not None,
           f"cnc={d.get('cnc')} sem={sem_ppc}")
+
+    # Lookahead-grid con metrado diario (0022 — plantillas Anexo 01 / F030b)
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": FECHA_TAREO, "fecha_fin": "2026-06-04",
+        "otm_id": "OTM-E2E", "titulo": "E2E Relleno con metrado",
+        "partida_id": p2["id"], "metrado_prog": 90})
+    act4 = r.json() if r.status_code == 200 else {}
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 2})
+    grid = r2.json() if r2.status_code == 200 else {}
+    ga = next((a for g in grid.get("grupos", []) for a in g["actividades"]
+               if a["id"] == act4.get("id")), {})
+    check("P15 lookahead-grid distribuye 90 en 3 días (30/30/30) agrupado por OTM",
+          r.status_code == 200 and ga.get("metrado_prog") == 90
+          and ga.get("prog", {}).get(FECHA_TAREO) == 30
+          and ga.get("prog", {}).get("2026-06-04") == 30
+          and len(grid.get("fechas", [])) == 14,
+          f"status={r.status_code} prog={ga.get('prog')}")
+
+    r = c.put(f"{API}/ev/programacion/actividades/{act4.get('id')}/metrado-dias",
+              json={"dias": {"2026-06-03": 50}})
+    check("P16 editar una celda recalcula el total (30+50+30=110)",
+          r.status_code == 200 and r.json().get("metrado_prog") == 110,
+          f"status={r.status_code} total={r.json().get('metrado_prog') if r.status_code == 200 else '-'}")
+
+    r = c.post(f"{API}/ev/programacion/avance-dia",
+               json={"partida_id": p2["id"], "fecha": FECHA_TAREO, "cantidad": 2.5})
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    ga = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act4.get("id")), {})
+    r3 = c.get(f"{API}/ev/semana-grid", params={"semana": 1, "otm": "OTM-E2E"})
+    fila_ev = next((p for p in r3.json().get("partidas", []) if p["id"] == p2["id"]), {})
+    cant_ev = (fila_ev.get("dias", {}).get(FECHA_TAREO) or {}).get("cant_ejecutada")
+    check("P17 avance real: aparece en el grid Y en /ev/semana-grid (las 2 vías, un dato)",
+          ga.get("real", {}).get(FECHA_TAREO) == 2.5 and cant_ev == 2.5
+          and ga.get("saldo") == 2.5,   # metrado_presup 5 - 2.5
+          f"real={ga.get('real')} ev={cant_ev} saldo={ga.get('saldo')}")
 
     print()
     if _fallas:
