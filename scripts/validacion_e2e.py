@@ -443,10 +443,27 @@ def main():
           and g6.get("prog", {}).get("2026-06-05") == 26,
           f"prog={g6.get('prog')}")
 
+    # P22: registrar avance en un día intermedio NO toca los días anteriores
+    # (act6: rango 02-05, prog {02:30 congelado, 03:26, 04:26, 05:26}, real 02=12)
+    r = c.post(f"{API}/ev/programacion/actividades/{act6.get('id')}/avance-dia",
+               json={"fecha": "2026-06-04", "cantidad": 26})
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    g6 = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act6.get("id")), {})
+    check("P22 avance en día intermedio: los anteriores quedan intactos y el saldo cae después (05=52)",
+          r.status_code == 200
+          and g6.get("prog", {}).get("2026-06-03") == 26      # anterior: intacto
+          and g6.get("prog", {}).get("2026-06-04") == 26      # el registrado: congelado
+          and g6.get("prog", {}).get("2026-06-05") == 52      # 90-12-26 en el único día posterior
+          and g6.get("real", {}).get("2026-06-04") == 26,
+          f"prog={g6.get('prog')} real={g6.get('real')}")
+
     # restaurar el calendario para no contaminar corridas parciales
     c.put(f"{API}/ev/programacion/config", json={"proyecto_id": 1, "dias_semana": [1, 2, 3, 4, 5, 6, 7]})
-    c.post(f"{API}/ev/programacion/actividades/{act6.get('id')}/avance-dia",
-           json={"fecha": FECHA_TAREO, "cantidad": None})
+    for fx in (FECHA_TAREO, "2026-06-04"):
+        c.post(f"{API}/ev/programacion/actividades/{act6.get('id')}/avance-dia",
+               json={"fecha": fx, "cantidad": None})
 
     print()
     if _fallas:

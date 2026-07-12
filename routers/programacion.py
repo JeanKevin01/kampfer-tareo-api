@@ -92,15 +92,18 @@ def _dias_habiles(desde: date, hasta: date, dias_semana: set, feriados: set,
             and d not in feriados and d not in saltos]
 
 
-async def _redistribuir(con, act: dict) -> None:
-    """Recalcula la distribución diaria del metrado de la actividad:
+async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) -> None:
+    """Recalcula la distribución diaria del metrado de la actividad. El metrado
+    META es inmutable aquí (solo se cambia desde el formulario):
       · salta los días no laborables (prog_config + prog_feriados) y los
         saltos intencionales de la actividad (dias_salto);
       · los días que YA tienen avance real registrado quedan CONGELADOS
-        (su programado es la línea contra la que se compara el cumplimiento)
-        y el SALDO (metrado − real acumulado) se re-prorratea entre los
-        días hábiles restantes — así la actividad sigue apuntando a terminar
-        en su F.Fin con lo que falta."""
+        (su programado es la línea contra la que se compara el cumplimiento);
+      · el SALDO (metrado − real acumulado) se re-prorratea entre los días
+        hábiles restantes — así la actividad sigue apuntando a terminar en
+        su F.Fin con lo que falta.
+    Con solo_despues_de (al registrar un avance): los días ANTERIORES no se
+    tocan ("eso ya se hizo") y el saldo cae solo en los días posteriores."""
     desde, hasta = act["fecha"], act["fecha_fin"] or act["fecha"]
     dias_semana, feriados = await _calendario(con, act["proyecto_id"], desde, hasta)
     saltos = set(act.get("dias_salto") or [])
@@ -114,15 +117,18 @@ async def _redistribuir(con, act: dict) -> None:
                  AND cantidad_dia IS NOT NULL""",
             act["partida_id"], desde, hasta)}
 
-    # Se borran solo las celdas NO congeladas (las de días con real se quedan).
+    intactos = set(reales)
+    if solo_despues_de:
+        intactos |= {d for d in habiles if d <= solo_despues_de}
+    # Se borran solo las celdas que se van a recalcular.
     await con.execute(
         "DELETE FROM prog_metrado_dia WHERE actividad_id = $1"
-        " AND NOT (fecha = ANY($2::date[]))", act["id"], list(reales))
+        " AND NOT (fecha = ANY($2::date[]))", act["id"], list(intactos))
     metrado = float(act["metrado_prog"] or 0)
     if metrado <= 0:
         return
     saldo = round(metrado - sum(reales.values()), 3)
-    restantes = [d for d in habiles if d not in reales]
+    restantes = [d for d in habiles if d not in intactos]
     if saldo <= 0 or not restantes:
         return
     await con.executemany(
@@ -465,7 +471,9 @@ async def avance_dia_actividad(act_id: int, data: dict):
                        ON CONFLICT (partida_id, fecha)
                        DO UPDATE SET cantidad_dia = $4, registrado_en = NOW()""",
                     act["partida_id"], f, semana, cantidad)
-            await _redistribuir(con, dict(act))
+            # Los días anteriores al registrado no se tocan; el saldo para
+            # cumplir el metrado meta se re-prorratea en los días siguientes.
+            await _redistribuir(con, dict(act), solo_despues_de=f)
     return {"ok": True, "cantidad": cantidad}
 
 
