@@ -44,7 +44,7 @@ def limpiar_y_sembrar(cur):
     cur.execute("DELETE FROM campo_fotos WHERE reporte_id IN "
                 "(SELECT id FROM campo_reportes WHERE otm_id='OTM-E2E')")
     cur.execute("DELETE FROM campo_reportes WHERE otm_id='OTM-E2E'")
-    cur.execute("DELETE FROM prog_actividades WHERE titulo LIKE 'E2E %'")
+    cur.execute("DELETE FROM prog_actividades WHERE titulo LIKE 'E2E %' OR otm_id='OTM-E2E'")
     cur.execute("DELETE FROM fases WHERE codigo LIKE 'E2E-%'")
     cur.execute("DELETE FROM tareo_partida WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM registros WHERE otm_id='OTM-E2E'")
@@ -374,6 +374,26 @@ def main():
           ga.get("real", {}).get(FECHA_TAREO) == 2.5 and cant_ev == 2.5
           and ga.get("saldo") == 2.5,   # metrado_presup 5 - 2.5
           f"real={ga.get('real')} ev={cant_ev} saldo={ga.get('saldo')}")
+
+    # Programación por lote: N partidas → N actividades, metrado default = presupuesto
+    r = c.post(f"{API}/ev/programacion/actividades-lote", json={
+        "proyecto_id": 1, "otm_id": "OTM-E2E", "responsable": "Cuadrilla E2E",
+        "items": [
+            {"partida_id": p1["id"], "fecha": FECHA_TAREO, "fecha_fin": "2026-06-03"},
+            {"partida_id": p2["id"], "fecha": FECHA_TAREO, "metrado_prog": 4},
+        ]})
+    lote = r.json() if r.status_code == 200 else {}
+    a_l1 = next((a for a in lote.get("actividades", []) if a["partida_id"] == p1["id"]), {})
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    gl = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == a_l1.get("id")), {})
+    check("P18 lote: 2 partidas -> 2 actividades; sin metrado usa el del presupuesto (10) y prorratea 5/5",
+          lote.get("creadas") == 2 and a_l1.get("metrado_prog") == 10
+          and gl.get("prog", {}).get(FECHA_TAREO) == 5
+          and gl.get("prog", {}).get("2026-06-03") == 5
+          and a_l1.get("titulo") == "Partida E2E-001",
+          f"status={r.status_code} lote={lote.get('creadas')} prog={gl.get('prog')}")
 
     print()
     if _fallas:

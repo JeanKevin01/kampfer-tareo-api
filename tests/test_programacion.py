@@ -173,6 +173,34 @@ def test_avance_dia_supervisor_403():
     assert r.status_code == 403
 
 
+def test_lote_supervisor_403():
+    r = _client().post("/ev/programacion/actividades-lote",
+                       json={"otm_id": "OTM-X", "items": [{"partida_id": 1, "fecha": "2026-07-13"}]},
+                       headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_lote_sin_items_400():
+    r = _client().post("/ev/programacion/actividades-lote",
+                       json={"otm_id": "OTM-X", "items": []}, headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_lote_item_sin_fecha_400():
+    r = _client().post("/ev/programacion/actividades-lote",
+                       json={"otm_id": "OTM-X", "items": [{"partida_id": 1}]},
+                       headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_lote_rango_invertido_400():
+    r = _client().post("/ev/programacion/actividades-lote",
+                       json={"otm_id": "OTM-X", "items": [
+                           {"partida_id": 1, "fecha": "2026-07-15", "fecha_fin": "2026-07-13"}]},
+                       headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
 def test_crear_actividad_rango_invertido_400():
     r = _client().post("/ev/programacion/actividades",
                        json={"fecha": "2026-07-15", "fecha_fin": "2026-07-13", "titulo": "x"},

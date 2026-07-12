@@ -282,6 +282,66 @@ async def lookahead(proyecto_id: int = 1, desde: str = "", semanas: int = 4):
             "tipos_restriccion": list(_TIPOS_RESTRICCION)}
 
 
+@router.post("/actividades-lote")
+async def crear_actividades_lote(data: dict, user: dict = Depends(require_role("oficina"))):
+    """Programación por partidas (flujo LookAhead): el planner elige una OTM,
+    marca varias partidas del presupuesto y cada una se vuelve UNA actividad
+    con su rango F.Inic-F.Fin y su metrado meta. Si el item no trae metrado,
+    se toma el metrado del presupuesto de la partida; en ambos casos se
+    prorratea equitativamente entre los días del rango."""
+    otm_id = str(data.get("otm_id") or "").strip()
+    items = data.get("items") or []
+    if not otm_id or not isinstance(items, list) or not items:
+        raise HTTPException(400, "otm_id e items son obligatorios")
+    if len(items) > 50:
+        raise HTTPException(422, "Máximo 50 partidas por lote")
+
+    parsed = []
+    for i, it in enumerate(items, 1):
+        pid = it.get("partida_id")
+        fecha = parse_fecha(it.get("fecha"))
+        if not pid or not fecha:
+            raise HTTPException(400, f"Item {i}: partida_id y fecha son obligatorios")
+        fecha_fin = parse_fecha(it.get("fecha_fin"))
+        if fecha_fin and fecha_fin < fecha:
+            raise HTTPException(400, f"Item {i}: fecha_fin anterior a fecha")
+        parsed.append((int(pid), fecha, fecha_fin, _parse_metrado(it.get("metrado_prog"))))
+
+    proyecto_id = int(data.get("proyecto_id") or 1)
+    supervisor_id = (str(data["supervisor_id"]).strip() or None) if data.get("supervisor_id") else None
+    responsable = data.get("responsable") or None
+    descripcion = data.get("descripcion") or None
+
+    pool = await db()
+    creadas = []
+    async with pool.acquire() as con:
+        pinfo = {r["id"]: dict(r) for r in await con.fetch(
+            "SELECT id, descripcion, metrado_presup FROM ev_partidas WHERE id = ANY($1)",
+            [p[0] for p in parsed])}
+        faltan = [str(p[0]) for p in parsed if p[0] not in pinfo]
+        if faltan:
+            raise HTTPException(400, f"Partidas inexistentes: {', '.join(faltan)}")
+        async with con.transaction():
+            for pid, fecha, fecha_fin, metrado in parsed:
+                p = pinfo[pid]
+                if metrado is None and p["metrado_presup"] is not None:
+                    metrado = float(p["metrado_presup"]) or None
+                try:
+                    row = await con.fetchrow(
+                        """INSERT INTO prog_actividades
+                           (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo,
+                            descripcion, responsable, supervisor_id, metrado_prog, creado_por)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *""",
+                        proyecto_id, fecha, fecha_fin, otm_id, pid,
+                        (p["descripcion"] or f"Partida {pid}")[:200],
+                        descripcion, responsable, supervisor_id, metrado, user.get("sub"))
+                except _ERRORES_DATO:
+                    raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
+                await _redistribuir(con, dict(row))
+                creadas.append(dict(row))
+    return {"creadas": len(creadas), "actividades": creadas}
+
+
 # ── Lookahead-grid: la vista tipo Excel del ex-gerente ───────
 # Réplica del "Anexo 01 - LookAhead" / "F030b - Planeamiento": filas =
 # actividades agrupadas por OTM, columnas = días de N semanas, con el
