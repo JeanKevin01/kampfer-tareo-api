@@ -215,21 +215,80 @@ def test_crear_actividad_metrado_negativo_400():
     assert r.status_code == 400
 
 
-def test_distribuir_uniforme_suma_exacta():
+def _dias(*ss):
     from datetime import date
+    return [date.fromisoformat(s) for s in ss]
+
+
+def test_distribuir_uniforme_suma_exacta():
     from routers.programacion import _distribuir
-    d = _distribuir(100.0, date(2026, 7, 13), date(2026, 7, 15))
+    d = _distribuir(100.0, _dias("2026-07-13", "2026-07-14", "2026-07-15"))
     assert len(d) == 3
-    assert d[date(2026, 7, 13)] == 33.333
-    assert d[date(2026, 7, 15)] == 33.334          # el último día absorbe el redondeo
+    assert d[_dias("2026-07-13")[0]] == 33.333
+    assert d[_dias("2026-07-15")[0]] == 33.334     # el último día absorbe el redondeo
     assert round(sum(d.values()), 3) == 100.0
 
 
 def test_distribuir_un_dia():
-    from datetime import date
     from routers.programacion import _distribuir
-    d = _distribuir(87.593, date(2026, 7, 13), date(2026, 7, 13))
-    assert d == {date(2026, 7, 13): 87.593}
+    d = _distribuir(87.593, _dias("2026-07-13"))
+    assert d == {_dias("2026-07-13")[0]: 87.593}
+
+
+def test_dias_habiles_salta_domingo_feriado_y_salto():
+    # Lun 13 a Dom 19: sin domingo (calendario L-S), feriado el 15, salto el 14
+    from datetime import date
+    from routers.programacion import _dias_habiles
+    h = _dias_habiles(date(2026, 7, 13), date(2026, 7, 19),
+                      dias_semana={1, 2, 3, 4, 5, 6},
+                      feriados={date(2026, 7, 15)},
+                      saltos={date(2026, 7, 14)})
+    assert h == _dias("2026-07-13", "2026-07-16", "2026-07-17", "2026-07-18")
+
+
+def test_dias_habiles_todo_bloqueado():
+    from datetime import date
+    from routers.programacion import _dias_habiles
+    assert _dias_habiles(date(2026, 7, 12), date(2026, 7, 12),
+                         dias_semana={1, 2, 3, 4, 5, 6}, feriados=set(), saltos=set()) == []
+
+
+def test_config_dias_semana_invalidos_400():
+    r = _client().put("/ev/programacion/config", json={"dias_semana": [0, 8]},
+                      headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_config_supervisor_403():
+    r = _client().put("/ev/programacion/config", json={"dias_semana": [1, 2]},
+                      headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_feriado_sin_fecha_400():
+    r = _client().post("/ev/programacion/feriados", json={"motivo": "x"},
+                       headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_avance_actividad_sin_fecha_400():
+    r = _client().post("/ev/programacion/actividades/1/avance-dia",
+                       json={"cantidad": 5}, headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_avance_actividad_supervisor_403():
+    r = _client().post("/ev/programacion/actividades/1/avance-dia",
+                       json={"fecha": "2026-07-13", "cantidad": 5},
+                       headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_dias_salto_invalidos_400():
+    r = _client().post("/ev/programacion/actividades",
+                       json={"fecha": "2026-07-13", "titulo": "x", "dias_salto": ["no-fecha"]},
+                       headers=_hdr("oficina"))
+    assert r.status_code == 400
 
 
 # ── Media firmada ────────────────────────────────────────────

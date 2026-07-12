@@ -64,28 +64,85 @@ def _lunes_de(fecha: date) -> date:
     return fecha - timedelta(days=fecha.weekday())
 
 
-def _distribuir(metrado: float, desde: date, hasta: date) -> dict:
-    """Distribución uniforme del metrado en el rango, como la fórmula del
-    LookAhead del ex-gerente: metrado / (F.Fin - F.Inic + 1) por día.
-    El último día absorbe el redondeo para que la suma sea exacta."""
-    dias = [desde + timedelta(days=i) for i in range((hasta - desde).days + 1)]
+def _distribuir(metrado: float, dias: list) -> dict:
+    """Distribución uniforme del metrado entre los días dados, como la fórmula
+    del LookAhead del ex-gerente. El último día absorbe el redondeo."""
+    if not dias:
+        return {}
     cuota = round(metrado / len(dias), 3)
     out = {d: cuota for d in dias}
     out[dias[-1]] = round(metrado - cuota * (len(dias) - 1), 3)
     return out
 
 
+async def _calendario(con, proyecto_id: int, desde: date, hasta: date) -> tuple:
+    """(días ISO de la semana que se trabajan, feriados del rango)."""
+    ds = await con.fetchval(
+        "SELECT dias_semana FROM prog_config WHERE proyecto_id = $1", proyecto_id)
+    fer = await con.fetch(
+        "SELECT fecha FROM prog_feriados WHERE proyecto_id = $1 AND fecha BETWEEN $2 AND $3",
+        proyecto_id, desde, hasta)
+    return (set(ds) if ds else {1, 2, 3, 4, 5, 6, 7}), {r["fecha"] for r in fer}
+
+
+def _dias_habiles(desde: date, hasta: date, dias_semana: set, feriados: set,
+                  saltos: set) -> list:
+    return [d for i in range((hasta - desde).days + 1)
+            if (d := desde + timedelta(days=i)).isoweekday() in dias_semana
+            and d not in feriados and d not in saltos]
+
+
 async def _redistribuir(con, act: dict) -> None:
-    """Reemplaza las celdas diarias de la actividad con la distribución
-    uniforme de su metrado_prog sobre [fecha, fecha_fin]."""
-    await con.execute("DELETE FROM prog_metrado_dia WHERE actividad_id = $1", act["id"])
+    """Recalcula la distribución diaria del metrado de la actividad:
+      · salta los días no laborables (prog_config + prog_feriados) y los
+        saltos intencionales de la actividad (dias_salto);
+      · los días que YA tienen avance real registrado quedan CONGELADOS
+        (su programado es la línea contra la que se compara el cumplimiento)
+        y el SALDO (metrado − real acumulado) se re-prorratea entre los
+        días hábiles restantes — así la actividad sigue apuntando a terminar
+        en su F.Fin con lo que falta."""
+    desde, hasta = act["fecha"], act["fecha_fin"] or act["fecha"]
+    dias_semana, feriados = await _calendario(con, act["proyecto_id"], desde, hasta)
+    saltos = set(act.get("dias_salto") or [])
+    habiles = _dias_habiles(desde, hasta, dias_semana, feriados, saltos)
+
+    reales: dict = {}
+    if act.get("partida_id"):
+        reales = {r["fecha"]: float(r["cantidad_dia"]) for r in await con.fetch(
+            """SELECT fecha, cantidad_dia FROM ev_avances_diarios
+               WHERE partida_id = $1 AND fecha BETWEEN $2 AND $3
+                 AND cantidad_dia IS NOT NULL""",
+            act["partida_id"], desde, hasta)}
+
+    # Se borran solo las celdas NO congeladas (las de días con real se quedan).
+    await con.execute(
+        "DELETE FROM prog_metrado_dia WHERE actividad_id = $1"
+        " AND NOT (fecha = ANY($2::date[]))", act["id"], list(reales))
     metrado = float(act["metrado_prog"] or 0)
     if metrado <= 0:
         return
-    celdas = _distribuir(metrado, act["fecha"], act["fecha_fin"] or act["fecha"])
+    saldo = round(metrado - sum(reales.values()), 3)
+    restantes = [d for d in habiles if d not in reales]
+    if saldo <= 0 or not restantes:
+        return
     await con.executemany(
-        "INSERT INTO prog_metrado_dia (actividad_id, fecha, cantidad) VALUES ($1,$2,$3)",
-        [(act["id"], f, c) for f, c in celdas.items() if c > 0])
+        "INSERT INTO prog_metrado_dia (actividad_id, fecha, cantidad) VALUES ($1,$2,$3)"
+        " ON CONFLICT (actividad_id, fecha) DO UPDATE SET cantidad = $3",
+        [(act["id"], f, c) for f, c in _distribuir(saldo, restantes).items() if c > 0])
+
+
+def _parse_saltos(v) -> list:
+    if v in (None, ""):
+        return []
+    if not isinstance(v, list):
+        raise HTTPException(400, "dias_salto debe ser una lista de fechas")
+    out = []
+    for s in v:
+        f = parse_fecha(s)
+        if not f:
+            raise HTTPException(400, f"dias_salto: fecha inválida {s}")
+        out.append(f)
+    return sorted(set(out))
 
 
 # SELECT canónico de actividades: partida de control, supervisor y el resumen
@@ -172,6 +229,7 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
         raise HTTPException(400, "fecha_fin no puede ser anterior a fecha")
     metrado = _parse_metrado(data.get("metrado_prog"))
     und = (str(data.get("und") or "").strip()[:10] or None)
+    saltos = _parse_saltos(data.get("dias_salto"))
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
@@ -179,14 +237,14 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
                 row = await con.fetchrow(
                     """INSERT INTO prog_actividades
                        (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo, descripcion,
-                        responsable, supervisor_id, metrado_prog, und, creado_por)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *""",
+                        responsable, supervisor_id, metrado_prog, und, dias_salto, creado_por)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *""",
                     int(data.get("proyecto_id") or 1), fecha, fecha_fin,
                     (str(data["otm_id"]).strip() or None) if data.get("otm_id") else None,
                     int(data["partida_id"]) if data.get("partida_id") else None,
                     titulo, data.get("descripcion") or None, data.get("responsable") or None,
                     (str(data["supervisor_id"]).strip() or None) if data.get("supervisor_id") else None,
-                    metrado, und, user.get("sub"))
+                    metrado, und, saltos, user.get("sub"))
             except _ERRORES_DATO:
                 raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
             await _redistribuir(con, dict(row))
@@ -212,6 +270,8 @@ async def editar_actividad(act_id: int, data: dict):
     if "und" in data:
         campos.append("und")
         valores.append(str(data["und"]).strip()[:10] or None if data["und"] is not None else None)
+    if "dias_salto" in data:
+        campos.append("dias_salto"); valores.append(_parse_saltos(data["dias_salto"]))
     if "causa_nc_cat" in data:
         campos.append("causa_nc_cat"); valores.append(_validar_cnc(data["causa_nc_cat"]))
     for k in ("titulo", "descripcion", "responsable", "otm_id", "supervisor_id", "causa_nc"):
@@ -237,10 +297,10 @@ async def editar_actividad(act_id: int, data: dict):
                 raise HTTPException(400, "OTM, partida, supervisor o rango de fechas inválido: revisa los datos")
             if not row:
                 raise HTTPException(404, "Actividad no encontrada")
-            # Si cambió el rango o el metrado comprometido, la distribución
+            # Si cambió el rango, el metrado o los saltos, la distribución
             # diaria se recalcula (las ediciones celda a celda van por
             # /actividades/{id}/metrado-dias y NO pasan por aquí).
-            if {"fecha", "fecha_fin", "metrado_prog"} & data.keys():
+            if {"fecha", "fecha_fin", "metrado_prog", "dias_salto"} & data.keys():
                 await _redistribuir(con, dict(row))
     return dict(row)
 
@@ -280,6 +340,133 @@ async def lookahead(proyecto_id: int = 1, desde: str = "", semanas: int = 4):
                                     if lun <= a["fecha"] <= dom]})
     return {"desde": str(base), "semanas": out, "cnc": CNC,
             "tipos_restriccion": list(_TIPOS_RESTRICCION)}
+
+
+# ── Calendario laboral (por proyecto — multi-empresa) ────────
+async def _reprorratear_programadas(con, proyecto_id: int) -> int:
+    """Tras cambiar el calendario, se recalcula la distribución de todas las
+    actividades aún PROGRAMADO con metrado (las ejecutadas no se tocan)."""
+    acts = await con.fetch(
+        """SELECT * FROM prog_actividades
+           WHERE proyecto_id = $1 AND estado = 'PROGRAMADO' AND metrado_prog IS NOT NULL""",
+        proyecto_id)
+    for a in acts:
+        await _redistribuir(con, dict(a))
+    return len(acts)
+
+
+@router.get("/config")
+async def ver_config(proyecto_id: int = 1):
+    pool = await db()
+    async with pool.acquire() as con:
+        ds = await con.fetchval(
+            "SELECT dias_semana FROM prog_config WHERE proyecto_id = $1", proyecto_id)
+        fer = await con.fetch(
+            "SELECT id, fecha, motivo FROM prog_feriados WHERE proyecto_id = $1 ORDER BY fecha",
+            proyecto_id)
+    return {"dias_semana": sorted(ds) if ds else [1, 2, 3, 4, 5, 6, 7],
+            "feriados": [{"id": r["id"], "fecha": str(r["fecha"]), "motivo": r["motivo"]}
+                         for r in fer]}
+
+
+@router.put("/config")
+async def guardar_config(data: dict):
+    """Días de la semana que se trabajan (ISO: 1=Lun … 7=Dom). Re-prorratea
+    las actividades PROGRAMADO para que el plan salte los días nuevos."""
+    dias = data.get("dias_semana")
+    if (not isinstance(dias, list) or not dias
+            or any(not isinstance(d, int) or d < 1 or d > 7 for d in dias)):
+        raise HTTPException(400, "dias_semana debe ser una lista no vacía con valores 1..7")
+    proyecto_id = int(data.get("proyecto_id") or 1)
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            await con.execute(
+                """INSERT INTO prog_config (proyecto_id, dias_semana)
+                   VALUES ($1, $2) ON CONFLICT (proyecto_id)
+                   DO UPDATE SET dias_semana = $2, actualizado_en = now()""",
+                proyecto_id, sorted(set(dias)))
+            n = await _reprorratear_programadas(con, proyecto_id)
+    return {"ok": True, "dias_semana": sorted(set(dias)), "reprorrateadas": n}
+
+
+@router.post("/feriados")
+async def crear_feriado(data: dict):
+    f = parse_fecha(data.get("fecha"))
+    if not f:
+        raise HTTPException(400, "fecha requerida")
+    proyecto_id = int(data.get("proyecto_id") or 1)
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            row = await con.fetchrow(
+                """INSERT INTO prog_feriados (proyecto_id, fecha, motivo)
+                   VALUES ($1,$2,$3) ON CONFLICT (proyecto_id, fecha)
+                   DO UPDATE SET motivo = $3 RETURNING id, fecha, motivo""",
+                proyecto_id, f, (str(data.get("motivo") or "").strip() or None))
+            n = await _reprorratear_programadas(con, proyecto_id)
+    return {"id": row["id"], "fecha": str(row["fecha"]), "motivo": row["motivo"],
+            "reprorrateadas": n}
+
+
+@router.delete("/feriados/{fer_id}")
+async def borrar_feriado(fer_id: int):
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            row = await con.fetchrow(
+                "DELETE FROM prog_feriados WHERE id = $1 RETURNING proyecto_id", fer_id)
+            if not row:
+                raise HTTPException(404, "Feriado no encontrado")
+            n = await _reprorratear_programadas(con, row["proyecto_id"])
+    return {"ok": True, "reprorrateadas": n}
+
+
+@router.post("/actividades/{act_id}/avance-dia")
+async def avance_dia_actividad(act_id: int, data: dict):
+    """El avance REAL del día contra una actividad del LookAhead: escribe en
+    ev_avances_diarios (la partida de control de la actividad) y RE-PRORRATEA
+    el saldo entre los días hábiles restantes — la actividad sigue apuntando
+    a terminar en su F.Fin. El programado del día avanzado queda congelado
+    como línea base de comparación (celeste→verde/ámbar/rojo en el panel)."""
+    from routers.ev._datos import _fecha_base
+    f = parse_fecha(data.get("fecha"))
+    if not f:
+        raise HTTPException(400, "fecha requerida")
+    cantidad = data.get("cantidad")
+    if cantidad not in (None, ""):
+        try:
+            cantidad = float(cantidad)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "cantidad debe ser un número")
+        if cantidad < 0:
+            raise HTTPException(400, "la cantidad no puede ser negativa")
+    else:
+        cantidad = None
+    pool = await db()
+    async with pool.acquire() as con:
+        act = await con.fetchrow("SELECT * FROM prog_actividades WHERE id = $1", act_id)
+        if not act:
+            raise HTTPException(404, "Actividad no encontrada")
+        if not act["partida_id"]:
+            raise HTTPException(400, "La actividad no tiene partida de control: asígnala para registrar avance")
+        async with con.transaction():
+            if cantidad is None:
+                await con.execute(
+                    "DELETE FROM ev_avances_diarios WHERE partida_id = $1 AND fecha = $2",
+                    act["partida_id"], f)
+            else:
+                base = await _fecha_base(con)
+                semana = max(1, (f - base).days // 7 + 1) if base else 1
+                await con.execute(
+                    """INSERT INTO ev_avances_diarios
+                         (partida_id, fecha, semana, cantidad_dia, registrado_en)
+                       VALUES ($1, $2, $3, $4, NOW())
+                       ON CONFLICT (partida_id, fecha)
+                       DO UPDATE SET cantidad_dia = $4, registrado_en = NOW()""",
+                    act["partida_id"], f, semana, cantidad)
+            await _redistribuir(con, dict(act))
+    return {"ok": True, "cantidad": cantidad}
 
 
 @router.post("/actividades-lote")
@@ -376,6 +563,7 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
         acum = {r["partida_id"]: float(r["total"] or 0) for r in await con.fetch(
             """SELECT partida_id, SUM(cantidad_dia) AS total FROM ev_avances_diarios
                WHERE partida_id = ANY($1) GROUP BY partida_id""", pids)} if pids else {}
+        dias_semana, feriados = await _calendario(con, proyecto_id, base, fin)
 
     prog_map: dict = {}
     for r in prog_rows:
@@ -401,6 +589,7 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "supervisor_nombre": a["supervisor_nombre"],
             "causa_nc": a["causa_nc"], "causa_nc_cat": a["causa_nc_cat"],
             "rest_pend": a["rest_pend"], "rest_total": a["rest_total"],
+            "dias_salto": [str(d) for d in (a["dias_salto"] or [])],
             "und": pinfo.get("unidad") or a["und"],
             "metrado_prog": float(a["metrado_prog"]) if a["metrado_prog"] is not None else None,
             "metrado_base": met_base,
@@ -421,6 +610,7 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
                for i in range(semanas)]
     return {"desde": str(base), "hasta": str(fin), "semanas": sem_out,
             "fechas": [str(base + timedelta(days=i)) for i in range(semanas * 7)],
+            "dias_semana": sorted(dias_semana), "feriados": sorted(str(f) for f in feriados),
             "grupos": grupos, "cnc": CNC}
 
 
@@ -723,6 +913,7 @@ async def programacion_dia(fecha: str = "", otm_id: str = ""):
     rows = await pool.fetch(
         """SELECT id, titulo, estado FROM prog_actividades
            WHERE $1 BETWEEN fecha AND COALESCE(fecha_fin, fecha)
+             AND NOT ($1 = ANY(dias_salto))
              AND estado <> 'CANCELADO'
              AND (otm_id = $2 OR otm_id IS NULL)
            ORDER BY id""", f, otm_id or None)
@@ -748,6 +939,7 @@ async def mis_actividades(supervisor_id: str, fecha: str = "",
            LEFT JOIN ev_partidas ev ON ev.id = a.partida_id
            LEFT JOIN prog_metrado_dia pm ON pm.actividad_id = a.id AND pm.fecha = $1
            WHERE $1 BETWEEN a.fecha AND COALESCE(a.fecha_fin, a.fecha)
+             AND NOT ($1 = ANY(a.dias_salto))
              AND a.supervisor_id = $2 AND a.estado <> 'CANCELADO'
            ORDER BY a.id""", f, supervisor_id)
     return [dict(r) for r in rows]

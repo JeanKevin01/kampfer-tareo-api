@@ -45,6 +45,8 @@ def limpiar_y_sembrar(cur):
                 "(SELECT id FROM campo_reportes WHERE otm_id='OTM-E2E')")
     cur.execute("DELETE FROM campo_reportes WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM prog_actividades WHERE titulo LIKE 'E2E %' OR otm_id='OTM-E2E'")
+    cur.execute("DELETE FROM prog_feriados WHERE proyecto_id=1")
+    cur.execute("DELETE FROM prog_config WHERE proyecto_id=1")
     cur.execute("DELETE FROM fases WHERE codigo LIKE 'E2E-%'")
     cur.execute("DELETE FROM tareo_partida WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM registros WHERE otm_id='OTM-E2E'")
@@ -394,6 +396,57 @@ def main():
           and gl.get("prog", {}).get("2026-06-03") == 5
           and a_l1.get("titulo") == "Partida E2E-001",
           f"status={r.status_code} lote={lote.get('creadas')} prog={gl.get('prog')}")
+
+    # Calendario laboral + saltos intencionales + re-prorrateo con avance (0023)
+    r = c.put(f"{API}/ev/programacion/config", json={"proyecto_id": 1, "dias_semana": [1, 2, 3, 4, 5, 6]})
+    r2 = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-06-05", "fecha_fin": "2026-06-08",
+        "otm_id": "OTM-E2E", "titulo": "E2E Con calendario y salto",
+        "metrado_prog": 90, "dias_salto": ["2026-06-06"]})
+    act5 = r2.json() if r2.status_code == 200 else {}
+    r3 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-05", "semanas": 2})
+    g5 = next((a for g in r3.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act5.get("id")), {})
+    check("P19 calendario L-S + salto del sábado: 90 cae solo en vie y lun (45/45)",
+          r.status_code == 200 and g5.get("prog") == {"2026-06-05": 45, "2026-06-08": 45}
+          and r3.json().get("dias_semana") == [1, 2, 3, 4, 5, 6],
+          f"cfg={r.status_code} prog={g5.get('prog')}")
+
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": FECHA_TAREO, "fecha_fin": "2026-06-04",
+        "otm_id": "OTM-E2E", "titulo": "E2E Linea base", "partida_id": p1["id"],
+        "metrado_prog": 90})
+    act6 = r.json() if r.status_code == 200 else {}
+    r2 = c.post(f"{API}/ev/programacion/actividades/{act6.get('id')}/avance-dia",
+                json={"fecha": FECHA_TAREO, "cantidad": 12})
+    r3 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    g6 = next((a for g in r3.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act6.get("id")), {})
+    check("P20 avance 12 vs prog 30: el día queda congelado y el saldo 78 se re-prorratea 39/39",
+          r2.status_code == 200 and g6.get("prog", {}).get(FECHA_TAREO) == 30
+          and g6.get("real", {}).get(FECHA_TAREO) == 12
+          and g6.get("prog", {}).get("2026-06-03") == 39
+          and g6.get("prog", {}).get("2026-06-04") == 39,
+          f"status={r2.status_code} prog={g6.get('prog')} real={g6.get('real')}")
+
+    r = c.put(f"{API}/ev/programacion/actividades/{act6.get('id')}",
+              json={"fecha_fin": "2026-06-05"})
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    g6 = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act6.get("id")), {})
+    check("P21 ampliar F.Fin re-prorratea el saldo en 3 días (26/26/26) sin tocar el congelado",
+          r.status_code == 200 and g6.get("prog", {}).get(FECHA_TAREO) == 30
+          and g6.get("prog", {}).get("2026-06-03") == 26
+          and g6.get("prog", {}).get("2026-06-05") == 26,
+          f"prog={g6.get('prog')}")
+
+    # restaurar el calendario para no contaminar corridas parciales
+    c.put(f"{API}/ev/programacion/config", json={"proyecto_id": 1, "dias_semana": [1, 2, 3, 4, 5, 6, 7]})
+    c.post(f"{API}/ev/programacion/actividades/{act6.get('id')}/avance-dia",
+           json={"fecha": FECHA_TAREO, "cantidad": None})
 
     print()
     if _fallas:
