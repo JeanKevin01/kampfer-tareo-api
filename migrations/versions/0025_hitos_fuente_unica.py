@@ -24,6 +24,10 @@ _UP = """
 ALTER TABLE ev_avances_diarios
   ADD COLUMN hito_id INT REFERENCES ev_hitos(id) ON DELETE CASCADE;
 
+-- Lección 0008: en prod (dump pre-Alembic) el unique es una CONSTRAINT;
+-- en el baseline local es un INDEX. Soltar la forma que exista.
+ALTER TABLE ev_avances_diarios
+  DROP CONSTRAINT IF EXISTS ev_avances_diarios_partida_id_fecha_key;
 DROP INDEX IF EXISTS ev_avances_diarios_partida_id_fecha_key;
 CREATE UNIQUE INDEX ev_avances_diarios_pfh_key
   ON ev_avances_diarios (partida_id, fecha, COALESCE(hito_id, 0));
