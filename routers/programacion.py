@@ -117,11 +117,19 @@ async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) 
 
     reales: dict = {}
     if act.get("partida_id"):
+        # Solo los reales de la MISMA etapa (hito) de la actividad; una
+        # actividad del hito principal equivale a una sin hito (NULL).
         reales = {r["fecha"]: float(r["cantidad_dia"]) for r in await con.fetch(
-            """SELECT fecha, cantidad_dia FROM ev_avances_diarios
+            """SELECT fecha, cantidad_dia FROM ev_avances_diarios ad
                WHERE partida_id = $1 AND fecha BETWEEN $2 AND $3
-                 AND cantidad_dia IS NOT NULL""",
-            act["partida_id"], desde, hasta)}
+                 AND cantidad_dia IS NOT NULL
+                 AND COALESCE(ad.hito_id, (SELECT id FROM ev_hitos h
+                       WHERE h.partida_id = $1
+                       ORDER BY h.es_principal DESC, h.peso DESC, h.id LIMIT 1))
+                     = COALESCE($4, (SELECT id FROM ev_hitos h
+                       WHERE h.partida_id = $1
+                       ORDER BY h.es_principal DESC, h.peso DESC, h.id LIMIT 1))""",
+            act["partida_id"], desde, hasta, act.get("hito_id"))}
 
     intactos = set(reales)
     if solo_despues_de:
@@ -248,26 +256,40 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
     medios = _parse_saltos(data.get("dias_medio"))
     if set(saltos) & set(medios):
         raise HTTPException(400, "Un día no puede ser salto y medio día a la vez")
+    partida_id = int(data["partida_id"]) if data.get("partida_id") else None
+    hito_id = int(data["hito_id"]) if data.get("hito_id") else None
     pool = await db()
     async with pool.acquire() as con:
+        if hito_id:
+            await _validar_hito(con, partida_id, hito_id)
         async with con.transaction():
             try:
                 row = await con.fetchrow(
                     """INSERT INTO prog_actividades
                        (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo, descripcion,
                         responsable, supervisor_id, metrado_prog, und, dias_salto, dias_medio,
-                        creado_por)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *""",
+                        hito_id, creado_por)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *""",
                     int(data.get("proyecto_id") or 1), fecha, fecha_fin,
                     (str(data["otm_id"]).strip() or None) if data.get("otm_id") else None,
-                    int(data["partida_id"]) if data.get("partida_id") else None,
+                    partida_id,
                     titulo, data.get("descripcion") or None, data.get("responsable") or None,
                     (str(data["supervisor_id"]).strip() or None) if data.get("supervisor_id") else None,
-                    metrado, und, saltos, medios, user.get("sub"))
+                    metrado, und, saltos, medios, hito_id, user.get("sub"))
             except _ERRORES_DATO:
                 raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
             await _redistribuir(con, dict(row))
     return dict(row)
+
+
+async def _validar_hito(con, partida_id: Optional[int], hito_id: int) -> None:
+    if not partida_id:
+        raise HTTPException(400, "hito_id requiere partida_id")
+    pid = await con.fetchval("SELECT partida_id FROM ev_hitos WHERE id = $1", hito_id)
+    if pid is None:
+        raise HTTPException(404, "Hito no encontrado")
+    if pid != partida_id:
+        raise HTTPException(400, "El hito no pertenece a la partida indicada")
 
 
 @router.put("/actividades/{act_id}")
@@ -464,43 +486,103 @@ def _parse_cantidad(v) -> Optional[float]:
     return c
 
 
+async def _hito_principal(con, partida_id: int) -> Optional[int]:
+    """Id del hito principal de la partida. Si la partida NO tiene hitos, lo
+    crea silenciosamente ('Ejecución', peso 100%) — así el % EV de cualquier
+    partida queda conectado al avance diario sin trabajo extra del planner."""
+    hid = await con.fetchval(
+        """SELECT id FROM ev_hitos WHERE partida_id = $1
+           ORDER BY es_principal DESC, peso DESC, id LIMIT 1""", partida_id)
+    if hid is None:
+        hid = await con.fetchval(
+            """INSERT INTO ev_hitos (partida_id, numero, descripcion, peso, es_principal)
+               VALUES ($1, 1, 'Ejecución', 1.0, true) RETURNING id""", partida_id)
+    return hid
+
+
+async def _rollup_ev_avances(con, partida_id: int) -> None:
+    """Fuente única: deriva ev_avances (acumulado semanal por hito — la entrada
+    del motor EV) del registro diario. Por hito: las semanas desde su primer
+    registro diario se recalculan como base_manual_previa + Σ diario; las
+    semanas anteriores (captura manual / carga histórica) no se tocan."""
+    principal = await _hito_principal(con, partida_id)
+    rows = await con.fetch(
+        """SELECT COALESCE(hito_id, $2) AS hid, semana, SUM(cantidad_dia) AS c
+           FROM ev_avances_diarios
+           WHERE partida_id = $1 AND cantidad_dia IS NOT NULL
+           GROUP BY 1, 2""", partida_id, principal)
+    por_hito: dict = {}
+    for r in rows:
+        por_hito.setdefault(r["hid"], {})[r["semana"]] = float(r["c"] or 0)
+    for hid, sems in por_hito.items():
+        primera = min(sems)
+        base = float(await con.fetchval(
+            """SELECT COALESCE(MAX(cantidad_acum), 0) FROM ev_avances
+               WHERE hito_id = $1 AND semana < $2""", hid, primera) or 0)
+        existentes = {r["semana"] for r in await con.fetch(
+            "SELECT semana FROM ev_avances WHERE hito_id = $1 AND semana >= $2",
+            hid, primera)}
+        for s in sorted(set(sems) | existentes):
+            acum = base + sum(c for w, c in sems.items() if w <= s)
+            await con.execute(
+                """INSERT INTO ev_avances (hito_id, semana, cantidad_acum, registrado_en)
+                   VALUES ($1, $2, $3, NOW())
+                   ON CONFLICT (hito_id, semana)
+                   DO UPDATE SET cantidad_acum = $3, registrado_en = NOW()""",
+                hid, s, round(acum, 4))
+
+
 async def registrar_avance_partida(con, partida_id: int, fecha: date, cantidad,
-                                   notas=None, actualizar_notas: bool = False) -> None:
+                                   notas=None, actualizar_notas: bool = False,
+                                   hito_id: Optional[int] = None) -> None:
     """Escritura ÚNICA del avance real diario (F1 LookAhead v2 / auditoría F-2):
     upsert (o DELETE si cantidad es None) en ev_avances_diarios y re-prorrateo
     de TODA actividad del LookAhead vinculada a la partida cuyo rango cubre la
     fecha — venga el avance de programación o del módulo Valor Ganado, el dato
-    y sus consecuencias son los mismos. La semana usa core.tiempo.semana_de."""
+    y sus consecuencias son los mismos. La semana usa core.tiempo.semana_de.
+    hito_id = etapa de la partida a la que pertenece el registro (NULL = hito
+    principal). Tras escribir, _rollup_ev_avances deriva ev_avances (la entrada
+    del motor EV): un solo dato alimenta LookAhead, VG diario y % de avance."""
     from routers.ev._datos import _fecha_base
+    # Convención dura: el hito principal SIEMPRE se guarda como NULL (las
+    # vistas por partida — semana-grid, matriz — leen NULL = cant. instalada).
+    principal = await _hito_principal(con, partida_id)
+    if hito_id is not None and hito_id == principal:
+        hito_id = None
     if cantidad is None:
         await con.execute(
-            "DELETE FROM ev_avances_diarios WHERE partida_id = $1 AND fecha = $2",
-            partida_id, fecha)
+            """DELETE FROM ev_avances_diarios WHERE partida_id = $1 AND fecha = $2
+               AND COALESCE(hito_id, 0) = COALESCE($3, 0)""",
+            partida_id, fecha, hito_id)
     else:
         base = await _fecha_base(con)
         semana = max(1, semana_de(fecha, base)) if base else 1
         if actualizar_notas:
             await con.execute(
                 """INSERT INTO ev_avances_diarios
-                     (partida_id, fecha, semana, cantidad_dia, notas, registrado_en)
-                   VALUES ($1, $2, $3, $4, $5, NOW())
-                   ON CONFLICT (partida_id, fecha)
+                     (partida_id, fecha, semana, cantidad_dia, notas, hito_id, registrado_en)
+                   VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                   ON CONFLICT (partida_id, fecha, COALESCE(hito_id, 0))
                    DO UPDATE SET cantidad_dia = $4, notas = $5, registrado_en = NOW()""",
-                partida_id, fecha, semana, cantidad, notas)
+                partida_id, fecha, semana, cantidad, notas, hito_id)
         else:
             await con.execute(
                 """INSERT INTO ev_avances_diarios
-                     (partida_id, fecha, semana, cantidad_dia, registrado_en)
-                   VALUES ($1, $2, $3, $4, NOW())
-                   ON CONFLICT (partida_id, fecha)
+                     (partida_id, fecha, semana, cantidad_dia, hito_id, registrado_en)
+                   VALUES ($1, $2, $3, $4, $5, NOW())
+                   ON CONFLICT (partida_id, fecha, COALESCE(hito_id, 0))
                    DO UPDATE SET cantidad_dia = $4, registrado_en = NOW()""",
-                partida_id, fecha, semana, cantidad)
+                partida_id, fecha, semana, cantidad, hito_id)
+    await _rollup_ev_avances(con, partida_id)
     # Los días anteriores al registrado no se tocan; el saldo para cumplir el
-    # metrado meta se re-prorratea en los días siguientes de cada actividad.
+    # metrado meta se re-prorratea en los días siguientes de cada actividad
+    # de la MISMA etapa (hito) de la partida — una actividad apuntando al
+    # hito principal equivale a una sin hito ($4 = id del principal).
     acts = await con.fetch(
         """SELECT * FROM prog_actividades
-           WHERE partida_id = $1 AND $2 BETWEEN fecha AND COALESCE(fecha_fin, fecha)""",
-        partida_id, fecha)
+           WHERE partida_id = $1 AND $2 BETWEEN fecha AND COALESCE(fecha_fin, fecha)
+             AND COALESCE(hito_id, $4) = COALESCE($3, $4)""",
+        partida_id, fecha, hito_id, principal)
     for a in acts:
         await _redistribuir(con, dict(a), solo_despues_de=fecha)
 
@@ -524,7 +606,8 @@ async def avance_dia_actividad(act_id: int, data: dict):
         if not act["partida_id"]:
             raise HTTPException(400, "La actividad no tiene partida de control: asígnala para registrar avance")
         async with con.transaction():
-            await registrar_avance_partida(con, act["partida_id"], f, cantidad)
+            await registrar_avance_partida(con, act["partida_id"], f, cantidad,
+                                           hito_id=act["hito_id"])
     return {"ok": True, "cantidad": cantidad}
 
 
@@ -551,39 +634,61 @@ async def crear_actividades_lote(data: dict, user: dict = Depends(require_role("
         fecha_fin = parse_fecha(it.get("fecha_fin"))
         if fecha_fin and fecha_fin < fecha:
             raise HTTPException(400, f"Item {i}: fecha_fin anterior a fecha")
-        parsed.append((int(pid), fecha, fecha_fin, _parse_metrado(it.get("metrado_prog"))))
+        parsed.append((int(pid), fecha, fecha_fin, _parse_metrado(it.get("metrado_prog")),
+                       int(it["hito_id"]) if it.get("hito_id") else None))
 
     proyecto_id = int(data.get("proyecto_id") or 1)
     supervisor_id = (str(data["supervisor_id"]).strip() or None) if data.get("supervisor_id") else None
     responsable = data.get("responsable") or None
     descripcion = data.get("descripcion") or None
 
+    encadenar = bool(data.get("encadenar_hitos"))
     pool = await db()
     creadas = []
     async with pool.acquire() as con:
         pinfo = {r["id"]: dict(r) for r in await con.fetch(
-            "SELECT id, descripcion, metrado_presup FROM ev_partidas WHERE id = ANY($1)",
+            "SELECT id, descripcion, metrado_presup, unidad FROM ev_partidas WHERE id = ANY($1)",
             [p[0] for p in parsed])}
         faltan = [str(p[0]) for p in parsed if p[0] not in pinfo]
         if faltan:
             raise HTTPException(400, f"Partidas inexistentes: {', '.join(faltan)}")
+        hinfo = {}
+        for pid, _f, _ff, _m, hid in parsed:
+            if hid:
+                await _validar_hito(con, pid, hid)
+                hinfo[hid] = await con.fetchrow(
+                    "SELECT descripcion, peso FROM ev_hitos WHERE id = $1", hid)
         async with con.transaction():
-            for pid, fecha, fecha_fin, metrado in parsed:
+            # id de la actividad anterior de la MISMA partida (para encadenar FS
+            # las etapas desplegadas por hitos, en el orden en que llegan).
+            prev_de_partida: dict = {}
+            for pid, fecha, fecha_fin, metrado, hid in parsed:
                 p = pinfo[pid]
                 if metrado is None and p["metrado_presup"] is not None:
                     metrado = float(p["metrado_presup"]) or None
+                titulo = (p["descripcion"] or f"Partida {pid}")[:170]
+                if hid and hinfo.get(hid):
+                    titulo = f"{titulo} — {hinfo[hid]['descripcion'] or 'Etapa'}"[:200]
                 try:
                     row = await con.fetchrow(
                         """INSERT INTO prog_actividades
                            (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo,
-                            descripcion, responsable, supervisor_id, metrado_prog, creado_por)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *""",
-                        proyecto_id, fecha, fecha_fin, otm_id, pid,
-                        (p["descripcion"] or f"Partida {pid}")[:200],
-                        descripcion, responsable, supervisor_id, metrado, user.get("sub"))
+                            descripcion, responsable, supervisor_id, metrado_prog, hito_id,
+                            creado_por)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *""",
+                        proyecto_id, fecha, fecha_fin, otm_id, pid, titulo,
+                        descripcion, responsable, supervisor_id, metrado, hid,
+                        user.get("sub"))
                 except _ERRORES_DATO:
                     raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
                 await _redistribuir(con, dict(row))
+                if encadenar and hid and prev_de_partida.get(pid):
+                    await con.execute(
+                        """INSERT INTO prog_dependencias (actividad_id, predecesora_id, lag_dias)
+                           VALUES ($1, $2, 0) ON CONFLICT DO NOTHING""",
+                        row["id"], prev_de_partida[pid])
+                if hid:
+                    prev_de_partida[pid] = row["id"]
                 creadas.append(dict(row))
     return {"creadas": len(creadas), "actividades": creadas}
 
@@ -672,19 +777,121 @@ async def recalcular_cascada(con, actividad_id_movida: int) -> list:
 
 
 @router.get("/actividades")
-async def listar_actividades(proyecto_id: int = 1, q: str = "", limite: int = 200):
-    """Listado ligero para el selector de antecesoras del modal."""
+async def listar_actividades(proyecto_id: int = 1, q: str = "", limite: int = 200,
+                             otm: str = ""):
+    """Listado ligero para el selector de antecesoras del modal. Con otm= el
+    selector trabaja en 2 pasos (primero la OTM, luego sus actividades)."""
     limite = max(1, min(int(limite or 200), 500))
     filtro = f"%{q.strip()}%" if q.strip() else None
+    otm_f = otm.strip() or None
     pool = await db()
     rows = await pool.fetch(
         """SELECT id, titulo, otm_id, fecha, COALESCE(fecha_fin, fecha) AS fecha_fin, estado
            FROM prog_actividades
            WHERE proyecto_id = $1 AND estado <> 'CANCELADO'
              AND ($2::text IS NULL OR titulo ILIKE $2 OR otm_id ILIKE $2)
+             AND ($4::text IS NULL OR otm_id = $4)
            ORDER BY fecha DESC, id DESC LIMIT $3""",
-        proyecto_id, filtro, limite)
+        proyecto_id, filtro, limite, otm_f)
     return [{**dict(r), "fecha": str(r["fecha"]), "fecha_fin": str(r["fecha_fin"])} for r in rows]
+
+
+# ── Hitos (rules of credit) vistos desde Programación ────────
+@router.get("/partidas/{partida_id}/hitos")
+async def hitos_de_partida(partida_id: int):
+    """Hitos de la partida con su % automático (acum de ev_avances / metrado
+    proyectado) y si su avance viene del registro DIARIO (auto) o de un
+    checkpoint manual. Si la partida no tiene hitos aún, devuelve el hito
+    'Ejecución 100%' virtual (se materializa recién al primer registro)."""
+    pool = await db()
+    async with pool.acquire() as con:
+        p = await con.fetchrow(
+            """SELECT id, COALESCE(metrado_proyec, metrado_presup) AS mp, unidad
+               FROM ev_partidas WHERE id = $1""", partida_id)
+        if not p:
+            raise HTTPException(404, "Partida no encontrada")
+        mp = float(p["mp"] or 0)
+        hitos = [dict(r) for r in await con.fetch(
+            """SELECT h.id, h.numero, h.descripcion, h.peso, h.es_principal,
+                      (SELECT cantidad_acum FROM ev_avances a
+                        WHERE a.hito_id = h.id ORDER BY a.semana DESC LIMIT 1) AS acum,
+                      EXISTS (SELECT 1 FROM ev_avances_diarios d
+                        WHERE d.partida_id = h.partida_id AND d.hito_id = h.id) AS con_diario,
+                      EXISTS (SELECT 1 FROM prog_actividades pa
+                        WHERE pa.hito_id = h.id) AS con_actividad
+               FROM ev_hitos h WHERE h.partida_id = $1
+               ORDER BY h.numero""", partida_id)]
+    if not hitos:
+        return {"partida_id": partida_id, "metrado": mp, "unidad": p["unidad"],
+                "hitos": [{"id": None, "numero": 1, "descripcion": "Ejecución",
+                           "peso": 1.0, "es_principal": True, "pct": None,
+                           "auto": True, "con_actividad": False, "virtual": True}]}
+    principal = max(hitos, key=lambda h: (h["es_principal"], float(h["peso"]), -h["id"]))["id"]
+    out = []
+    for h in hitos:
+        acum = float(h["acum"] or 0)
+        out.append({
+            "id": h["id"], "numero": h["numero"], "descripcion": h["descripcion"],
+            "peso": float(h["peso"]), "es_principal": h["es_principal"],
+            "pct": round(min(acum / mp, 1.0), 4) if mp > 0 else None,
+            "acum": round(acum, 4),
+            # auto = su acumulado sale del registro diario (principal o etapa
+            # con sub-actividad); si no, se marca con checkpoint manual.
+            "auto": h["id"] == principal or h["con_diario"],
+            "con_actividad": h["con_actividad"], "virtual": False,
+        })
+    return {"partida_id": partida_id, "metrado": mp, "unidad": p["unidad"], "hitos": out}
+
+
+@router.post("/hitos/{hito_id}/checkpoint")
+async def checkpoint_hito(hito_id: int, data: dict,
+                          user: dict = Depends(require_role("oficina"))):
+    """Marca el avance de un hito SECUNDARIO (etapa sin registro diario):
+    pct 0..1 del metrado que ya pasó por esa etapa (1 = etapa completa) en la
+    fecha dada — escribe ev_avances en la semana canónica de esa fecha. Los
+    hitos alimentados por el diario se rechazan (los gobierna el rollup)."""
+    from routers.ev._datos import _fecha_base
+    f = parse_fecha(data.get("fecha")) or fecha_lima()
+    try:
+        pct = float(data.get("pct", 1.0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "pct debe ser un número entre 0 y 1")
+    if not (0 <= pct <= 1):
+        raise HTTPException(400, "pct debe estar entre 0 y 1")
+    pool = await db()
+    async with pool.acquire() as con:
+        h = await con.fetchrow(
+            """SELECT h.id, h.partida_id,
+                      COALESCE(p.metrado_proyec, p.metrado_presup) AS mp
+               FROM ev_hitos h JOIN ev_partidas p ON p.id = h.partida_id
+               WHERE h.id = $1""", hito_id)
+        if not h:
+            raise HTTPException(404, "Hito no encontrado")
+        principal = await _hito_principal(con, h["partida_id"])
+        con_diario = await con.fetchval(
+            """SELECT EXISTS (SELECT 1 FROM ev_avances_diarios
+               WHERE partida_id = $1 AND COALESCE(hito_id, $2) = $3)""",
+            h["partida_id"], principal, hito_id)
+        if con_diario:
+            raise HTTPException(409, "Este hito se alimenta del registro diario; corrige las celdas del día")
+        mp = float(h["mp"] or 0)
+        if mp <= 0:
+            raise HTTPException(400, "La partida no tiene metrado: define el presupuesto primero")
+        base = await _fecha_base(con)
+        semana = max(1, semana_de(f, base)) if base else 1
+        async with con.transaction():
+            await con.execute(
+                """INSERT INTO ev_avances (hito_id, semana, cantidad_acum, registrado_en)
+                   VALUES ($1, $2, $3, NOW())
+                   ON CONFLICT (hito_id, semana)
+                   DO UPDATE SET cantidad_acum = $3, registrado_en = NOW()""",
+                hito_id, semana, round(pct * mp, 4))
+            # El acumulado no puede DECRECER en semanas posteriores ya escritas.
+            await con.execute(
+                """UPDATE ev_avances SET cantidad_acum = $3, registrado_en = NOW()
+                   WHERE hito_id = $1 AND semana > $2 AND cantidad_acum < $3""",
+                hito_id, semana, round(pct * mp, 4))
+    return {"ok": True, "hito_id": hito_id, "semana": semana, "pct": pct}
 
 
 @router.get("/actividades/{act_id}/dependencias")
@@ -766,15 +973,24 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
                WHERE actividad_id = ANY($1) AND fecha BETWEEN $2 AND $3""",
             ids, base, fin) if ids else []
         real_rows = await con.fetch(
-            """SELECT partida_id, fecha::text AS f, cantidad_dia FROM ev_avances_diarios
+            """SELECT partida_id, hito_id, fecha::text AS f, cantidad_dia
+               FROM ev_avances_diarios
                WHERE partida_id = ANY($1) AND fecha BETWEEN $2 AND $3""",
             pids, base, fin) if pids else []
         partidas = {r["id"]: dict(r) for r in await con.fetch(
             """SELECT id, unidad, metrado_presup FROM ev_partidas WHERE id = ANY($1)""",
             pids)} if pids else {}
-        acum = {r["partida_id"]: float(r["total"] or 0) for r in await con.fetch(
-            """SELECT partida_id, SUM(cantidad_dia) AS total FROM ev_avances_diarios
-               WHERE partida_id = ANY($1) GROUP BY partida_id""", pids)} if pids else {}
+        acum = {(r["partida_id"], r["hito_id"]): float(r["total"] or 0)
+                for r in await con.fetch(
+            """SELECT partida_id, hito_id, SUM(cantidad_dia) AS total
+               FROM ev_avances_diarios
+               WHERE partida_id = ANY($1) GROUP BY partida_id, hito_id""",
+            pids)} if pids else {}
+        hitos_rows = [dict(r) for r in await con.fetch(
+            """SELECT id, partida_id, descripcion, peso, es_principal FROM ev_hitos
+               WHERE partida_id = ANY($1)
+               ORDER BY partida_id, es_principal DESC, peso DESC, id""",
+            pids)] if pids else []
         dias_semana, feriados = await _calendario(con, proyecto_id, base, fin)
         deps = await con.fetch(
             """SELECT d.actividad_id, d.predecesora_id, d.lag_dias,
@@ -795,17 +1011,29 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
     prog_map: dict = {}
     for r in prog_rows:
         prog_map.setdefault(r["actividad_id"], {})[r["f"]] = float(r["cantidad"])
+    # Reales por (partida, etapa): NULL = hito principal (convención 0025).
     real_map: dict = {}
     for r in real_rows:
         if r["cantidad_dia"] is not None:
-            real_map.setdefault(r["partida_id"], {})[r["f"]] = float(r["cantidad_dia"])
+            real_map.setdefault((r["partida_id"], r["hito_id"]), {})[r["f"]] = \
+                float(r["cantidad_dia"])
+    principal_de: dict = {}
+    hitos_de: dict = {}
+    for h in hitos_rows:
+        hitos_de.setdefault(h["partida_id"], []).append(h)
+        principal_de.setdefault(h["partida_id"], h["id"])   # 1º = principal (ORDER BY)
+    hito_info = {h["id"]: h for h in hitos_rows}
 
     grupos: list = []
     idx: dict = {}
     for a in acts:
         pinfo = partidas.get(a["partida_id"]) or {}
         met_base = float(pinfo["metrado_presup"]) if pinfo.get("metrado_presup") is not None else None
-        acum_real = acum.get(a["partida_id"]) if a["partida_id"] else None
+        # Clave de etapa de la actividad: el hito principal se guarda como NULL.
+        hkey = a["hito_id"]
+        if hkey is not None and hkey == principal_de.get(a["partida_id"]):
+            hkey = None
+        acum_real = acum.get((a["partida_id"], hkey)) if a["partida_id"] else None
         act_out = {
             "id": a["id"], "titulo": a["titulo"], "estado": a["estado"],
             "descripcion": a["descripcion"],
@@ -828,8 +1056,11 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "metrado_base": met_base,
             "acum_real": acum_real,
             "saldo": round(met_base - acum_real, 3) if met_base is not None and acum_real is not None else None,
+            "hito_id": a["hito_id"],
+            "hito_desc": (hito_info.get(a["hito_id"]) or {}).get("descripcion") if a["hito_id"] else None,
+            "hito_peso": float(hito_info[a["hito_id"]]["peso"]) if a["hito_id"] in hito_info else None,
             "prog": prog_map.get(a["id"], {}),
-            "real": real_map.get(a["partida_id"], {}) if a["partida_id"] else {},
+            "real": real_map.get((a["partida_id"], hkey), {}) if a["partida_id"] else {},
         }
         clave = a["otm_id"] or ""
         if clave not in idx:
@@ -907,14 +1138,166 @@ async def avance_dia(data: dict):
     if not partida_id or not f:
         raise HTTPException(400, "partida_id y fecha son obligatorios")
     cantidad = _parse_cantidad(data.get("cantidad"))
+    hito_id = int(data["hito_id"]) if data.get("hito_id") else None
     pool = await db()
     async with pool.acquire() as con:
+        if hito_id:
+            await _validar_hito(con, int(partida_id), hito_id)
         async with con.transaction():
             try:
-                await registrar_avance_partida(con, int(partida_id), f, cantidad)
+                await registrar_avance_partida(con, int(partida_id), f, cantidad,
+                                               hito_id=hito_id)
             except _ERRORES_DATO:
                 raise HTTPException(400, "Partida inexistente o datos inválidos")
     return {"ok": True, "cantidad": cantidad}
+
+
+@router.get("/historial-grid")
+async def historial_grid(otm: str, desde: str = "", semanas: int = 0):
+    """Historial COMPLETO de avance de las partidas de una OTM, estilo Excel
+    del LookAhead (tab «Avance diario» del VG): arranca en el primer registro
+    (avance diario o HH de tareo, lo más antiguo) y llega hasta hoy o hasta
+    el fin programado. Editable en todo el rango — misma fuente única.
+    Por partida: fila por ETAPA (hito con actividad/registros propios; NULL =
+    principal) con real diario, programado (prog_metrado_dia) y HH del tareo.
+    desde/semanas permiten acotar la ventana (máx. 26 semanas por página)."""
+    otm = otm.strip()
+    if not otm:
+        raise HTTPException(400, "otm requerida")
+    pool = await db()
+    async with pool.acquire() as con:
+        partidas = [dict(r) for r in await con.fetch(
+            """SELECT id, codigo, descripcion, unidad, hh_presup, metrado_presup,
+                      COALESCE(metrado_proyec, metrado_presup) AS metrado,
+                      CASE WHEN metrado_presup > 0 THEN hh_presup / metrado_presup
+                           ELSE 0 END AS factor_conv
+               FROM ev_partidas
+               WHERE activo AND fase IS NOT NULL AND otm_id = $1
+               ORDER BY codigo""", otm)]
+        if not partidas:
+            return {"otm": otm, "partidas": [], "fechas": [], "semanas": []}
+        pids = [p["id"] for p in partidas]
+
+        lim = await con.fetchrow(
+            """SELECT LEAST((SELECT MIN(fecha) FROM ev_avances_diarios WHERE partida_id = ANY($1)),
+                            (SELECT MIN(fecha) FROM tareo_partida WHERE partida_id = ANY($1))) AS ini,
+                      GREATEST((SELECT MAX(fecha) FROM ev_avances_diarios WHERE partida_id = ANY($1)),
+                               (SELECT MAX(COALESCE(fecha_fin, fecha)) FROM prog_actividades
+                                WHERE partida_id = ANY($1))) AS fin""", pids)
+        hoy = fecha_lima()
+        ini = lim["ini"] or hoy
+        fin = max(lim["fin"] or hoy, hoy)
+        base = _lunes_de(parse_fecha(desde) or ini)
+        fin_dom = fin + timedelta(days=6 - fin.weekday())
+        n_sem = min(max(1, int(semanas) or ((fin_dom - base).days + 1) // 7), 26)
+        fin_dom = min(fin_dom, base + timedelta(days=n_sem * 7 - 1))
+        truncado = (base + timedelta(days=n_sem * 7 - 1)) < fin
+
+        real_rows = await con.fetch(
+            """SELECT partida_id, hito_id, fecha::text AS f, cantidad_dia
+               FROM ev_avances_diarios
+               WHERE partida_id = ANY($1) AND fecha BETWEEN $2 AND $3
+                 AND cantidad_dia IS NOT NULL""", pids, base, fin_dom)
+        hh_rows = await con.fetch(
+            """SELECT partida_id, fecha::text AS f, SUM(hh) AS hh
+               FROM tareo_partida
+               WHERE partida_id = ANY($1) AND fecha BETWEEN $2 AND $3 AND hh IS NOT NULL
+               GROUP BY partida_id, fecha""", pids, base, fin_dom)
+        acts = [dict(r) for r in await con.fetch(
+            """SELECT id, partida_id, hito_id, fecha, fecha_fin, estado,
+                      dias_salto, dias_medio, metrado_prog
+               FROM prog_actividades
+               WHERE partida_id = ANY($1)
+               ORDER BY fecha""", pids)]
+        prog_rows = await con.fetch(
+            """SELECT pm.actividad_id, pm.fecha::text AS f, pm.cantidad,
+                      pa.partida_id, pa.hito_id
+               FROM prog_metrado_dia pm
+               JOIN prog_actividades pa ON pa.id = pm.actividad_id
+               WHERE pa.partida_id = ANY($1) AND pm.fecha BETWEEN $2 AND $3""",
+            pids, base, fin_dom)
+        hitos_rows = [dict(r) for r in await con.fetch(
+            """SELECT id, partida_id, descripcion, peso, es_principal FROM ev_hitos
+               WHERE partida_id = ANY($1)
+               ORDER BY partida_id, es_principal DESC, peso DESC, id""", pids)]
+        primer_reg = {r["partida_id"]: r["ini"] for r in await con.fetch(
+            """SELECT partida_id, LEAST(MIN(f1), MIN(f2)) AS ini FROM (
+                 SELECT partida_id, fecha AS f1, NULL::date AS f2
+                   FROM ev_avances_diarios WHERE partida_id = ANY($1)
+                 UNION ALL
+                 SELECT partida_id, NULL::date, fecha FROM tareo_partida
+                  WHERE partida_id = ANY($1)) x GROUP BY partida_id""", pids)}
+        dias_semana, feriados = await _calendario(con, 1, base, fin_dom)
+
+    principal_de: dict = {}
+    hito_info: dict = {}
+    for h in hitos_rows:
+        principal_de.setdefault(h["partida_id"], h["id"])
+        hito_info[h["id"]] = h
+
+    def _hkey(pid, hid):
+        return None if hid is None or hid == principal_de.get(pid) else hid
+
+    real_map: dict = {}
+    for r in real_rows:
+        real_map.setdefault((r["partida_id"], _hkey(r["partida_id"], r["hito_id"])),
+                            {})[r["f"]] = float(r["cantidad_dia"])
+    hh_map: dict = {}
+    for r in hh_rows:
+        hh_map.setdefault(r["partida_id"], {})[r["f"]] = float(r["hh"])
+    prog_map: dict = {}
+    for r in prog_rows:
+        k = (r["partida_id"], _hkey(r["partida_id"], r["hito_id"]))
+        prog_map.setdefault(k, {})[r["f"]] = \
+            prog_map.get(k, {}).get(r["f"], 0) + float(r["cantidad"])
+    acts_map: dict = {}
+    for a in acts:
+        acts_map.setdefault((a["partida_id"], _hkey(a["partida_id"], a["hito_id"])),
+                            []).append({
+            "id": a["id"], "fecha": str(a["fecha"]),
+            "fecha_fin": str(a["fecha_fin"] or a["fecha"]), "estado": a["estado"],
+            "dias_salto": [str(d) for d in (a["dias_salto"] or [])],
+            "dias_medio": [str(d) for d in (a["dias_medio"] or [])],
+            "metrado_prog": float(a["metrado_prog"]) if a["metrado_prog"] is not None else None,
+        })
+
+    out = []
+    for p in partidas:
+        pid = p["id"]
+        claves = sorted(
+            {k[1] for m in (real_map, prog_map, acts_map) for k in m if k[0] == pid},
+            key=lambda h: (h is not None, h or 0))
+        if not claves:
+            claves = [None]
+        etapas = [{
+            "hito_id": hk,
+            "hito_desc": hito_info[hk]["descripcion"] if hk in hito_info else None,
+            "hito_peso": float(hito_info[hk]["peso"]) if hk in hito_info else None,
+            "real": real_map.get((pid, hk), {}),
+            "prog": prog_map.get((pid, hk), {}),
+            "actividades": acts_map.get((pid, hk), []),
+        } for hk in claves]
+        out.append({
+            "id": pid, "codigo": p["codigo"], "descripcion": p["descripcion"],
+            "unidad": p["unidad"], "metrado": float(p["metrado"] or 0),
+            "factor_conv": round(float(p["factor_conv"] or 0), 4),
+            "hh_presup": float(p["hh_presup"] or 0),
+            "hh": hh_map.get(pid, {}),
+            "primer_registro": str(primer_reg[pid]) if primer_reg.get(pid) else None,
+            "sin_registros": primer_reg.get(pid) is None,
+            "etapas": etapas,
+        })
+
+    n_dias = (fin_dom - base).days + 1
+    sem_out = [{"lunes": str(base + timedelta(days=i * 7)),
+                "domingo": str(base + timedelta(days=i * 7 + 6)),
+                "fechas": [str(base + timedelta(days=i * 7 + d)) for d in range(7)]}
+               for i in range(n_dias // 7)]
+    return {"otm": otm, "desde": str(base), "hasta": str(fin_dom),
+            "truncado": truncado, "hoy": str(hoy),
+            "fechas": [str(base + timedelta(days=i)) for i in range(n_dias)],
+            "semanas": sem_out, "dias_semana": sorted(dias_semana),
+            "feriados": sorted(str(f) for f in feriados), "partidas": out}
 
 
 @router.get("/actividades/{act_id}/restricciones")
