@@ -66,14 +66,14 @@ from routers.ev import (  # noqa: E402
     anomalias as _ev_anomalias, avance_diario as _ev_avance, captura as _ev_captura,
     conflictos as _ev_conflictos, historico as _ev_historico,
     improductivas as _ev_improd, isp as _ev_isp, matriz as _ev_matriz,
-    partidas as _ev_partidas, rendimiento as _ev_rend, tarifas as _ev_tarifas,
-    valorizado as _ev_valorizado,
+    partidas as _ev_partidas, performance as _ev_perf, rendimiento as _ev_rend,
+    tarifas as _ev_tarifas, valorizado as _ev_valorizado,
 )
 from routers.ev._modelos import *  # noqa: E402,F401,F403 (compat: modelos re-exportados)
 from routers.ev.tarifas import _HH_POR_CARGO_SQL, _resultado_operativo  # noqa: E402,F401 (tests)
 
 for _m in (_ev_partidas, _ev_captura, _ev_isp, _ev_anomalias, _ev_improd,
            _ev_valorizado, _ev_tarifas, _ev_avance, _ev_rend, _ev_historico,
-           _ev_conflictos, _ev_matriz):
+           _ev_conflictos, _ev_matriz, _ev_perf):
     router.include_router(_m.router)
     router_campo.include_router(_m.router_campo)

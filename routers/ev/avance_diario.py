@@ -147,11 +147,14 @@ async def semana_grid(
                 fallback_by_date = {r["f"]: float(r["hh_dia"] or 0) for r in fb}
 
             # ── Avances diarios (cant_ejecutada) ─────────────────
+            # Solo hito principal (hito_id NULL) = cantidad instalada; las
+            # etapas desplegadas por hitos viven en el LookAhead (0025).
             cant_rows = await con.fetch(
                 """SELECT partida_id, fecha::text AS f, cantidad_dia
                    FROM ev_avances_diarios
                    WHERE partida_id = ANY($1)
-                     AND fecha >= $2::date AND fecha <= $3::date""",
+                     AND fecha >= $2::date AND fecha <= $3::date
+                     AND hito_id IS NULL""",
                 p_ids,
                 lunes_date,
                 domingo_date,
@@ -254,12 +257,13 @@ async def guardar_avance_diario(data: dict):
     if not partida_id or not fecha_str:
         raise HTTPException(400, "partida_id y fecha son requeridos")
 
+    hito_id = int(data["hito_id"]) if data.get("hito_id") else None
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
             await registrar_avance_partida(
                 con, int(partida_id), _as_date(fecha_str), cantidad_dia,
-                notas=notas, actualizar_notas=True)
+                notas=notas, actualizar_notas=True, hito_id=hito_id)
     return {"ok": True}
 
 

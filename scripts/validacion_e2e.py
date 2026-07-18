@@ -580,6 +580,118 @@ def main():
           and g8b.get("fecha") == "2026-06-12" and g8b.get("fecha_fin") == "2026-06-13",
           f"movidas={r.json().get('movidas')} rango={g8b.get('fecha')}..{g8b.get('fecha_fin')}")
 
+    # ── Hitos + fuente única (migración 0025, encargo 2026-07-18) ──
+
+    # P29 — ROLLUP: cada registro diario deriva ev_avances del hito principal
+    # (la ENTRADA del motor EV) = Σ diario de la semana canónica.
+    r = c.post(f"{API}/ev/avance-diario",
+               json={"partida_id": p1["id"], "fecha": "2026-06-04", "cantidad_dia": 2})
+    cur.execute("SELECT COALESCE(SUM(cantidad_dia),0) FROM ev_avances_diarios "
+                "WHERE partida_id=%s AND hito_id IS NULL AND semana=1", (p1["id"],))
+    suma_diaria = float(cur.fetchone()[0])
+    cur.execute("SELECT cantidad_acum FROM ev_avances WHERE hito_id=%s AND semana=1",
+                (p1["hito_id"],))
+    fila_acum = cur.fetchone()
+    check("P29 rollup fuente única: ev_avances(sem 1) del hito principal = suma del diario",
+          r.status_code == 200 and fila_acum is not None
+          and abs(float(fila_acum[0]) - suma_diaria) < 0.001,
+          f"acum={fila_acum} sum_diario={suma_diaria}")
+
+    # P30 — ETAPAS: partida con 2 hitos desplegada por hitos en el lote, con
+    # FS encadenado; el diario de la etapa NO principal alimenta SU hito y no
+    # aparece en semana-grid (que es solo cantidad instalada = principal).
+    cur.execute("INSERT INTO ev_partidas (codigo, fase, descripcion, unidad, "
+                "metrado_presup, hh_presup, otm_id) VALUES "
+                "('E2E-003','F-E2E','Partida etapas','und',20,80,'OTM-E2E') RETURNING id")
+    p3 = cur.fetchone()[0]
+    cur.execute("INSERT INTO ev_hitos (partida_id, numero, descripcion, peso, es_principal) "
+                "VALUES (%s,1,'Habilitación',0.4,false) RETURNING id", (p3,))
+    h1 = cur.fetchone()[0]
+    cur.execute("INSERT INTO ev_hitos (partida_id, numero, descripcion, peso, es_principal) "
+                "VALUES (%s,2,'Montaje',0.6,true) RETURNING id", (p3,))
+    h2 = cur.fetchone()[0]
+    r = c.post(f"{API}/ev/programacion/actividades-lote", json={
+        "proyecto_id": 1, "otm_id": "OTM-E2E", "encadenar_hitos": True,
+        "items": [
+            {"partida_id": p3, "hito_id": h1, "fecha": "2026-06-15", "fecha_fin": "2026-06-16"},
+            {"partida_id": p3, "hito_id": h2, "fecha": "2026-06-17", "fecha_fin": "2026-06-18"},
+        ]})
+    lote = r.json() if r.status_code == 200 else {}
+    acts_etapa = lote.get("actividades", [])
+    act_h1 = next((a for a in acts_etapa if a.get("hito_id") == h1), {})
+    act_h2 = next((a for a in acts_etapa if a.get("hito_id") == h2), {})
+    cur.execute("SELECT count(*) FROM prog_dependencias WHERE actividad_id=%s "
+                "AND predecesora_id=%s", (act_h2.get("id"), act_h1.get("id")))
+    fs_creado = cur.fetchone()[0]
+    r2 = c.post(f"{API}/ev/programacion/actividades/{act_h1.get('id')}/avance-dia",
+                json={"fecha": "2026-06-15", "cantidad": 4})
+    cur.execute("SELECT cantidad_acum FROM ev_avances WHERE hito_id=%s", (h1,))
+    acum_h1 = cur.fetchone()
+    r3 = c.get(f"{API}/ev/semana-grid", params={"semana": 3, "otm": "OTM-E2E",
+                                                "lunes": "2026-06-15"})
+    fila3 = next((p for p in r3.json().get("partidas", []) if p["id"] == p3), {})
+    cant_grid = (fila3.get("dias", {}).get("2026-06-15") or {}).get("cant_ejecutada")
+    r4 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-15", "semanas": 1})
+    ge = next((a for g in r4.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act_h1.get("id")), {})
+    check("P30 etapas: lote por hitos con FS auto, el diario alimenta SU hito y "
+          "semana-grid solo muestra el principal",
+          r.status_code == 200 and len(acts_etapa) == 2 and fs_creado == 1
+          and r2.status_code == 200 and acum_h1 is not None
+          and abs(float(acum_h1[0]) - 4) < 0.001
+          and cant_grid is None
+          and ge.get("hito_desc") == "Habilitación"
+          and ge.get("real", {}).get("2026-06-15") == 4,
+          f"lote={len(acts_etapa)} fs={fs_creado} acum_h1={acum_h1} "
+          f"grid_cant={cant_grid} hito_desc={ge.get('hito_desc')}")
+
+    # P31 — CHECKPOINT: etapa manual sin diario acepta pct; la etapa con
+    # diario lo rechaza (409, la gobierna el rollup).
+    cur.execute("INSERT INTO ev_partidas (codigo, fase, descripcion, unidad, "
+                "metrado_presup, hh_presup, otm_id) VALUES "
+                "('E2E-004','F-E2E','Partida checkpoint','und',10,40,'OTM-E2E') RETURNING id")
+    p4 = cur.fetchone()[0]
+    cur.execute("INSERT INTO ev_hitos (partida_id, numero, descripcion, peso, es_principal) "
+                "VALUES (%s,1,'QC',0.3,false) RETURNING id", (p4,))
+    h4 = cur.fetchone()[0]
+    cur.execute("INSERT INTO ev_hitos (partida_id, numero, descripcion, peso, es_principal) "
+                "VALUES (%s,2,'Ejecución',0.7,true)", (p4,))
+    r = c.post(f"{API}/ev/programacion/hitos/{h4}/checkpoint",
+               json={"fecha": FECHA_TAREO, "pct": 1})
+    cur.execute("SELECT cantidad_acum FROM ev_avances WHERE hito_id=%s", (h4,))
+    acum_h4 = cur.fetchone()
+    r2 = c.post(f"{API}/ev/programacion/hitos/{h1}/checkpoint", json={"pct": 1})
+    check("P31 checkpoint: etapa manual guarda pct*metrado y la etapa con diario da 409",
+          r.status_code == 200 and acum_h4 is not None
+          and abs(float(acum_h4[0]) - 10) < 0.001 and r2.status_code == 409,
+          f"chk={r.status_code} acum={acum_h4} con_diario={r2.status_code}")
+
+    # P32 — HISTORIAL-GRID: arranca en el primer registro, trae las etapas y
+    # marca sin_registros la partida que aún no tiene diario ni tareo.
+    r = c.get(f"{API}/ev/programacion/historial-grid", params={"otm": "OTM-E2E"})
+    hg = r.json() if r.status_code == 200 else {}
+    hg3 = next((p for p in hg.get("partidas", []) if p["id"] == p3), {})
+    hg4 = next((p for p in hg.get("partidas", []) if p["id"] == p4), {})
+    etapas3 = {e.get("hito_id") for e in hg3.get("etapas", [])}
+    check("P32 historial-grid: rango desde el primer registro, etapas por hito y sin_registros",
+          r.status_code == 200 and hg.get("desde") == "2026-06-01"
+          and h1 in etapas3
+          and hg3.get("sin_registros") is False
+          and hg4.get("sin_registros") is True,
+          f"desde={hg.get('desde')} etapas3={etapas3} sr4={hg4.get('sin_registros')}")
+
+    # P33 — PERFORMANCE: la serie semanal sale del motor con los datos ya
+    # registrados (sin llenar nada) y refleja HH ganadas > 0.
+    r = c.get(f"{API}/ev/performance", params={"hasta": 3, "otm": "OTM-E2E"})
+    pf = r.json() if r.status_code == 200 else {}
+    serie = pf.get("serie", [])
+    check("P33 performance: serie semanal auto-alimentada con HH ganadas y presupuesto",
+          r.status_code == 200 and len(serie) >= 1
+          and pf.get("hh_presup_total", 0) > 0
+          and any(s.get("hh_ganadas_acum", 0) > 0 for s in serie),
+          f"status={r.status_code} n={len(serie)} presup={pf.get('hh_presup_total')}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")

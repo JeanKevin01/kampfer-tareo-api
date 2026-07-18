@@ -62,7 +62,7 @@ _SQL = {
         SELECT ad.partida_id AS id, ev.codigo || ' — ' || COALESCE(ev.descripcion,'') AS etiqueta,
                ev.fase AS grupo, ad.fecha, SUM(ad.cantidad_dia) AS valor
         FROM ev_avances_diarios ad JOIN ev_partidas ev ON ev.id = ad.partida_id
-        WHERE ad.fecha BETWEEN $1 AND $2 {otm_ev}
+        WHERE ad.fecha BETWEEN $1 AND $2 AND ad.hito_id IS NULL {otm_ev}
         GROUP BY ad.partida_id, ev.codigo, ev.descripcion, ev.fase, ad.fecha""",
     ("trabajadores", "hh"): """
         SELECT tp.trabajador_id AS id,
