@@ -528,6 +528,58 @@ def main():
           and g7.get("dias_medio") == ["2026-06-09"],
           f"status={r.status_code} prog={g7.get('prog')} medios={g7.get('dias_medio')}")
 
+    # P26 — F5a v2: dependencia FS con anti-ciclo y retorno en el grid
+    # act7 (08-10) será antecesora de act8 (11-12); el ciclo inverso da 409.
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-06-11", "fecha_fin": "2026-06-12",
+        "otm_id": "OTM-E2E", "titulo": "E2E Sucesora", "metrado_prog": 40})
+    act8 = r.json() if r.status_code == 200 else {}
+    r2 = c.post(f"{API}/ev/programacion/actividades/{act8.get('id')}/dependencias",
+                json={"predecesora_id": act7.get("id"), "lag_dias": 0})
+    r3 = c.post(f"{API}/ev/programacion/actividades/{act7.get('id')}/dependencias",
+                json={"predecesora_id": act8.get("id")})       # ciclo → 409
+    r4 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-08", "semanas": 1})
+    g8 = next((a for g in r4.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act8.get("id")), {})
+    g7b = next((a for g in r4.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act7.get("id")), {})
+    check("P26 dependencia FS: se crea, el ciclo inverso da 409 y el grid trae PRED./sucesoras",
+          r2.status_code == 200 and r3.status_code == 409
+          and [p["id"] for p in g8.get("predecesoras", [])] == [act7.get("id")]
+          and g8.get("dep_total") == 1
+          and g7b.get("sucesoras") == [act8.get("id")],
+          f"dep={r2.status_code} ciclo={r3.status_code} preds={g8.get('predecesoras')}")
+
+    # P27 — F5b v2: mover la F.Fin de la antecesora EMPUJA a la sucesora
+    # act7 termina ahora el 11 (era 10) → act8 (11-12, dur 2 hábiles) debe
+    # arrancar el 12 y terminar el 13, con su metrado re-prorrateado (20/20).
+    r = c.put(f"{API}/ev/programacion/actividades/{act7.get('id')}",
+              json={"fecha_fin": "2026-06-11"})
+    movidas = r.json().get("movidas", []) if r.status_code == 200 else []
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-08", "semanas": 1})
+    g8 = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act8.get("id")), {})
+    check("P27 cascada: ampliar la antecesora empuja la sucesora al 12-13 y re-prorratea 20/20",
+          r.status_code == 200 and movidas == [act8.get("id")]
+          and g8.get("fecha") == "2026-06-12" and g8.get("fecha_fin") == "2026-06-13"
+          and g8.get("prog", {}).get("2026-06-12") == 20
+          and g8.get("prog", {}).get("2026-06-13") == 20,
+          f"movidas={movidas} rango={g8.get('fecha')}..{g8.get('fecha_fin')} prog={g8.get('prog')}")
+
+    # P28 — la cascada nunca ADELANTA: acortar la antecesora no mueve a nadie
+    r = c.put(f"{API}/ev/programacion/actividades/{act7.get('id')}",
+              json={"fecha_fin": "2026-06-09"})
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-08", "semanas": 1})
+    g8b = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act8.get("id")), {})
+    check("P28 la cascada nunca adelanta: acortar la antecesora deja a la sucesora en 12-13",
+          r.status_code == 200 and r.json().get("movidas") == []
+          and g8b.get("fecha") == "2026-06-12" and g8b.get("fecha_fin") == "2026-06-13",
+          f"movidas={r.json().get('movidas')} rango={g8b.get('fecha')}..{g8b.get('fecha_fin')}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
