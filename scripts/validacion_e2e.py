@@ -73,6 +73,7 @@ def limpiar_y_sembrar(cur):
     cur.execute("INSERT INTO trabajadores (id, nombre, cargo) VALUES "
                 "('901','Trabajador E2E Uno','OFICIAL'),('902','Trabajador E2E Dos','OPERARIO') "
                 "ON CONFLICT (id) DO NOTHING")
+    cur.execute("DELETE FROM otms WHERE descripcion LIKE 'E2E PROYECTO%'")
     cur.execute("INSERT INTO otms (id, descripcion, proyecto_id) VALUES "
                 "('OTM-E2E','OTM de validación E2E',1) ON CONFLICT (id) DO NOTHING")
     cur.execute("INSERT INTO ev_config (clave, valor) VALUES ('fecha_base', %s) "
@@ -691,6 +692,27 @@ def main():
           and pf.get("hh_presup_total", 0) > 0
           and any(s.get("hh_ganadas_acum", 0) > 0 for s in serie),
           f"status={r.status_code} n={len(serie)} presup={pf.get('hh_presup_total')}")
+
+    # P34 — PROYECTOS (2ª tanda): id PROY-#### automático con F.Fin calculada,
+    # el similar (mismo nombre / monto ±100) responde 409, y forzar crea igual.
+    r = c.post(f"{API}/admin/otm", json={
+        "nombre": "E2E PROYECTO NUEVO", "moneda": "USD", "estado": "EJECUCION",
+        "fecha_inicio": "2026-06-01", "plazo": 30, "monto_contractual": 5000})
+    j1 = r.json() if r.status_code == 200 else {}
+    cur.execute("SELECT fecha_fin, moneda FROM otms WHERE id = %s", (j1.get("id", ""),))
+    fila_p = cur.fetchone()
+    r2 = c.post(f"{API}/admin/otm", json={
+        "nombre": "E2E PROYECTO NUEVO", "monto_contractual": 5050})
+    sim = (r2.json().get("detail") or {}).get("similares", []) if r2.status_code == 409 else []
+    r3 = c.post(f"{API}/admin/otm", json={
+        "nombre": "E2E PROYECTO NUEVO 2", "monto_contractual": 5050, "forzar": True})
+    check("P34 proyectos: PROY-#### auto + F.Fin=inicio+plazo, similar da 409 y forzar crea",
+          r.status_code == 200 and str(j1.get("id", "")).startswith("PROY-")
+          and fila_p is not None and str(fila_p[0]) == "2026-07-01"
+          and fila_p[1] == "USD"
+          and r2.status_code == 409 and len(sim) >= 1
+          and r3.status_code == 200,
+          f"id={j1.get('id')} fin={fila_p} sim={r2.status_code}/{len(sim)} forzar={r3.status_code}")
 
     print()
     if _fallas:
