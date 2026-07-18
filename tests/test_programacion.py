@@ -284,6 +284,12 @@ def test_avance_actividad_supervisor_403():
     assert r.status_code == 403
 
 
+def test_causa_planner_invalida_422():
+    r = _client().put("/ev/programacion/actividades/1",
+                      json={"causa_nc_planner_cat": "FLOJERA"}, headers=_hdr("oficina"))
+    assert r.status_code == 422
+
+
 def test_dias_salto_invalidos_400():
     r = _client().post("/ev/programacion/actividades",
                        json={"fecha": "2026-07-13", "titulo": "x", "dias_salto": ["no-fecha"]},

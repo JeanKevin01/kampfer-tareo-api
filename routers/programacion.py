@@ -280,7 +280,10 @@ async def editar_actividad(act_id: int, data: dict):
         campos.append("dias_salto"); valores.append(_parse_saltos(data["dias_salto"]))
     if "causa_nc_cat" in data:
         campos.append("causa_nc_cat"); valores.append(_validar_cnc(data["causa_nc_cat"]))
-    for k in ("titulo", "descripcion", "responsable", "otm_id", "supervisor_id", "causa_nc"):
+    if "causa_nc_planner_cat" in data:
+        campos.append("causa_nc_planner_cat"); valores.append(_validar_cnc(data["causa_nc_planner_cat"]))
+    for k in ("titulo", "descripcion", "responsable", "otm_id", "supervisor_id",
+              "causa_nc", "causa_nc_planner"):
         if k in data:
             v = str(data[k]).strip() if data[k] is not None else None
             if k == "titulo" and not v:
@@ -623,6 +626,8 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "responsable": a["responsable"], "supervisor_id": a["supervisor_id"],
             "supervisor_nombre": a["supervisor_nombre"],
             "causa_nc": a["causa_nc"], "causa_nc_cat": a["causa_nc_cat"],
+            "causa_nc_planner": a["causa_nc_planner"],
+            "causa_nc_planner_cat": a["causa_nc_planner_cat"],
             "rest_pend": a["rest_pend"], "rest_total": a["rest_total"],
             "dias_salto": [str(d) for d in (a["dias_salto"] or [])],
             "und": pinfo.get("unidad") or a["und"],
@@ -801,8 +806,10 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
            FROM prog_actividades
            WHERE proyecto_id = $1 AND fecha BETWEEN $2 AND $3
            GROUP BY 1 ORDER BY 1""", proyecto_id, desde, hasta)
+    # Regla (F3 v2): en el Pareto manda la causa del PLANNER si existe (es la
+    # depurada por oficina); si no, cae a la reportada desde campo.
     cnc_rows = await pool.fetch(
-        """SELECT COALESCE(causa_nc_cat, 'OTROS') AS causa, count(*) AS n
+        """SELECT COALESCE(causa_nc_planner_cat, causa_nc_cat, 'OTROS') AS causa, count(*) AS n
            FROM prog_actividades
            WHERE proyecto_id = $1 AND estado = 'NO_CUMPLIDA' AND fecha BETWEEN $2 AND $3
            GROUP BY 1 ORDER BY n DESC""", proyecto_id, desde, hasta)

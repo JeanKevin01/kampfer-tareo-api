@@ -491,6 +491,25 @@ def main():
           and r3.status_code == 200 and "2026-06-03" not in g6b.get("real", {}),
           f"real={g6.get('real')} prog={g6.get('prog')} sem={fila_sem}")
 
+    # P24 — F3 v2: causa de no cumplimiento del PLANNER, separada de la de campo;
+    # en el Pareto manda la del planner (act2 pasa de MATERIALES a PROGRAMACION).
+    r = c.put(f"{API}/ev/programacion/actividades/{act2.get('id')}",
+              json={"causa_nc_planner_cat": "PROGRAMACION",
+                    "causa_nc_planner": "Secuencia mal estimada"})
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    a2g = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act2.get("id")), {})
+    r3 = c.get(f"{API}/ev/programacion/ppc", params={"proyecto_id": 1, "semanas": 26})
+    pareto = {x["causa"]: x["n"] for x in r3.json().get("cnc", [])}
+    check("P24 causa del planner: se guarda, sale en el grid y manda en el Pareto",
+          r.status_code == 200
+          and a2g.get("causa_nc_planner_cat") == "PROGRAMACION"
+          and a2g.get("causa_nc_planner") == "Secuencia mal estimada"
+          and a2g.get("causa_nc_cat") == "MATERIALES"
+          and pareto.get("PROGRAMACION", 0) >= 1,
+          f"act={a2g.get('causa_nc_planner_cat')}/{a2g.get('causa_nc_cat')} pareto={pareto}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
