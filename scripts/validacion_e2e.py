@@ -465,6 +465,32 @@ def main():
         c.post(f"{API}/ev/programacion/actividades/{act6.get('id')}/avance-dia",
                json={"fecha": fx, "cantidad": None})
 
+    # P23 — F1 LookAhead v2: el avance por la VÍA DEL EV (/ev/avance-diario)
+    # re-prorratea la actividad vinculada igual que la vía de programación,
+    # y la semana se calcula con core.tiempo.semana_de (base = lunes 06-01).
+    r = c.post(f"{API}/ev/avance-diario",
+               json={"partida_id": p1["id"], "fecha": "2026-06-03", "cantidad_dia": 5})
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    g6 = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act6.get("id")), {})
+    cur.execute("SELECT semana FROM ev_avances_diarios WHERE partida_id=%s AND fecha='2026-06-03'",
+                (p1["id"],))
+    fila_sem = cur.fetchone()
+    r3 = c.post(f"{API}/ev/avance-diario",
+                json={"partida_id": p1["id"], "fecha": "2026-06-03", "cantidad_dia": None})
+    r4 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    g6b = next((a for g in r4.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act6.get("id")), {})
+    check("P23 avance vía EV re-prorratea el LookAhead (42.5/42.5), semana canónica=1 y el null borra",
+          r.status_code == 200 and g6.get("real", {}).get("2026-06-03") == 5
+          and g6.get("prog", {}).get("2026-06-04") == 42.5
+          and g6.get("prog", {}).get("2026-06-05") == 42.5
+          and fila_sem is not None and fila_sem[0] == 1
+          and r3.status_code == 200 and "2026-06-03" not in g6b.get("real", {}),
+          f"real={g6.get('real')} prog={g6.get('prog')} sem={fila_sem}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")

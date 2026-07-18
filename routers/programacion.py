@@ -21,7 +21,7 @@ from core.db import db
 from core.log import get_logger
 from core.media import (MAX_FOTO_BYTES, MAX_FOTOS_POR_REPORTE, guardar_foto,
                         media_dir, semana_iso_a_lunes, url_firmada)
-from core.tiempo import fecha_lima, parse_fecha
+from core.tiempo import fecha_lima, parse_fecha, semana_de
 
 log = get_logger("programacion")
 
@@ -428,6 +428,59 @@ async def borrar_feriado(fer_id: int):
     return {"ok": True, "reprorrateadas": n}
 
 
+def _parse_cantidad(v) -> Optional[float]:
+    if v in (None, ""):
+        return None
+    try:
+        c = float(v)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "cantidad debe ser un número")
+    if c < 0:
+        raise HTTPException(400, "la cantidad no puede ser negativa")
+    return c
+
+
+async def registrar_avance_partida(con, partida_id: int, fecha: date, cantidad,
+                                   notas=None, actualizar_notas: bool = False) -> None:
+    """Escritura ÚNICA del avance real diario (F1 LookAhead v2 / auditoría F-2):
+    upsert (o DELETE si cantidad es None) en ev_avances_diarios y re-prorrateo
+    de TODA actividad del LookAhead vinculada a la partida cuyo rango cubre la
+    fecha — venga el avance de programación o del módulo Valor Ganado, el dato
+    y sus consecuencias son los mismos. La semana usa core.tiempo.semana_de."""
+    from routers.ev._datos import _fecha_base
+    if cantidad is None:
+        await con.execute(
+            "DELETE FROM ev_avances_diarios WHERE partida_id = $1 AND fecha = $2",
+            partida_id, fecha)
+    else:
+        base = await _fecha_base(con)
+        semana = max(1, semana_de(fecha, base)) if base else 1
+        if actualizar_notas:
+            await con.execute(
+                """INSERT INTO ev_avances_diarios
+                     (partida_id, fecha, semana, cantidad_dia, notas, registrado_en)
+                   VALUES ($1, $2, $3, $4, $5, NOW())
+                   ON CONFLICT (partida_id, fecha)
+                   DO UPDATE SET cantidad_dia = $4, notas = $5, registrado_en = NOW()""",
+                partida_id, fecha, semana, cantidad, notas)
+        else:
+            await con.execute(
+                """INSERT INTO ev_avances_diarios
+                     (partida_id, fecha, semana, cantidad_dia, registrado_en)
+                   VALUES ($1, $2, $3, $4, NOW())
+                   ON CONFLICT (partida_id, fecha)
+                   DO UPDATE SET cantidad_dia = $4, registrado_en = NOW()""",
+                partida_id, fecha, semana, cantidad)
+    # Los días anteriores al registrado no se tocan; el saldo para cumplir el
+    # metrado meta se re-prorratea en los días siguientes de cada actividad.
+    acts = await con.fetch(
+        """SELECT * FROM prog_actividades
+           WHERE partida_id = $1 AND $2 BETWEEN fecha AND COALESCE(fecha_fin, fecha)""",
+        partida_id, fecha)
+    for a in acts:
+        await _redistribuir(con, dict(a), solo_despues_de=fecha)
+
+
 @router.post("/actividades/{act_id}/avance-dia")
 async def avance_dia_actividad(act_id: int, data: dict):
     """El avance REAL del día contra una actividad del LookAhead: escribe en
@@ -435,20 +488,10 @@ async def avance_dia_actividad(act_id: int, data: dict):
     el saldo entre los días hábiles restantes — la actividad sigue apuntando
     a terminar en su F.Fin. El programado del día avanzado queda congelado
     como línea base de comparación (celeste→verde/ámbar/rojo en el panel)."""
-    from routers.ev._datos import _fecha_base
     f = parse_fecha(data.get("fecha"))
     if not f:
         raise HTTPException(400, "fecha requerida")
-    cantidad = data.get("cantidad")
-    if cantidad not in (None, ""):
-        try:
-            cantidad = float(cantidad)
-        except (TypeError, ValueError):
-            raise HTTPException(400, "cantidad debe ser un número")
-        if cantidad < 0:
-            raise HTTPException(400, "la cantidad no puede ser negativa")
-    else:
-        cantidad = None
+    cantidad = _parse_cantidad(data.get("cantidad"))
     pool = await db()
     async with pool.acquire() as con:
         act = await con.fetchrow("SELECT * FROM prog_actividades WHERE id = $1", act_id)
@@ -457,23 +500,7 @@ async def avance_dia_actividad(act_id: int, data: dict):
         if not act["partida_id"]:
             raise HTTPException(400, "La actividad no tiene partida de control: asígnala para registrar avance")
         async with con.transaction():
-            if cantidad is None:
-                await con.execute(
-                    "DELETE FROM ev_avances_diarios WHERE partida_id = $1 AND fecha = $2",
-                    act["partida_id"], f)
-            else:
-                base = await _fecha_base(con)
-                semana = max(1, (f - base).days // 7 + 1) if base else 1
-                await con.execute(
-                    """INSERT INTO ev_avances_diarios
-                         (partida_id, fecha, semana, cantidad_dia, registrado_en)
-                       VALUES ($1, $2, $3, $4, NOW())
-                       ON CONFLICT (partida_id, fecha)
-                       DO UPDATE SET cantidad_dia = $4, registrado_en = NOW()""",
-                    act["partida_id"], f, semana, cantidad)
-            # Los días anteriores al registrado no se tocan; el saldo para
-            # cumplir el metrado meta se re-prorratea en los días siguientes.
-            await _redistribuir(con, dict(act), solo_despues_de=f)
+            await registrar_avance_partida(con, act["partida_id"], f, cantidad)
     return {"ok": True, "cantidad": cantidad}
 
 
@@ -675,39 +702,21 @@ async def editar_metrado_dias(act_id: int, data: dict):
 async def avance_dia(data: dict):
     """Registra el metrado REAL ejecutado de una partida en un día — escribe
     en ev_avances_diarios, la misma tabla del módulo de Valor Ganado (2 vías,
-    un solo dato). cantidad null borra el registro del día."""
-    from routers.ev._datos import _fecha_base
+    un solo dato) y re-prorratea la actividad vinculada si existe.
+    cantidad null borra el registro del día."""
     partida_id = data.get("partida_id")
     f = parse_fecha(data.get("fecha"))
     if not partida_id or not f:
         raise HTTPException(400, "partida_id y fecha son obligatorios")
-    cantidad = data.get("cantidad")
+    cantidad = _parse_cantidad(data.get("cantidad"))
     pool = await db()
     async with pool.acquire() as con:
-        if cantidad in (None, ""):
-            await con.execute(
-                "DELETE FROM ev_avances_diarios WHERE partida_id = $1 AND fecha = $2",
-                int(partida_id), f)
-            return {"ok": True, "cantidad": None}
-        try:
-            cant = float(cantidad)
-        except (TypeError, ValueError):
-            raise HTTPException(400, "cantidad debe ser un número")
-        if cant < 0:
-            raise HTTPException(400, "la cantidad no puede ser negativa")
-        base = await _fecha_base(con)
-        semana = max(1, (f - base).days // 7 + 1) if base else 1
-        try:
-            await con.execute(
-                """INSERT INTO ev_avances_diarios
-                     (partida_id, fecha, semana, cantidad_dia, registrado_en)
-                   VALUES ($1, $2, $3, $4, NOW())
-                   ON CONFLICT (partida_id, fecha)
-                   DO UPDATE SET cantidad_dia = $4, registrado_en = NOW()""",
-                int(partida_id), f, semana, cant)
-        except _ERRORES_DATO:
-            raise HTTPException(400, "Partida inexistente o datos inválidos")
-    return {"ok": True, "cantidad": cant}
+        async with con.transaction():
+            try:
+                await registrar_avance_partida(con, int(partida_id), f, cantidad)
+            except _ERRORES_DATO:
+                raise HTTPException(400, "Partida inexistente o datos inválidos")
+    return {"ok": True, "cantidad": cantidad}
 
 
 @router.get("/actividades/{act_id}/restricciones")
