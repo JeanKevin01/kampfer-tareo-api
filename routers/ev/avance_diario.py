@@ -238,30 +238,28 @@ async def semana_grid(
 
 @router_campo.post("/avance-diario")
 async def guardar_avance_diario(data: dict):
-    """Guarda o actualiza la cantidad ejecutada de una partida en un día."""
+    """Guarda o actualiza la cantidad ejecutada de una partida en un día.
+
+    F1 LookAhead v2: usa el helper ÚNICO registrar_avance_partida — el mismo
+    del módulo de programación — así el avance ingresado desde Valor Ganado
+    también re-prorratea la actividad del LookAhead vinculada (un solo dato,
+    mismas consecuencias por las dos vías). cantidad_dia None borra el día."""
+    from routers.programacion import registrar_avance_partida
     partida_id   = data.get("partida_id")
     fecha_str    = data.get("fecha")
-    cantidad_dia = data.get("cantidad_dia")  # puede ser None para borrar
+    cantidad_dia = data.get("cantidad_dia")  # None = borrar el registro del día
+    if cantidad_dia in (None, ""):
+        cantidad_dia = None
     notas        = data.get("notas")
     if not partida_id or not fecha_str:
         raise HTTPException(400, "partida_id y fecha son requeridos")
 
     pool = await db()
     async with pool.acquire() as con:
-        base = await _fecha_base(con)
-        semana = 1
-        if base:
-            delta  = (date.fromisoformat(fecha_str) - base).days
-            semana = max(1, delta // 7 + 1)
-
-        await con.execute(
-            """INSERT INTO ev_avances_diarios
-                 (partida_id, fecha, semana, cantidad_dia, notas, registrado_en)
-               VALUES ($1, $2::date, $3, $4, $5, NOW())
-               ON CONFLICT (partida_id, fecha)
-               DO UPDATE SET cantidad_dia=$4, notas=$5, registrado_en=NOW()""",
-            partida_id, _as_date(fecha_str), semana, cantidad_dia, notas
-        )
+        async with con.transaction():
+            await registrar_avance_partida(
+                con, int(partida_id), _as_date(fecha_str), cantidad_dia,
+                notas=notas, actualizar_notas=True)
     return {"ok": True}
 
 

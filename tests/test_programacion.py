@@ -235,6 +235,34 @@ def test_distribuir_un_dia():
     assert d == {_dias("2026-07-13")[0]: 87.593}
 
 
+def test_distribuir_medio_dia_pesa_la_mitad():
+    # 90 en [completo, medio, completo] → pesos 2.5 → 36 / 18 / 36
+    from routers.programacion import _distribuir
+    dias = _dias("2026-07-13", "2026-07-14", "2026-07-15")
+    d = _distribuir(90.0, dias, medios={dias[1]})
+    assert d[dias[0]] == 36.0
+    assert d[dias[1]] == 18.0
+    assert d[dias[2]] == 36.0
+    assert round(sum(d.values()), 3) == 90.0
+
+
+def test_distribuir_medio_dia_al_final_absorbe_redondeo():
+    from routers.programacion import _distribuir
+    dias = _dias("2026-07-13", "2026-07-14")
+    d = _distribuir(100.0, dias, medios={dias[1]})    # pesos 1.5 → 66.667 / 33.333
+    assert d[dias[0]] == 66.667
+    assert d[dias[1]] == 33.333
+    assert round(sum(d.values()), 3) == 100.0
+
+
+def test_salto_y_medio_a_la_vez_400():
+    r = _client().post("/ev/programacion/actividades",
+                       json={"fecha": "2026-07-13", "fecha_fin": "2026-07-15", "titulo": "x",
+                             "dias_salto": ["2026-07-14"], "dias_medio": ["2026-07-14"]},
+                       headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
 def test_dias_habiles_salta_domingo_feriado_y_salto():
     # Lun 13 a Dom 19: sin domingo (calendario L-S), feriado el 15, salto el 14
     from datetime import date
@@ -282,6 +310,45 @@ def test_avance_actividad_supervisor_403():
                        json={"fecha": "2026-07-13", "cantidad": 5},
                        headers=_hdr("supervisor", "01"))
     assert r.status_code == 403
+
+
+# ── Dependencias / cascada (F5 v2) ───────────────────────────
+def test_dependencia_supervisor_403():
+    r = _client().post("/ev/programacion/actividades/1/dependencias",
+                       json={"predecesora_id": 2}, headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_dependencia_sin_predecesora_400():
+    r = _client().post("/ev/programacion/actividades/1/dependencias",
+                       json={}, headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_dependencia_a_si_misma_400():
+    r = _client().post("/ev/programacion/actividades/7/dependencias",
+                       json={"predecesora_id": 7}, headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_dependencia_lag_invalido_400():
+    r = _client().post("/ev/programacion/actividades/1/dependencias",
+                       json={"predecesora_id": 2, "lag_dias": "x"}, headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
+def test_siguiente_habil_salta_finde_y_feriado():
+    from datetime import date
+    from routers.programacion import _siguiente_habil
+    # Vie 17-jul, calendario L-V, feriado el lunes 20 → martes 21
+    d = _siguiente_habil(date(2026, 7, 17), {1, 2, 3, 4, 5}, {date(2026, 7, 20)})
+    assert d == date(2026, 7, 21)
+
+
+def test_causa_planner_invalida_422():
+    r = _client().put("/ev/programacion/actividades/1",
+                      json={"causa_nc_planner_cat": "FLOJERA"}, headers=_hdr("oficina"))
+    assert r.status_code == 422
 
 
 def test_dias_salto_invalidos_400():

@@ -21,7 +21,7 @@ from core.db import db
 from core.log import get_logger
 from core.media import (MAX_FOTO_BYTES, MAX_FOTOS_POR_REPORTE, guardar_foto,
                         media_dir, semana_iso_a_lunes, url_firmada)
-from core.tiempo import fecha_lima, parse_fecha
+from core.tiempo import fecha_lima, parse_fecha, semana_de
 
 log = get_logger("programacion")
 
@@ -64,14 +64,20 @@ def _lunes_de(fecha: date) -> date:
     return fecha - timedelta(days=fecha.weekday())
 
 
-def _distribuir(metrado: float, dias: list) -> dict:
-    """Distribución uniforme del metrado entre los días dados, como la fórmula
-    del LookAhead del ex-gerente. El último día absorbe el redondeo."""
+def _distribuir(metrado: float, dias: list, medios: set = frozenset()) -> dict:
+    """Distribución del metrado entre los días dados, como la fórmula del
+    LookAhead del ex-gerente, con PESOS: un día en `medios` pesa 0.5 (recibe
+    la mitad que un día completo, F4 v2). El último día absorbe el redondeo."""
     if not dias:
         return {}
-    cuota = round(metrado / len(dias), 3)
-    out = {d: cuota for d in dias}
-    out[dias[-1]] = round(metrado - cuota * (len(dias) - 1), 3)
+    peso = lambda d: 0.5 if d in medios else 1.0          # noqa: E731
+    cuota = metrado / sum(peso(d) for d in dias)
+    out, acum = {}, 0.0
+    for d in dias[:-1]:
+        v = round(cuota * peso(d), 3)
+        out[d] = v
+        acum += v
+    out[dias[-1]] = round(metrado - acum, 3)
     return out
 
 
@@ -131,10 +137,11 @@ async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) 
     restantes = [d for d in habiles if d not in intactos]
     if saldo <= 0 or not restantes:
         return
+    medios = set(act.get("dias_medio") or [])             # pesan 0.5 (F4 v2)
     await con.executemany(
         "INSERT INTO prog_metrado_dia (actividad_id, fecha, cantidad) VALUES ($1,$2,$3)"
         " ON CONFLICT (actividad_id, fecha) DO UPDATE SET cantidad = $3",
-        [(act["id"], f, c) for f, c in _distribuir(saldo, restantes).items() if c > 0])
+        [(act["id"], f, c) for f, c in _distribuir(saldo, restantes, medios).items() if c > 0])
 
 
 def _parse_saltos(v) -> list:
@@ -159,7 +166,9 @@ _ACT_SQL = """
            (SELECT count(*) FROM prog_restricciones pr
              WHERE pr.actividad_id = a.id) AS rest_total,
            (SELECT count(*) FROM prog_restricciones pr
-             WHERE pr.actividad_id = a.id AND NOT pr.liberada) AS rest_pend
+             WHERE pr.actividad_id = a.id AND NOT pr.liberada) AS rest_pend,
+           (SELECT count(*) FROM prog_dependencias pd
+             WHERE pd.actividad_id = a.id OR pd.predecesora_id = a.id) AS dep_total
     FROM prog_actividades a
     LEFT JOIN otms o ON o.id = a.otm_id
     LEFT JOIN supervisores s ON s.id = a.supervisor_id
@@ -236,6 +245,9 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
     metrado = _parse_metrado(data.get("metrado_prog"))
     und = (str(data.get("und") or "").strip()[:10] or None)
     saltos = _parse_saltos(data.get("dias_salto"))
+    medios = _parse_saltos(data.get("dias_medio"))
+    if set(saltos) & set(medios):
+        raise HTTPException(400, "Un día no puede ser salto y medio día a la vez")
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
@@ -243,14 +255,15 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
                 row = await con.fetchrow(
                     """INSERT INTO prog_actividades
                        (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo, descripcion,
-                        responsable, supervisor_id, metrado_prog, und, dias_salto, creado_por)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *""",
+                        responsable, supervisor_id, metrado_prog, und, dias_salto, dias_medio,
+                        creado_por)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *""",
                     int(data.get("proyecto_id") or 1), fecha, fecha_fin,
                     (str(data["otm_id"]).strip() or None) if data.get("otm_id") else None,
                     int(data["partida_id"]) if data.get("partida_id") else None,
                     titulo, data.get("descripcion") or None, data.get("responsable") or None,
                     (str(data["supervisor_id"]).strip() or None) if data.get("supervisor_id") else None,
-                    metrado, und, saltos, user.get("sub"))
+                    metrado, und, saltos, medios, user.get("sub"))
             except _ERRORES_DATO:
                 raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
             await _redistribuir(con, dict(row))
@@ -278,9 +291,14 @@ async def editar_actividad(act_id: int, data: dict):
         valores.append(str(data["und"]).strip()[:10] or None if data["und"] is not None else None)
     if "dias_salto" in data:
         campos.append("dias_salto"); valores.append(_parse_saltos(data["dias_salto"]))
+    if "dias_medio" in data:
+        campos.append("dias_medio"); valores.append(_parse_saltos(data["dias_medio"]))
     if "causa_nc_cat" in data:
         campos.append("causa_nc_cat"); valores.append(_validar_cnc(data["causa_nc_cat"]))
-    for k in ("titulo", "descripcion", "responsable", "otm_id", "supervisor_id", "causa_nc"):
+    if "causa_nc_planner_cat" in data:
+        campos.append("causa_nc_planner_cat"); valores.append(_validar_cnc(data["causa_nc_planner_cat"]))
+    for k in ("titulo", "descripcion", "responsable", "otm_id", "supervisor_id",
+              "causa_nc", "causa_nc_planner"):
         if k in data:
             v = str(data[k]).strip() if data[k] is not None else None
             if k == "titulo" and not v:
@@ -303,12 +321,18 @@ async def editar_actividad(act_id: int, data: dict):
                 raise HTTPException(400, "OTM, partida, supervisor o rango de fechas inválido: revisa los datos")
             if not row:
                 raise HTTPException(404, "Actividad no encontrada")
-            # Si cambió el rango, el metrado o los saltos, la distribución
-            # diaria se recalcula (las ediciones celda a celda van por
-            # /actividades/{id}/metrado-dias y NO pasan por aquí).
-            if {"fecha", "fecha_fin", "metrado_prog", "dias_salto"} & data.keys():
+            if set(row["dias_salto"] or []) & set(row["dias_medio"] or []):
+                raise HTTPException(400, "Un día no puede ser salto y medio día a la vez")
+            # Si cambió el rango, el metrado, los saltos o los medios días, la
+            # distribución diaria se recalcula (las ediciones celda a celda van
+            # por /actividades/{id}/metrado-dias y NO pasan por aquí).
+            movidas: list = []
+            if {"fecha", "fecha_fin", "metrado_prog", "dias_salto", "dias_medio"} & data.keys():
                 await _redistribuir(con, dict(row))
-    return dict(row)
+            # Auto-cascada FS: mover el rango empuja a las sucesoras (F5b v2).
+            if {"fecha", "fecha_fin"} & data.keys():
+                movidas = await recalcular_cascada(con, act_id)
+    return {**dict(row), "movidas": movidas}
 
 
 @router.delete("/actividades/{act_id}")
@@ -428,6 +452,59 @@ async def borrar_feriado(fer_id: int):
     return {"ok": True, "reprorrateadas": n}
 
 
+def _parse_cantidad(v) -> Optional[float]:
+    if v in (None, ""):
+        return None
+    try:
+        c = float(v)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "cantidad debe ser un número")
+    if c < 0:
+        raise HTTPException(400, "la cantidad no puede ser negativa")
+    return c
+
+
+async def registrar_avance_partida(con, partida_id: int, fecha: date, cantidad,
+                                   notas=None, actualizar_notas: bool = False) -> None:
+    """Escritura ÚNICA del avance real diario (F1 LookAhead v2 / auditoría F-2):
+    upsert (o DELETE si cantidad es None) en ev_avances_diarios y re-prorrateo
+    de TODA actividad del LookAhead vinculada a la partida cuyo rango cubre la
+    fecha — venga el avance de programación o del módulo Valor Ganado, el dato
+    y sus consecuencias son los mismos. La semana usa core.tiempo.semana_de."""
+    from routers.ev._datos import _fecha_base
+    if cantidad is None:
+        await con.execute(
+            "DELETE FROM ev_avances_diarios WHERE partida_id = $1 AND fecha = $2",
+            partida_id, fecha)
+    else:
+        base = await _fecha_base(con)
+        semana = max(1, semana_de(fecha, base)) if base else 1
+        if actualizar_notas:
+            await con.execute(
+                """INSERT INTO ev_avances_diarios
+                     (partida_id, fecha, semana, cantidad_dia, notas, registrado_en)
+                   VALUES ($1, $2, $3, $4, $5, NOW())
+                   ON CONFLICT (partida_id, fecha)
+                   DO UPDATE SET cantidad_dia = $4, notas = $5, registrado_en = NOW()""",
+                partida_id, fecha, semana, cantidad, notas)
+        else:
+            await con.execute(
+                """INSERT INTO ev_avances_diarios
+                     (partida_id, fecha, semana, cantidad_dia, registrado_en)
+                   VALUES ($1, $2, $3, $4, NOW())
+                   ON CONFLICT (partida_id, fecha)
+                   DO UPDATE SET cantidad_dia = $4, registrado_en = NOW()""",
+                partida_id, fecha, semana, cantidad)
+    # Los días anteriores al registrado no se tocan; el saldo para cumplir el
+    # metrado meta se re-prorratea en los días siguientes de cada actividad.
+    acts = await con.fetch(
+        """SELECT * FROM prog_actividades
+           WHERE partida_id = $1 AND $2 BETWEEN fecha AND COALESCE(fecha_fin, fecha)""",
+        partida_id, fecha)
+    for a in acts:
+        await _redistribuir(con, dict(a), solo_despues_de=fecha)
+
+
 @router.post("/actividades/{act_id}/avance-dia")
 async def avance_dia_actividad(act_id: int, data: dict):
     """El avance REAL del día contra una actividad del LookAhead: escribe en
@@ -435,20 +512,10 @@ async def avance_dia_actividad(act_id: int, data: dict):
     el saldo entre los días hábiles restantes — la actividad sigue apuntando
     a terminar en su F.Fin. El programado del día avanzado queda congelado
     como línea base de comparación (celeste→verde/ámbar/rojo en el panel)."""
-    from routers.ev._datos import _fecha_base
     f = parse_fecha(data.get("fecha"))
     if not f:
         raise HTTPException(400, "fecha requerida")
-    cantidad = data.get("cantidad")
-    if cantidad not in (None, ""):
-        try:
-            cantidad = float(cantidad)
-        except (TypeError, ValueError):
-            raise HTTPException(400, "cantidad debe ser un número")
-        if cantidad < 0:
-            raise HTTPException(400, "la cantidad no puede ser negativa")
-    else:
-        cantidad = None
+    cantidad = _parse_cantidad(data.get("cantidad"))
     pool = await db()
     async with pool.acquire() as con:
         act = await con.fetchrow("SELECT * FROM prog_actividades WHERE id = $1", act_id)
@@ -457,23 +524,7 @@ async def avance_dia_actividad(act_id: int, data: dict):
         if not act["partida_id"]:
             raise HTTPException(400, "La actividad no tiene partida de control: asígnala para registrar avance")
         async with con.transaction():
-            if cantidad is None:
-                await con.execute(
-                    "DELETE FROM ev_avances_diarios WHERE partida_id = $1 AND fecha = $2",
-                    act["partida_id"], f)
-            else:
-                base = await _fecha_base(con)
-                semana = max(1, (f - base).days // 7 + 1) if base else 1
-                await con.execute(
-                    """INSERT INTO ev_avances_diarios
-                         (partida_id, fecha, semana, cantidad_dia, registrado_en)
-                       VALUES ($1, $2, $3, $4, NOW())
-                       ON CONFLICT (partida_id, fecha)
-                       DO UPDATE SET cantidad_dia = $4, registrado_en = NOW()""",
-                    act["partida_id"], f, semana, cantidad)
-            # Los días anteriores al registrado no se tocan; el saldo para
-            # cumplir el metrado meta se re-prorratea en los días siguientes.
-            await _redistribuir(con, dict(act), solo_despues_de=f)
+            await registrar_avance_partida(con, act["partida_id"], f, cantidad)
     return {"ok": True, "cantidad": cantidad}
 
 
@@ -537,6 +588,159 @@ async def crear_actividades_lote(data: dict, user: dict = Depends(require_role("
     return {"creadas": len(creadas), "actividades": creadas}
 
 
+# ── Dependencias (F5 v2): antecesoras Fin→Inicio con auto-cascada ──
+async def _hay_ciclo(con, predecesora_id: int, actividad_id: int) -> bool:
+    """¿Agregar 'predecesora_id precede a actividad_id' crearía un ciclo?
+    Sí, cuando predecesora_id es alcanzable desde actividad_id siguiendo
+    la relación 'precede a' (BFS sobre las sucesoras)."""
+    cola, vistas = [actividad_id], set()
+    while cola:
+        actual = cola.pop(0)
+        if actual == predecesora_id:
+            return True
+        if actual in vistas:
+            continue
+        vistas.add(actual)
+        cola += [r["actividad_id"] for r in await con.fetch(
+            "SELECT actividad_id FROM prog_dependencias WHERE predecesora_id = $1", actual)]
+    return False
+
+
+def _siguiente_habil(d: date, dias_semana: set, feriados: set) -> date:
+    """Primer día ESTRICTAMENTE posterior a d que es hábil del calendario."""
+    x = d + timedelta(days=1)
+    while not (x.isoweekday() in dias_semana and x not in feriados):
+        x += timedelta(days=1)
+    return x
+
+
+async def recalcular_cascada(con, actividad_id_movida: int) -> list:
+    """Auto-cascada FS (F5b v2): al mover una antecesora, cada sucesora se
+    desplaza SOLO HACIA ADELANTE — nueva F.Inicio = max(F.Inicio actual,
+    siguiente día hábil tras F.Fin de la antecesora + lag). La F.Fin se
+    desplaza preservando la duración en días hábiles del calendario, los
+    saltos/medios que queden fuera del nuevo rango se descartan y el metrado
+    se re-prorratea. BFS en orden; los ciclos ya están vetados al crear."""
+    movidas: list = []
+    cola, vistas = [actividad_id_movida], set()
+    while cola:
+        actual = cola.pop(0)
+        if actual in vistas:
+            continue
+        vistas.add(actual)
+        pred = await con.fetchrow("SELECT * FROM prog_actividades WHERE id = $1", actual)
+        if not pred:
+            continue
+        fin_pred = pred["fecha_fin"] or pred["fecha"]
+        deps = await con.fetch(
+            "SELECT actividad_id, lag_dias FROM prog_dependencias WHERE predecesora_id = $1",
+            actual)
+        for dep in deps:
+            suc = await con.fetchrow(
+                "SELECT * FROM prog_actividades WHERE id = $1", dep["actividad_id"])
+            if not suc or suc["estado"] == "CANCELADO":
+                continue
+            dias_semana, feriados = await _calendario(
+                con, suc["proyecto_id"], fin_pred, fin_pred + timedelta(days=366))
+            inicio_min = _siguiente_habil(
+                fin_pred + timedelta(days=int(dep["lag_dias"] or 0)), dias_semana, feriados)
+            if inicio_min <= suc["fecha"]:
+                continue                      # nunca se adelanta ni se toca
+            fin_suc = suc["fecha_fin"] or suc["fecha"]
+            dur = len(_dias_habiles(suc["fecha"], fin_suc, dias_semana, feriados, set()))
+            if dur > 0:
+                nueva_fin, n = inicio_min, 1 if inicio_min.isoweekday() in dias_semana and inicio_min not in feriados else 0
+                while n < dur:
+                    nueva_fin = _siguiente_habil(nueva_fin, dias_semana, feriados)
+                    n += 1
+            else:
+                nueva_fin = inicio_min + (fin_suc - suc["fecha"])
+            rango = {inicio_min + timedelta(days=i)
+                     for i in range((nueva_fin - inicio_min).days + 1)}
+            row = await con.fetchrow(
+                """UPDATE prog_actividades
+                   SET fecha = $2, fecha_fin = $3,
+                       dias_salto = $4, dias_medio = $5, actualizado_en = now()
+                   WHERE id = $1 RETURNING *""",
+                suc["id"], inicio_min, nueva_fin,
+                sorted(d for d in (suc["dias_salto"] or []) if d in rango),
+                sorted(d for d in (suc["dias_medio"] or []) if d in rango))
+            await _redistribuir(con, dict(row))
+            movidas.append(suc["id"])
+            cola.append(suc["id"])
+    return movidas
+
+
+@router.get("/actividades")
+async def listar_actividades(proyecto_id: int = 1, q: str = "", limite: int = 200):
+    """Listado ligero para el selector de antecesoras del modal."""
+    limite = max(1, min(int(limite or 200), 500))
+    filtro = f"%{q.strip()}%" if q.strip() else None
+    pool = await db()
+    rows = await pool.fetch(
+        """SELECT id, titulo, otm_id, fecha, COALESCE(fecha_fin, fecha) AS fecha_fin, estado
+           FROM prog_actividades
+           WHERE proyecto_id = $1 AND estado <> 'CANCELADO'
+             AND ($2::text IS NULL OR titulo ILIKE $2 OR otm_id ILIKE $2)
+           ORDER BY fecha DESC, id DESC LIMIT $3""",
+        proyecto_id, filtro, limite)
+    return [{**dict(r), "fecha": str(r["fecha"]), "fecha_fin": str(r["fecha_fin"])} for r in rows]
+
+
+@router.get("/actividades/{act_id}/dependencias")
+async def listar_dependencias(act_id: int):
+    pool = await db()
+    rows = await pool.fetch(
+        """SELECT d.id, d.predecesora_id, d.tipo, d.lag_dias,
+                  p.titulo AS pred_titulo, p.fecha AS pred_fecha,
+                  COALESCE(p.fecha_fin, p.fecha) AS pred_fecha_fin, p.estado AS pred_estado
+           FROM prog_dependencias d
+           JOIN prog_actividades p ON p.id = d.predecesora_id
+           WHERE d.actividad_id = $1 ORDER BY d.id""", act_id)
+    return [{**dict(r), "pred_fecha": str(r["pred_fecha"]),
+             "pred_fecha_fin": str(r["pred_fecha_fin"])} for r in rows]
+
+
+@router.post("/actividades/{act_id}/dependencias")
+async def crear_dependencia(act_id: int, data: dict):
+    pred_id = data.get("predecesora_id")
+    if not pred_id:
+        raise HTTPException(400, "predecesora_id requerida")
+    pred_id = int(pred_id)
+    if pred_id == act_id:
+        raise HTTPException(400, "Una actividad no puede ser su propia antecesora")
+    try:
+        lag = int(data.get("lag_dias") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "lag_dias debe ser un entero")
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            if await _hay_ciclo(con, pred_id, act_id):
+                raise HTTPException(409, "La dependencia crearía un ciclo (la actividad ya precede a esa antecesora)")
+            try:
+                row = await con.fetchrow(
+                    """INSERT INTO prog_dependencias (actividad_id, predecesora_id, tipo, lag_dias)
+                       VALUES ($1, $2, 'FS', $3)
+                       ON CONFLICT (actividad_id, predecesora_id)
+                       DO UPDATE SET lag_dias = $3 RETURNING *""",
+                    act_id, pred_id, lag)
+            except _ERRORES_DATO:
+                raise HTTPException(400, "Actividad o antecesora inexistente")
+            # La nueva dependencia puede exigir empujar la sucesora ya mismo.
+            movidas = await recalcular_cascada(con, pred_id)
+    return {**dict(row), "movidas": movidas}
+
+
+@router.delete("/dependencias/{dep_id}")
+async def borrar_dependencia(dep_id: int):
+    pool = await db()
+    n = await pool.execute("DELETE FROM prog_dependencias WHERE id = $1", dep_id)
+    if n == "DELETE 0":
+        raise HTTPException(404, "Dependencia no encontrada")
+    return {"ok": True}
+
+
 # ── Lookahead-grid: la vista tipo Excel del ex-gerente ───────
 # Réplica del "Anexo 01 - LookAhead" / "F030b - Planeamiento": filas =
 # actividades agrupadas por OTM, columnas = días de N semanas, con el
@@ -572,6 +776,21 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             """SELECT partida_id, SUM(cantidad_dia) AS total FROM ev_avances_diarios
                WHERE partida_id = ANY($1) GROUP BY partida_id""", pids)} if pids else {}
         dias_semana, feriados = await _calendario(con, proyecto_id, base, fin)
+        deps = await con.fetch(
+            """SELECT d.actividad_id, d.predecesora_id, d.lag_dias,
+                      p.titulo AS pred_titulo, COALESCE(p.fecha_fin, p.fecha) AS pred_fin
+               FROM prog_dependencias d
+               JOIN prog_actividades p ON p.id = d.predecesora_id
+               WHERE d.actividad_id = ANY($1) OR d.predecesora_id = ANY($1)""",
+            ids) if ids else []
+
+    preds_map: dict = {}
+    sucs_map: dict = {}
+    for r in deps:
+        preds_map.setdefault(r["actividad_id"], []).append({
+            "id": r["predecesora_id"], "titulo": r["pred_titulo"],
+            "fecha_fin": str(r["pred_fin"]), "lag_dias": r["lag_dias"]})
+        sucs_map.setdefault(r["predecesora_id"], []).append(r["actividad_id"])
 
     prog_map: dict = {}
     for r in prog_rows:
@@ -596,8 +815,14 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "responsable": a["responsable"], "supervisor_id": a["supervisor_id"],
             "supervisor_nombre": a["supervisor_nombre"],
             "causa_nc": a["causa_nc"], "causa_nc_cat": a["causa_nc_cat"],
+            "causa_nc_planner": a["causa_nc_planner"],
+            "causa_nc_planner_cat": a["causa_nc_planner_cat"],
             "rest_pend": a["rest_pend"], "rest_total": a["rest_total"],
             "dias_salto": [str(d) for d in (a["dias_salto"] or [])],
+            "dias_medio": [str(d) for d in (a["dias_medio"] or [])],
+            "predecesoras": preds_map.get(a["id"], []),
+            "sucesoras": sucs_map.get(a["id"], []),
+            "dep_total": a["dep_total"],
             "und": pinfo.get("unidad") or a["und"],
             "metrado_prog": float(a["metrado_prog"]) if a["metrado_prog"] is not None else None,
             "metrado_base": met_base,
@@ -675,39 +900,21 @@ async def editar_metrado_dias(act_id: int, data: dict):
 async def avance_dia(data: dict):
     """Registra el metrado REAL ejecutado de una partida en un día — escribe
     en ev_avances_diarios, la misma tabla del módulo de Valor Ganado (2 vías,
-    un solo dato). cantidad null borra el registro del día."""
-    from routers.ev._datos import _fecha_base
+    un solo dato) y re-prorratea la actividad vinculada si existe.
+    cantidad null borra el registro del día."""
     partida_id = data.get("partida_id")
     f = parse_fecha(data.get("fecha"))
     if not partida_id or not f:
         raise HTTPException(400, "partida_id y fecha son obligatorios")
-    cantidad = data.get("cantidad")
+    cantidad = _parse_cantidad(data.get("cantidad"))
     pool = await db()
     async with pool.acquire() as con:
-        if cantidad in (None, ""):
-            await con.execute(
-                "DELETE FROM ev_avances_diarios WHERE partida_id = $1 AND fecha = $2",
-                int(partida_id), f)
-            return {"ok": True, "cantidad": None}
-        try:
-            cant = float(cantidad)
-        except (TypeError, ValueError):
-            raise HTTPException(400, "cantidad debe ser un número")
-        if cant < 0:
-            raise HTTPException(400, "la cantidad no puede ser negativa")
-        base = await _fecha_base(con)
-        semana = max(1, (f - base).days // 7 + 1) if base else 1
-        try:
-            await con.execute(
-                """INSERT INTO ev_avances_diarios
-                     (partida_id, fecha, semana, cantidad_dia, registrado_en)
-                   VALUES ($1, $2, $3, $4, NOW())
-                   ON CONFLICT (partida_id, fecha)
-                   DO UPDATE SET cantidad_dia = $4, registrado_en = NOW()""",
-                int(partida_id), f, semana, cant)
-        except _ERRORES_DATO:
-            raise HTTPException(400, "Partida inexistente o datos inválidos")
-    return {"ok": True, "cantidad": cant}
+        async with con.transaction():
+            try:
+                await registrar_avance_partida(con, int(partida_id), f, cantidad)
+            except _ERRORES_DATO:
+                raise HTTPException(400, "Partida inexistente o datos inválidos")
+    return {"ok": True, "cantidad": cantidad}
 
 
 @router.get("/actividades/{act_id}/restricciones")
@@ -792,8 +999,10 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
            FROM prog_actividades
            WHERE proyecto_id = $1 AND fecha BETWEEN $2 AND $3
            GROUP BY 1 ORDER BY 1""", proyecto_id, desde, hasta)
+    # Regla (F3 v2): en el Pareto manda la causa del PLANNER si existe (es la
+    # depurada por oficina); si no, cae a la reportada desde campo.
     cnc_rows = await pool.fetch(
-        """SELECT COALESCE(causa_nc_cat, 'OTROS') AS causa, count(*) AS n
+        """SELECT COALESCE(causa_nc_planner_cat, causa_nc_cat, 'OTROS') AS causa, count(*) AS n
            FROM prog_actividades
            WHERE proyecto_id = $1 AND estado = 'NO_CUMPLIDA' AND fecha BETWEEN $2 AND $3
            GROUP BY 1 ORDER BY n DESC""", proyecto_id, desde, hasta)

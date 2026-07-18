@@ -465,6 +465,121 @@ def main():
         c.post(f"{API}/ev/programacion/actividades/{act6.get('id')}/avance-dia",
                json={"fecha": fx, "cantidad": None})
 
+    # P23 — F1 LookAhead v2: el avance por la VÍA DEL EV (/ev/avance-diario)
+    # re-prorratea la actividad vinculada igual que la vía de programación,
+    # y la semana se calcula con core.tiempo.semana_de (base = lunes 06-01).
+    r = c.post(f"{API}/ev/avance-diario",
+               json={"partida_id": p1["id"], "fecha": "2026-06-03", "cantidad_dia": 5})
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    g6 = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act6.get("id")), {})
+    cur.execute("SELECT semana FROM ev_avances_diarios WHERE partida_id=%s AND fecha='2026-06-03'",
+                (p1["id"],))
+    fila_sem = cur.fetchone()
+    r3 = c.post(f"{API}/ev/avance-diario",
+                json={"partida_id": p1["id"], "fecha": "2026-06-03", "cantidad_dia": None})
+    r4 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    g6b = next((a for g in r4.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act6.get("id")), {})
+    check("P23 avance vía EV re-prorratea el LookAhead (42.5/42.5), semana canónica=1 y el null borra",
+          r.status_code == 200 and g6.get("real", {}).get("2026-06-03") == 5
+          and g6.get("prog", {}).get("2026-06-04") == 42.5
+          and g6.get("prog", {}).get("2026-06-05") == 42.5
+          and fila_sem is not None and fila_sem[0] == 1
+          and r3.status_code == 200 and "2026-06-03" not in g6b.get("real", {}),
+          f"real={g6.get('real')} prog={g6.get('prog')} sem={fila_sem}")
+
+    # P24 — F3 v2: causa de no cumplimiento del PLANNER, separada de la de campo;
+    # en el Pareto manda la del planner (act2 pasa de MATERIALES a PROGRAMACION).
+    r = c.put(f"{API}/ev/programacion/actividades/{act2.get('id')}",
+              json={"causa_nc_planner_cat": "PROGRAMACION",
+                    "causa_nc_planner": "Secuencia mal estimada"})
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    a2g = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act2.get("id")), {})
+    r3 = c.get(f"{API}/ev/programacion/ppc", params={"proyecto_id": 1, "semanas": 26})
+    pareto = {x["causa"]: x["n"] for x in r3.json().get("cnc", [])}
+    check("P24 causa del planner: se guarda, sale en el grid y manda en el Pareto",
+          r.status_code == 200
+          and a2g.get("causa_nc_planner_cat") == "PROGRAMACION"
+          and a2g.get("causa_nc_planner") == "Secuencia mal estimada"
+          and a2g.get("causa_nc_cat") == "MATERIALES"
+          and pareto.get("PROGRAMACION", 0) >= 1,
+          f"act={a2g.get('causa_nc_planner_cat')}/{a2g.get('causa_nc_cat')} pareto={pareto}")
+
+    # P25 — F4 v2: medio día pesa 0.5 en el prorrateo (90 en L/M◐/X → 36/18/36)
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-06-08", "fecha_fin": "2026-06-10",
+        "otm_id": "OTM-E2E", "titulo": "E2E Medio dia", "metrado_prog": 90,
+        "dias_medio": ["2026-06-09"]})
+    act7 = r.json() if r.status_code == 200 else {}
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-08", "semanas": 1})
+    g7 = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act7.get("id")), {})
+    check("P25 medio dia pesa 0.5: 90 en 3 días con M◐ -> 36/18/36 y el grid devuelve dias_medio",
+          r.status_code == 200
+          and g7.get("prog", {}).get("2026-06-08") == 36
+          and g7.get("prog", {}).get("2026-06-09") == 18
+          and g7.get("prog", {}).get("2026-06-10") == 36
+          and g7.get("dias_medio") == ["2026-06-09"],
+          f"status={r.status_code} prog={g7.get('prog')} medios={g7.get('dias_medio')}")
+
+    # P26 — F5a v2: dependencia FS con anti-ciclo y retorno en el grid
+    # act7 (08-10) será antecesora de act8 (11-12); el ciclo inverso da 409.
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-06-11", "fecha_fin": "2026-06-12",
+        "otm_id": "OTM-E2E", "titulo": "E2E Sucesora", "metrado_prog": 40})
+    act8 = r.json() if r.status_code == 200 else {}
+    r2 = c.post(f"{API}/ev/programacion/actividades/{act8.get('id')}/dependencias",
+                json={"predecesora_id": act7.get("id"), "lag_dias": 0})
+    r3 = c.post(f"{API}/ev/programacion/actividades/{act7.get('id')}/dependencias",
+                json={"predecesora_id": act8.get("id")})       # ciclo → 409
+    r4 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-08", "semanas": 1})
+    g8 = next((a for g in r4.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act8.get("id")), {})
+    g7b = next((a for g in r4.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act7.get("id")), {})
+    check("P26 dependencia FS: se crea, el ciclo inverso da 409 y el grid trae PRED./sucesoras",
+          r2.status_code == 200 and r3.status_code == 409
+          and [p["id"] for p in g8.get("predecesoras", [])] == [act7.get("id")]
+          and g8.get("dep_total") == 1
+          and g7b.get("sucesoras") == [act8.get("id")],
+          f"dep={r2.status_code} ciclo={r3.status_code} preds={g8.get('predecesoras')}")
+
+    # P27 — F5b v2: mover la F.Fin de la antecesora EMPUJA a la sucesora
+    # act7 termina ahora el 11 (era 10) → act8 (11-12, dur 2 hábiles) debe
+    # arrancar el 12 y terminar el 13, con su metrado re-prorrateado (20/20).
+    r = c.put(f"{API}/ev/programacion/actividades/{act7.get('id')}",
+              json={"fecha_fin": "2026-06-11"})
+    movidas = r.json().get("movidas", []) if r.status_code == 200 else []
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-08", "semanas": 1})
+    g8 = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act8.get("id")), {})
+    check("P27 cascada: ampliar la antecesora empuja la sucesora al 12-13 y re-prorratea 20/20",
+          r.status_code == 200 and movidas == [act8.get("id")]
+          and g8.get("fecha") == "2026-06-12" and g8.get("fecha_fin") == "2026-06-13"
+          and g8.get("prog", {}).get("2026-06-12") == 20
+          and g8.get("prog", {}).get("2026-06-13") == 20,
+          f"movidas={movidas} rango={g8.get('fecha')}..{g8.get('fecha_fin')} prog={g8.get('prog')}")
+
+    # P28 — la cascada nunca ADELANTA: acortar la antecesora no mueve a nadie
+    r = c.put(f"{API}/ev/programacion/actividades/{act7.get('id')}",
+              json={"fecha_fin": "2026-06-09"})
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-08", "semanas": 1})
+    g8b = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act8.get("id")), {})
+    check("P28 la cascada nunca adelanta: acortar la antecesora deja a la sucesora en 12-13",
+          r.status_code == 200 and r.json().get("movidas") == []
+          and g8b.get("fecha") == "2026-06-12" and g8b.get("fecha_fin") == "2026-06-13",
+          f"movidas={r.json().get('movidas')} rango={g8b.get('fecha')}..{g8b.get('fecha_fin')}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
