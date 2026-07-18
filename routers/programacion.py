@@ -64,14 +64,20 @@ def _lunes_de(fecha: date) -> date:
     return fecha - timedelta(days=fecha.weekday())
 
 
-def _distribuir(metrado: float, dias: list) -> dict:
-    """Distribución uniforme del metrado entre los días dados, como la fórmula
-    del LookAhead del ex-gerente. El último día absorbe el redondeo."""
+def _distribuir(metrado: float, dias: list, medios: set = frozenset()) -> dict:
+    """Distribución del metrado entre los días dados, como la fórmula del
+    LookAhead del ex-gerente, con PESOS: un día en `medios` pesa 0.5 (recibe
+    la mitad que un día completo, F4 v2). El último día absorbe el redondeo."""
     if not dias:
         return {}
-    cuota = round(metrado / len(dias), 3)
-    out = {d: cuota for d in dias}
-    out[dias[-1]] = round(metrado - cuota * (len(dias) - 1), 3)
+    peso = lambda d: 0.5 if d in medios else 1.0          # noqa: E731
+    cuota = metrado / sum(peso(d) for d in dias)
+    out, acum = {}, 0.0
+    for d in dias[:-1]:
+        v = round(cuota * peso(d), 3)
+        out[d] = v
+        acum += v
+    out[dias[-1]] = round(metrado - acum, 3)
     return out
 
 
@@ -131,10 +137,11 @@ async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) 
     restantes = [d for d in habiles if d not in intactos]
     if saldo <= 0 or not restantes:
         return
+    medios = set(act.get("dias_medio") or [])             # pesan 0.5 (F4 v2)
     await con.executemany(
         "INSERT INTO prog_metrado_dia (actividad_id, fecha, cantidad) VALUES ($1,$2,$3)"
         " ON CONFLICT (actividad_id, fecha) DO UPDATE SET cantidad = $3",
-        [(act["id"], f, c) for f, c in _distribuir(saldo, restantes).items() if c > 0])
+        [(act["id"], f, c) for f, c in _distribuir(saldo, restantes, medios).items() if c > 0])
 
 
 def _parse_saltos(v) -> list:
@@ -236,6 +243,9 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
     metrado = _parse_metrado(data.get("metrado_prog"))
     und = (str(data.get("und") or "").strip()[:10] or None)
     saltos = _parse_saltos(data.get("dias_salto"))
+    medios = _parse_saltos(data.get("dias_medio"))
+    if set(saltos) & set(medios):
+        raise HTTPException(400, "Un día no puede ser salto y medio día a la vez")
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
@@ -243,14 +253,15 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
                 row = await con.fetchrow(
                     """INSERT INTO prog_actividades
                        (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo, descripcion,
-                        responsable, supervisor_id, metrado_prog, und, dias_salto, creado_por)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *""",
+                        responsable, supervisor_id, metrado_prog, und, dias_salto, dias_medio,
+                        creado_por)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *""",
                     int(data.get("proyecto_id") or 1), fecha, fecha_fin,
                     (str(data["otm_id"]).strip() or None) if data.get("otm_id") else None,
                     int(data["partida_id"]) if data.get("partida_id") else None,
                     titulo, data.get("descripcion") or None, data.get("responsable") or None,
                     (str(data["supervisor_id"]).strip() or None) if data.get("supervisor_id") else None,
-                    metrado, und, saltos, user.get("sub"))
+                    metrado, und, saltos, medios, user.get("sub"))
             except _ERRORES_DATO:
                 raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
             await _redistribuir(con, dict(row))
@@ -278,6 +289,8 @@ async def editar_actividad(act_id: int, data: dict):
         valores.append(str(data["und"]).strip()[:10] or None if data["und"] is not None else None)
     if "dias_salto" in data:
         campos.append("dias_salto"); valores.append(_parse_saltos(data["dias_salto"]))
+    if "dias_medio" in data:
+        campos.append("dias_medio"); valores.append(_parse_saltos(data["dias_medio"]))
     if "causa_nc_cat" in data:
         campos.append("causa_nc_cat"); valores.append(_validar_cnc(data["causa_nc_cat"]))
     if "causa_nc_planner_cat" in data:
@@ -306,10 +319,12 @@ async def editar_actividad(act_id: int, data: dict):
                 raise HTTPException(400, "OTM, partida, supervisor o rango de fechas inválido: revisa los datos")
             if not row:
                 raise HTTPException(404, "Actividad no encontrada")
-            # Si cambió el rango, el metrado o los saltos, la distribución
-            # diaria se recalcula (las ediciones celda a celda van por
-            # /actividades/{id}/metrado-dias y NO pasan por aquí).
-            if {"fecha", "fecha_fin", "metrado_prog", "dias_salto"} & data.keys():
+            if set(row["dias_salto"] or []) & set(row["dias_medio"] or []):
+                raise HTTPException(400, "Un día no puede ser salto y medio día a la vez")
+            # Si cambió el rango, el metrado, los saltos o los medios días, la
+            # distribución diaria se recalcula (las ediciones celda a celda van
+            # por /actividades/{id}/metrado-dias y NO pasan por aquí).
+            if {"fecha", "fecha_fin", "metrado_prog", "dias_salto", "dias_medio"} & data.keys():
                 await _redistribuir(con, dict(row))
     return dict(row)
 
@@ -630,6 +645,7 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "causa_nc_planner_cat": a["causa_nc_planner_cat"],
             "rest_pend": a["rest_pend"], "rest_total": a["rest_total"],
             "dias_salto": [str(d) for d in (a["dias_salto"] or [])],
+            "dias_medio": [str(d) for d in (a["dias_medio"] or [])],
             "und": pinfo.get("unidad") or a["und"],
             "metrado_prog": float(a["metrado_prog"]) if a["metrado_prog"] is not None else None,
             "metrado_base": met_base,

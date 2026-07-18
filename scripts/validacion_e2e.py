@@ -510,6 +510,24 @@ def main():
           and pareto.get("PROGRAMACION", 0) >= 1,
           f"act={a2g.get('causa_nc_planner_cat')}/{a2g.get('causa_nc_cat')} pareto={pareto}")
 
+    # P25 — F4 v2: medio día pesa 0.5 en el prorrateo (90 en L/M◐/X → 36/18/36)
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-06-08", "fecha_fin": "2026-06-10",
+        "otm_id": "OTM-E2E", "titulo": "E2E Medio dia", "metrado_prog": 90,
+        "dias_medio": ["2026-06-09"]})
+    act7 = r.json() if r.status_code == 200 else {}
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-08", "semanas": 1})
+    g7 = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act7.get("id")), {})
+    check("P25 medio dia pesa 0.5: 90 en 3 días con M◐ -> 36/18/36 y el grid devuelve dias_medio",
+          r.status_code == 200
+          and g7.get("prog", {}).get("2026-06-08") == 36
+          and g7.get("prog", {}).get("2026-06-09") == 18
+          and g7.get("prog", {}).get("2026-06-10") == 36
+          and g7.get("dias_medio") == ["2026-06-09"],
+          f"status={r.status_code} prog={g7.get('prog')} medios={g7.get('dias_medio')}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")

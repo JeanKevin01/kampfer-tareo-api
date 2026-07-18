@@ -235,6 +235,34 @@ def test_distribuir_un_dia():
     assert d == {_dias("2026-07-13")[0]: 87.593}
 
 
+def test_distribuir_medio_dia_pesa_la_mitad():
+    # 90 en [completo, medio, completo] → pesos 2.5 → 36 / 18 / 36
+    from routers.programacion import _distribuir
+    dias = _dias("2026-07-13", "2026-07-14", "2026-07-15")
+    d = _distribuir(90.0, dias, medios={dias[1]})
+    assert d[dias[0]] == 36.0
+    assert d[dias[1]] == 18.0
+    assert d[dias[2]] == 36.0
+    assert round(sum(d.values()), 3) == 90.0
+
+
+def test_distribuir_medio_dia_al_final_absorbe_redondeo():
+    from routers.programacion import _distribuir
+    dias = _dias("2026-07-13", "2026-07-14")
+    d = _distribuir(100.0, dias, medios={dias[1]})    # pesos 1.5 → 66.667 / 33.333
+    assert d[dias[0]] == 66.667
+    assert d[dias[1]] == 33.333
+    assert round(sum(d.values()), 3) == 100.0
+
+
+def test_salto_y_medio_a_la_vez_400():
+    r = _client().post("/ev/programacion/actividades",
+                       json={"fecha": "2026-07-13", "fecha_fin": "2026-07-15", "titulo": "x",
+                             "dias_salto": ["2026-07-14"], "dias_medio": ["2026-07-14"]},
+                       headers=_hdr("oficina"))
+    assert r.status_code == 400
+
+
 def test_dias_habiles_salta_domingo_feriado_y_salto():
     # Lun 13 a Dom 19: sin domingo (calendario L-S), feriado el 15, salto el 14
     from datetime import date
