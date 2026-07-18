@@ -183,6 +183,11 @@ async def importar(body: ImportarIn):
     async with pool.acquire() as con:
         pl_rows = await con.fetch("SELECT * FROM ev_plantillas_hitos")
         plantillas = {r["tipo_actividad"]: json.loads(r["hitos"]) for r in pl_rows}
+        # Herencia del ÁREA del proyecto (decisión Jean 2026-07-18): la plantilla
+        # ya no pide área/sistema — si la fila no lo trae, la partida toma el
+        # área del proyecto y la matriz Área×Disciplina sigue funcionando.
+        areas_proy = {r["id"]: r["area"] for r in await con.fetch(
+            "SELECT id, area FROM otms WHERE area IS NOT NULL AND area <> ''")}
 
         async with con.transaction():
             codigo_a_id: dict[str, int] = {}
@@ -196,6 +201,8 @@ async def importar(body: ImportarIn):
                     parent_codigo = sep.join(p.codigo.split(sep)[:-1])
                 tipo_costo = _norm_tipo_costo(p.tipo_costo)
                 naturaleza = _norm_naturaleza(p.naturaleza)
+                if not p.sistema and p.otm_id:
+                    p.sistema = areas_proy.get(p.otm_id)
 
                 # Resolver hitos según tipo de nodo
                 if p.fase is None:
