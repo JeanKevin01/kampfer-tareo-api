@@ -1,5 +1,5 @@
 # ============================================================
-# routers/ev/partidas.py — plantillas de hitos + CRUD de partidas + OTMs + importador masivo (F0.5b)
+# routers/ev/partidas.py — CRUD de partidas + OTMs + importador masivo (F0.5b)
 # Extraído de valor_ganado.py SIN cambios de lógica.
 # ============================================================
 import json  # noqa: F401
@@ -32,32 +32,6 @@ log = get_logger("ev")
 # Sin prefijo: /ev lo aporta el router agregador (valor_ganado.py).
 router = APIRouter()
 router_campo = APIRouter()
-
-
-# ---------------------- Plantillas de hitos ----------------------
-@router.get("/plantillas")
-async def listar_plantillas():
-    pool = await db()
-    async with pool.acquire() as con:
-        rows = await con.fetch("SELECT * FROM ev_plantillas_hitos ORDER BY tipo_actividad")
-    return [
-        {"tipo_actividad": r["tipo_actividad"], "hitos": json.loads(r["hitos"])}
-        for r in rows
-    ]
-
-
-@router.post("/plantillas")
-async def guardar_plantilla(body: PlantillaIn):
-    _validar_pesos(body.hitos)
-    pool = await db()
-    async with pool.acquire() as con:
-        await con.execute(
-            """INSERT INTO ev_plantillas_hitos (tipo_actividad, hitos) VALUES ($1, $2)
-               ON CONFLICT (tipo_actividad) DO UPDATE SET hitos=$2""",
-            body.tipo_actividad.strip().upper(),
-            json.dumps([h.model_dump() for h in body.hitos]),
-        )
-    return {"ok": True}
 
 
 # ---------------------- CRUD Partidas ----------------------
@@ -181,8 +155,6 @@ async def importar(body: ImportarIn):
     errores: list[str] = []
 
     async with pool.acquire() as con:
-        pl_rows = await con.fetch("SELECT * FROM ev_plantillas_hitos")
-        plantillas = {r["tipo_actividad"]: json.loads(r["hitos"]) for r in pl_rows}
         # Herencia del ÁREA del proyecto (decisión Jean 2026-07-18): la plantilla
         # ya no pide área/sistema — si la fila no lo trae, la partida toma el
         # área del proyecto y la matriz Área×Disciplina sigue funcionando.
@@ -214,24 +186,13 @@ async def importar(body: ImportarIn):
                         _validar_pesos(hitos)
                     except HTTPException as e:
                         errores.append(f"Fila {i} ({p.codigo}): {e.detail}"); continue
-                elif p.tipo_actividad:
-                    hitos_raw = plantillas.get(p.tipo_actividad.strip().upper())
-                    if hitos_raw is None:
-                        errores.append(
-                            f"Fila {i} ({p.codigo}): tipo_actividad '{p.tipo_actividad}' no existe"
-                        ); continue
-                    try:
-                        hitos = [HitoIn(**h) for h in hitos_raw]; _validar_pesos(hitos)
-                    except Exception as e:
-                        errores.append(f"Fila {i} ({p.codigo}): hitos inválidos ({e})"); continue
                 else:
-                    hitos_raw = plantillas.get("GENERICO", [
-                        {"numero": 1, "descripcion": "Ejecución", "peso": 1.0, "es_principal": True}
-                    ])
-                    try:
-                        hitos = [HitoIn(**h) for h in hitos_raw]; _validar_pesos(hitos)
-                    except Exception as e:
-                        errores.append(f"Fila {i} ({p.codigo}): {e}"); continue
+                    # Sin hitos declarados (HITO1..5): hito único 'Ejecución'
+                    # 100% — la misma convención del hito principal silencioso
+                    # (0025). tipo_actividad de archivos viejos se ignora
+                    # (Fase S: la tabla de plantillas de hitos se retiró).
+                    hitos = [HitoIn(numero=1, descripcion="Ejecución",
+                                    peso=1.0, es_principal=True)]
 
                 # 0008: el código es único POR OTM — resolver siempre con la pareja (codigo, otm)
                 existente = await con.fetchval(

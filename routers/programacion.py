@@ -1513,6 +1513,88 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
     }
 
 
+# ── Histograma MO + Ratios HH (espejo del Anexo 01, Fase S·S6) ──
+@router.get("/histograma")
+async def histograma(proyecto_id: int = 1, desde: str = "", semanas: int = 4,
+                     otm: str = ""):
+    """Espejo de las hojas 'Histograma MO' y 'Ratios HH' del Anexo 01 del
+    ex-gerente. Solo LECTURA de datos que ya existen:
+      · dias: HH del tareo y nº de trabajadores distintos por día (histograma
+        de mano de obra);
+      · ratios: por partida y semana, HH del tareo vs cantidad instalada
+        (real del hito principal) → ratio HH/unidad, comparable contra el
+        ratio presupuestado (hh_presup/metrado_presup)."""
+    semanas = max(1, min(int(semanas or 4), 12))
+    base = _lunes_de(parse_fecha(desde) or fecha_lima())
+    fin = base + timedelta(days=semanas * 7 - 1)
+    otm_f = otm.strip() or None
+    pool = await db()
+    async with pool.acquire() as con:
+        dias = await con.fetch(
+            """SELECT fecha, SUM(hh) AS hh, COUNT(DISTINCT trabajador_id) AS trabajadores
+               FROM tareo_partida
+               WHERE fecha BETWEEN $1 AND $2 AND hh IS NOT NULL AND hh > 0
+                 AND ($3::text IS NULL OR otm_id = $3)
+               GROUP BY fecha ORDER BY fecha""", base, fin, otm_f)
+        hh_rows = await con.fetch(
+            """SELECT partida_id,
+                      (fecha - ((EXTRACT(ISODOW FROM fecha)::int) - 1)) AS lunes,
+                      SUM(hh) AS hh
+               FROM tareo_partida
+               WHERE fecha BETWEEN $1 AND $2 AND hh IS NOT NULL AND hh > 0
+                 AND partida_id IS NOT NULL
+                 AND ($3::text IS NULL OR otm_id = $3)
+               GROUP BY 1, 2""", base, fin, otm_f)
+        cant_rows = await con.fetch(
+            """SELECT ad.partida_id,
+                      (ad.fecha - ((EXTRACT(ISODOW FROM ad.fecha)::int) - 1)) AS lunes,
+                      SUM(ad.cantidad_dia) AS cant
+               FROM ev_avances_diarios ad
+               JOIN ev_partidas p ON p.id = ad.partida_id
+               WHERE ad.fecha BETWEEN $1 AND $2 AND ad.cantidad_dia IS NOT NULL
+                 AND ad.hito_id IS NULL
+                 AND ($3::text IS NULL OR p.otm_id = $3)
+               GROUP BY 1, 2""", base, fin, otm_f)
+        pids = sorted({r["partida_id"] for r in hh_rows}
+                      | {r["partida_id"] for r in cant_rows})
+        pinfo = {r["id"]: dict(r) for r in await con.fetch(
+            """SELECT id, codigo, descripcion, unidad,
+                      CASE WHEN metrado_presup > 0 THEN hh_presup / metrado_presup
+                      END AS ratio_presup
+               FROM ev_partidas WHERE id = ANY($1)""", pids)} if pids else {}
+
+    por_partida: dict = {}
+    for r in hh_rows:
+        por_partida.setdefault(r["partida_id"], {}).setdefault(
+            str(r["lunes"]), {})["hh"] = float(r["hh"] or 0)
+    for r in cant_rows:
+        por_partida.setdefault(r["partida_id"], {}).setdefault(
+            str(r["lunes"]), {})["cant"] = float(r["cant"] or 0)
+    ratios = []
+    for pid in pids:
+        info = pinfo.get(pid) or {}
+        sems = {}
+        for lun, v in sorted(por_partida.get(pid, {}).items()):
+            hh, cant = v.get("hh", 0.0), v.get("cant", 0.0)
+            sems[lun] = {"hh": round(hh, 2), "cant": round(cant, 3),
+                         "ratio": round(hh / cant, 3) if cant > 0 else None}
+        rp = info.get("ratio_presup")
+        ratios.append({
+            "partida_id": pid, "codigo": info.get("codigo"),
+            "descripcion": info.get("descripcion"), "unidad": info.get("unidad"),
+            "ratio_presup": round(float(rp), 3) if rp is not None else None,
+            "semanas": sems})
+    return {
+        "desde": str(base), "hasta": str(fin),
+        "semanas": [{"lunes": str(base + timedelta(days=i * 7)),
+                     "domingo": str(base + timedelta(days=i * 7 + 6))}
+                    for i in range(semanas)],
+        "dias": [{"fecha": str(r["fecha"]), "hh": round(float(r["hh"] or 0), 2),
+                  "trabajadores": r["trabajadores"]} for r in dias],
+        "ratios": ratios,
+    }
+
+
 # ── Almacenamiento (indicador semanal + purga manual) ────────
 @router.get("/media-uso")
 async def media_uso(proyecto_id: int = 1):
@@ -1685,39 +1767,53 @@ async def crear_reporte(
     if len(fotos) > MAX_FOTOS_POR_REPORTE:
         raise HTTPException(422, f"Máximo {MAX_FOTOS_POR_REPORTE} fotos por reporte")
 
-    # Procesar/escribir las fotos ANTES de la transacción (si algo falla, 4xx limpio).
-    guardadas = []
-    for up in fotos:
-        data = await up.read()
-        if len(data) > MAX_FOTO_BYTES:
-            raise HTTPException(413, f"{up.filename}: supera el máximo de 8 MB")
-        try:
-            guardadas.append(guardar_foto(f_rep, data))
-        except ValueError as e:
-            raise HTTPException(415, f"{up.filename}: {e}")
+    # Procesar/escribir las fotos ANTES de la transacción. Si CUALQUIER paso
+    # posterior falla (otra foto inválida, FK en la BD…), los archivos ya
+    # escritos se borran del disco — sin huérfanos (C2·F-1, Fase S).
+    guardadas: list = []
 
-    pool = await db()
-    async with pool.acquire() as con:
-        async with con.transaction():
+    def _limpiar_huerfanas() -> None:
+        for g in guardadas:
+            for ruta in (g["ruta"], g["ruta_thumb"]):
+                p = media_dir() / ruta
+                if p.is_file():
+                    p.unlink()
+
+    try:
+        for up in fotos:
+            data = await up.read()
+            if len(data) > MAX_FOTO_BYTES:
+                raise HTTPException(413, f"{up.filename}: supera el máximo de 8 MB")
             try:
-                rid = await con.fetchval(
-                    """INSERT INTO campo_reportes
-                       (proyecto_id, fecha, otm_id, actividad_id, supervisor_id, descripcion)
-                       VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
-                    proyecto_id, f_rep, otm_id.strip(), actividad_id,
-                    supervisor_id.strip(), descripcion.strip() or None)
-            except _ERRORES_DATO:
-                raise HTTPException(400, "OTM, actividad o supervisor inválido: revisa los datos")
-            for g in guardadas:
-                await con.execute(
-                    """INSERT INTO campo_fotos
-                       (reporte_id, semana_iso, ruta, ruta_thumb, bytes, bytes_thumb, ancho, alto)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
-                    rid, g["semana_iso"], g["ruta"], g["ruta_thumb"],
-                    g["bytes"], g["bytes_thumb"], g["ancho"], g["alto"])
-            # Calendario combinado: el reporte "ejecuta" la actividad programada.
-            if actividad_id:
-                await con.execute(
-                    "UPDATE prog_actividades SET estado='EJECUTADO', actualizado_en=now() "
-                    "WHERE id = $1 AND estado = 'PROGRAMADO'", actividad_id)
+                guardadas.append(guardar_foto(f_rep, data))
+            except ValueError as e:
+                raise HTTPException(415, f"{up.filename}: {e}")
+
+        pool = await db()
+        async with pool.acquire() as con:
+            async with con.transaction():
+                try:
+                    rid = await con.fetchval(
+                        """INSERT INTO campo_reportes
+                           (proyecto_id, fecha, otm_id, actividad_id, supervisor_id, descripcion)
+                           VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
+                        proyecto_id, f_rep, otm_id.strip(), actividad_id,
+                        supervisor_id.strip(), descripcion.strip() or None)
+                except _ERRORES_DATO:
+                    raise HTTPException(400, "OTM, actividad o supervisor inválido: revisa los datos")
+                for g in guardadas:
+                    await con.execute(
+                        """INSERT INTO campo_fotos
+                           (reporte_id, semana_iso, ruta, ruta_thumb, bytes, bytes_thumb, ancho, alto)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
+                        rid, g["semana_iso"], g["ruta"], g["ruta_thumb"],
+                        g["bytes"], g["bytes_thumb"], g["ancho"], g["alto"])
+                # Calendario combinado: el reporte "ejecuta" la actividad programada.
+                if actividad_id:
+                    await con.execute(
+                        "UPDATE prog_actividades SET estado='EJECUTADO', actualizado_en=now() "
+                        "WHERE id = $1 AND estado = 'PROGRAMADO'", actividad_id)
+    except BaseException:
+        _limpiar_huerfanas()
+        raise
     return {"ok": True, "id": rid, "fotos": len(guardadas)}

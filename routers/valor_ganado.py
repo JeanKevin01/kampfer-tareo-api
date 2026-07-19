@@ -6,8 +6,6 @@
 #   - OTM por encima de fase/sub-fase (ev_partidas.otm_id)
 #   - POST /ev/importar: carga masiva de partidas (desde cero o con
 #     histórico de avances y HH) en una sola transacción
-#   - GET/POST /ev/plantillas: catálogo de rules of credit por tipo
-#     de actividad
 #   - HH del tareo QR leídas DIRECTO de tareo_partida (fuente única desde F0.3);
 #     mapeo fecha->semana vía ev_config.fecha_base (auto-derivada del primer tareo)
 #   - GET /ev/curva-fase: tendencia de PF por disciplina

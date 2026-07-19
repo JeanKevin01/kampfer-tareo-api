@@ -132,32 +132,3 @@ def _resultado_operativo(por_otm: dict, tar: dict, default, otm_info: dict):
     return out, total
 
 
-@router.get("/rentabilidad")
-async def rentabilidad():
-    """Resultado Operativo por OTM: Ingreso valorizado − Costo MO (HH reales × tarifa).
-    Costo basado en tareo_partida (HH reales por trabajador → cargo → tarifa)."""
-    pool = await db()
-    async with pool.acquire() as con:
-        hh_rows = await con.fetch(
-            _HH_POR_CARGO_SQL.format(sel="tp.otm_id AS otm,", grpby="tp.otm_id,")
-        )
-        tar_rows = await con.fetch("SELECT cargo, costo_hh FROM ev_tarifas_cargo")
-        otm_rows = await con.fetch(
-            "SELECT id, descripcion, monto_contractual, monto_valorizado FROM otms"
-        )
-    tar = {r["cargo"]: float(r["costo_hh"]) for r in tar_rows}
-    default = tar.get("(Default)")          # None ⇒ respaldo sin configurar
-    otm_info = {r["id"]: r for r in otm_rows}
-
-    por_otm: dict = defaultdict(lambda: defaultdict(float))
-    for r in hh_rows:
-        por_otm[r["otm"]][r["cargo"]] += float(r["hh"] or 0)
-
-    out, total = _resultado_operativo(por_otm, tar, default, otm_info)
-    return {
-        "otms": out,
-        "total": total,
-        "tarifa_default": default if default is not None else 0.0,
-    }
-
-

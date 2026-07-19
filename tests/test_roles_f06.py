@@ -65,22 +65,8 @@ def test_enviar_con_partidas_suplantado_403():
     assert r.status_code == 403
 
 
-def test_crear_sesion_suplantado_403():
-    r = _client().post("/api/sesion", json={"supervisor_id": "02", "otm_id": "OTM-X"},
-                       headers=_hdr("supervisor", "01"))
-    assert r.status_code == 403
-
-
 def test_cuadrilla_ajena_403():
     r = _client().post("/api/cuadrilla/02/001", headers=_hdr("supervisor", "01"))
-    assert r.status_code == 403
-
-
-def test_cambio_partida_suplantado_403():
-    body = {"trabajador_ids": ["001"], "partida_id": 1,
-            "otm_id": "OTM-X", "supervisor_id": "02"}
-    r = _client().post("/api/tareo-partida/cambio", json=body,
-                       headers=_hdr("supervisor", "01"))
     assert r.status_code == 403
 
 

@@ -454,15 +454,6 @@ def test_hh_por_cargo_sql_tarifas_sin_otm():
     assert " AS " not in _group_by_clause(sql)
 
 
-def test_hh_por_cargo_sql_rentabilidad_agrupa_por_otm():
-    """/rentabilidad agrupa por OTM SIN colar el alias en el GROUP BY (bug Postgres)."""
-    sql = _HH_POR_CARGO_SQL.format(sel="tp.otm_id AS otm,", grpby="tp.otm_id,")
-    up = sql.upper()
-    assert "TP.OTM_ID AS OTM" in up            # el alias va en el SELECT…
-    assert "TP.OTM_ID," in _group_by_clause(sql)  # …y la columna cruda en el GROUP BY
-    assert " AS " not in _group_by_clause(sql)    # nunca el alias en el GROUP BY
-
-
 def test_matriz_dos_areas_y_total():
     """Dos áreas con una disciplina cada una: total general suma ambas."""
     hojas = [

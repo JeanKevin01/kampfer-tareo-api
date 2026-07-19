@@ -21,24 +21,6 @@ router = APIRouter(tags=["tareo"])
 
 
 # ── SESIONES (Session-First model) ───────────────────────────
-@router.post("/api/sesion")
-async def crear_sesion(data: dict, user: dict = Depends(require_role())):
-    supervisor_id = str(data.get("supervisor_id", "")).strip()
-    otm_id        = str(data.get("otm_id", "")).strip()
-    fecha_str     = str(data.get("fecha", fecha_lima().isoformat()))
-    hh_turno      = float(data.get("hh_turno", 9.5))
-    if not supervisor_id or not otm_id:
-        raise HTTPException(400, "supervisor_id y otm_id son requeridos")
-    exigir_identidad_supervisor(user, supervisor_id)   # F0.6: anti-suplantación
-    pool = await core_db()
-    sid = await pool.fetchval(
-        "INSERT INTO sesiones (supervisor_id, otm_id, fecha, hh_turno) "
-        "VALUES ($1, $2, $3, $4) RETURNING id",
-        supervisor_id, otm_id, parse_fecha(fecha_str), hh_turno,
-    )
-    return {"id": sid, "ok": True}
-
-
 @router.get("/api/sesion/hoy/{supervisor_id}")
 async def sesiones_hoy(supervisor_id: str):
     pool = await core_db()
@@ -410,39 +392,3 @@ async def enviar_con_partidas(data: dict, user: dict = Depends(require_role())):
             "sesion_id": sesion_id, "hh_dia": hh_dia}
 
 
-@router.post("/api/tareo-partida/cambio")
-async def cambio_partida_dia(data: dict, user: dict = Depends(require_role())):
-    """
-    Registra un cambio de partida a mitad del día.
-    La hora queda como el timestamp del request.
-    El cron recalculará las HH al cierre del día.
-    """
-    trabajador_ids = data.get("trabajador_ids", [])
-    partida_id     = data.get("partida_id")
-    otm_id         = str(data.get("otm_id", "")).strip()
-    supervisor_id  = str(data.get("supervisor_id", "")).strip()
-    fecha_str      = str(data.get("fecha", fecha_lima().isoformat()))
-
-    if not trabajador_ids or not partida_id:
-        raise HTTPException(400, "trabajador_ids y partida_id son requeridos")
-    exigir_identidad_supervisor(user, supervisor_id)   # F0.6: anti-suplantación
-
-    fecha_obj = parse_fecha(fecha_str)
-    if not fecha_obj:
-        raise HTTPException(400, "fecha inválida")
-    pool = await core_db()
-    semana = await _semana_para(pool, fecha_obj)
-
-    creados = 0
-    for tid in trabajador_ids:
-        trab_id = str(tid).zfill(3)
-        await pool.execute(
-            "INSERT INTO tareo_partida "
-            "(trabajador_id, partida_id, otm_id, fecha, semana, "
-            " hora_registro, supervisor_id, fuente) "
-            "VALUES ($1, $2, $3, $4, $5, NOW(), $6, 'cambio')",
-            trab_id, partida_id, otm_id, fecha_obj, semana, supervisor_id,
-        )
-        creados += 1
-
-    return {"ok": True, "creados": creados}

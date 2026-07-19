@@ -58,31 +58,6 @@ async def put_config(body: dict):
 
 
 # ---------------------- Tareo QR → partida ----------------------
-@router.get("/semanas")
-async def semanas():
-    pool = await db()
-    async with pool.acquire() as con:
-        base = await _fecha_base(con)
-        rows = await con.fetch(
-            """SELECT DISTINCT semana FROM (
-                 SELECT semana FROM ev_avances
-                 UNION SELECT semana FROM ev_hh_gastadas
-               ) s"""
-        )
-        sem = {r["semana"] for r in rows}
-        if base:
-            tareo = await con.fetch(
-                "SELECT DISTINCT fecha FROM tareo_partida WHERE hh IS NOT NULL AND hh > 0"
-            )
-            for t in tareo:
-                sem.add(_semana_de(t["fecha"], base))
-    return sorted(sem)
-
-
-# (F0.5b: _hh_real_por_semana, _hh_real_split y _hh_gastadas_unificada viven en
-#  routers/ev/_datos.py — re-exportadas arriba.)
-
-
 @router.get("/captura")
 async def captura(semana: int, otm: Optional[str] = None):
     pool = await db()
@@ -155,6 +130,26 @@ async def guardar_captura(body: CapturaIn):
     async with pool.acquire() as con:
         async with con.transaction():
             for a in body.avances:
+                # Candado de fuente única (Fase S 2026-07-19): un hito con
+                # registro DIARIO lo gobierna el rollup (principal = hito_id
+                # NULL; etapa = su propio hito_id) — la captura manual solo
+                # puede escribirlo en semanas HISTÓRICAS (anteriores a su
+                # primer registro diario).
+                primera = await con.fetchval(
+                    """SELECT (SELECT MIN(d.semana) FROM ev_avances_diarios d
+                                WHERE d.partida_id = h.partida_id
+                                  AND d.cantidad_dia IS NOT NULL
+                                  AND COALESCE(d.hito_id,
+                                        (SELECT id FROM ev_hitos h2
+                                          WHERE h2.partida_id = h.partida_id
+                                          ORDER BY h2.es_principal DESC, h2.peso DESC, h2.id
+                                          LIMIT 1)) = h.id)
+                       FROM ev_hitos h WHERE h.id = $1""", a.hito_id)
+                if primera is not None and body.semana >= primera:
+                    raise HTTPException(
+                        409, "El avance de ese hito lo gobierna el registro DIARIO "
+                             f"desde la semana {primera}: corrige las celdas del "
+                             "día (LookAhead o Avance diario), no la captura semanal")
                 await con.execute(
                     """INSERT INTO ev_avances (hito_id, semana, cantidad_acum)
                        VALUES ($1,$2,$3)

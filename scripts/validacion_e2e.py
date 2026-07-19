@@ -381,10 +381,12 @@ def main():
                params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
     ga = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
                if a["id"] == act4.get("id")), {})
-    r3 = c.get(f"{API}/ev/semana-grid", params={"semana": 1, "otm": "OTM-E2E"})
-    fila_ev = next((p for p in r3.json().get("partidas", []) if p["id"] == p2["id"]), {})
-    cant_ev = (fila_ev.get("dias", {}).get(FECHA_TAREO) or {}).get("cant_ejecutada")
-    check("P17 avance real: aparece en el grid Y en /ev/semana-grid (las 2 vías, un dato)",
+    r3 = c.get(f"{API}/ev/matriz", params={"desde": FECHA_TAREO, "hasta": FECHA_TAREO,
+                                           "modo": "partidas", "celda": "cantidad",
+                                           "otm": "OTM-E2E"})
+    fila_ev = next((f for f in r3.json().get("filas", []) if f["id"] == str(p2["id"])), {})
+    cant_ev = fila_ev.get("celdas", {}).get(FECHA_TAREO)
+    check("P17 avance real: aparece en el grid Y en /ev/matriz (las 2 vías, un dato)",
           ga.get("real", {}).get(FECHA_TAREO) == 2.5 and cant_ev == 2.5
           and ga.get("saldo") == 2.5,   # metrado_presup 5 - 2.5
           f"real={ga.get('real')} ev={cant_ev} saldo={ga.get('saldo')}")
@@ -639,16 +641,17 @@ def main():
                 json={"fecha": "2026-06-15", "cantidad": 4})
     cur.execute("SELECT cantidad_acum FROM ev_avances WHERE hito_id=%s", (h1,))
     acum_h1 = cur.fetchone()
-    r3 = c.get(f"{API}/ev/semana-grid", params={"semana": 3, "otm": "OTM-E2E",
-                                                "lunes": "2026-06-15"})
-    fila3 = next((p for p in r3.json().get("partidas", []) if p["id"] == p3), {})
-    cant_grid = (fila3.get("dias", {}).get("2026-06-15") or {}).get("cant_ejecutada")
+    r3 = c.get(f"{API}/ev/matriz", params={"desde": "2026-06-15", "hasta": "2026-06-15",
+                                           "modo": "partidas", "celda": "cantidad",
+                                           "otm": "OTM-E2E"})
+    fila3 = next((f for f in r3.json().get("filas", []) if f["id"] == str(p3)), {})
+    cant_grid = fila3.get("celdas", {}).get("2026-06-15")
     r4 = c.get(f"{API}/ev/programacion/lookahead-grid",
                params={"proyecto_id": 1, "desde": "2026-06-15", "semanas": 1})
     ge = next((a for g in r4.json().get("grupos", []) for a in g["actividades"]
                if a["id"] == act_h1.get("id")), {})
     check("P30 etapas: lote por hitos con FS auto, el diario alimenta SU hito y "
-          "semana-grid solo muestra el principal",
+          "la matriz (cantidad instalada) solo muestra el principal",
           r.status_code == 200 and len(acts_etapa) == 2 and fs_creado == 1
           and r2.status_code == 200 and acum_h1 is not None
           and abs(float(acum_h1[0]) - 4) < 0.001
@@ -803,6 +806,35 @@ def main():
           and g37.get("prog", {}).get("2026-06-25") == 10
           and "2026-06-23" in g37.get("prog_manual", []),
           f"prog={g37.get('prog')} manual={g37.get('prog_manual')}")
+
+    # P38 — CANDADO FUENTE ÚNICA (Fase S): la captura semanal manual NO puede
+    # escribir un hito gobernado por el diario en sus semanas (409); un hito
+    # sin registro diario sigue aceptando captura (checkpoint/histórico).
+    r = c.post(f"{API}/ev/captura", json={
+        "semana": 1, "avances": [{"hito_id": p1["hito_id"], "cantidad_acum": 99}],
+        "hh_gastadas": []})
+    cur.execute("SELECT id FROM ev_hitos WHERE partida_id=%s AND descripcion='Montaje'", (p3,))
+    h2_id = cur.fetchone()[0]
+    r2 = c.post(f"{API}/ev/captura", json={
+        "semana": 3, "avances": [{"hito_id": h2_id, "cantidad_acum": 7}],
+        "hh_gastadas": []})
+    check("P38 candado: captura manual sobre hito con diario da 409; sin diario sigue permitida",
+          r.status_code == 409 and r2.status_code == 200,
+          f"con_diario={r.status_code} sin_diario={r2.status_code}")
+
+    # P39 — HISTOGRAMA MO + RATIOS (Fase S·S6, espejo del Anexo 01): el tareo
+    # de la semana 1 aparece como HH/trabajadores por día y alguna partida
+    # trae su ratio semanal.
+    r = c.get(f"{API}/ev/programacion/histograma",
+              params={"desde": "2026-06-01", "semanas": 1, "otm": "OTM-E2E"})
+    hg39 = r.json() if r.status_code == 200 else {}
+    dia_t = next((x for x in hg39.get("dias", []) if x["fecha"] == FECHA_TAREO), {})
+    con_hh = [p for p in hg39.get("ratios", [])
+              if any(s.get("hh", 0) > 0 for s in p.get("semanas", {}).values())]
+    check("P39 histograma MO: HH y trabajadores del tareo por día + ratios por partida",
+          r.status_code == 200 and dia_t.get("hh", 0) > 0
+          and dia_t.get("trabajadores", 0) >= 1 and len(con_hh) >= 1,
+          f"status={r.status_code} dia={dia_t} ratios_con_hh={len(con_hh)}")
 
     print()
     if _fallas:

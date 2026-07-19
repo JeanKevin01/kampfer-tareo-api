@@ -45,11 +45,6 @@ class CapturaIn(BaseModel):
     hh_gastadas: list[HHIn] = []
 
 
-class PlantillaIn(BaseModel):
-    tipo_actividad: str
-    hitos: list[HitoIn]
-
-
 class ImpPartida(BaseModel):
     codigo: str
     otm_id: Optional[str] = None
