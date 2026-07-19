@@ -117,19 +117,22 @@ async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) 
 
     reales: dict = {}
     if act.get("partida_id"):
-        # Solo los reales de la MISMA etapa (hito) de la actividad; una
+        # TODOS los reales de la MISMA etapa (hito) de la actividad, SIN
+        # acotar al rango vigente: al reprogramar fechas, lo ya anotado en el
+        # rango viejo sigue descontando del saldo (si no, el metrado completo
+        # reaparecería prorrateado como si nada se hubiera hecho). Una
         # actividad del hito principal equivale a una sin hito (NULL).
         reales = {r["fecha"]: float(r["cantidad_dia"]) for r in await con.fetch(
             """SELECT fecha, cantidad_dia FROM ev_avances_diarios ad
-               WHERE partida_id = $1 AND fecha BETWEEN $2 AND $3
+               WHERE partida_id = $1
                  AND cantidad_dia IS NOT NULL
                  AND COALESCE(ad.hito_id, (SELECT id FROM ev_hitos h
                        WHERE h.partida_id = $1
                        ORDER BY h.es_principal DESC, h.peso DESC, h.id LIMIT 1))
-                     = COALESCE($4, (SELECT id FROM ev_hitos h
+                     = COALESCE($2, (SELECT id FROM ev_hitos h
                        WHERE h.partida_id = $1
                        ORDER BY h.es_principal DESC, h.peso DESC, h.id LIMIT 1))""",
-            act["partida_id"], desde, hasta, act.get("hito_id"))}
+            act["partida_id"], act.get("hito_id"))}
 
     intactos = set(reales)
     if solo_despues_de:

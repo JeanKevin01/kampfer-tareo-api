@@ -714,6 +714,23 @@ def main():
           and r3.status_code == 200,
           f"id={j1.get('id')} fin={fila_p} sim={r2.status_code}/{len(sim)} forzar={r3.status_code}")
 
+    # P35 — REPROGRAMAR NO RESUCITA LO HECHO: act_h1 (metrado 20, real 4 el
+    # 15/06) se mueve a un rango posterior → el programado nuevo reparte solo
+    # el SALDO (16) y la celda del día ya avanzado queda congelada (10).
+    r = c.put(f"{API}/ev/programacion/actividades/{act_h1.get('id')}",
+              json={"fecha": "2026-06-22", "fecha_fin": "2026-06-23"})
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-15", "semanas": 2})
+    g35 = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act_h1.get("id")), {})
+    prog35 = g35.get("prog", {})
+    suma_nueva = sum(v for f, v in prog35.items() if f >= "2026-06-22")
+    check("P35 reprogramar descuenta lo anotado: saldo 16 repartido y celda avanzada congelada",
+          r.status_code == 200 and abs(suma_nueva - 16) < 0.001
+          and prog35.get("2026-06-15") == 10
+          and g35.get("saldo") == 16,
+          f"put={r.status_code} prog={prog35} saldo={g35.get('saldo')}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
