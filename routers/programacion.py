@@ -35,6 +35,10 @@ _ESTADOS = ("PROGRAMADO", "EJECUTADO", "CANCELADO", "NO_CUMPLIDA")
 # lo muestra como "Failed to fetch".
 _ERRORES_DATO = (asyncpg.IntegrityConstraintViolationError, asyncpg.DataError)
 
+
+class _ReporteYaExiste(Exception):
+    """Dos reintentos del outbox llegaron a la vez con el mismo id_local (F4)."""
+
 # Catálogo de Causas de No Cumplimiento (Last Planner): categoría cerrada para
 # poder hacer el Pareto; el detalle libre acompaña en causa_nc.
 CNC = {
@@ -1757,6 +1761,7 @@ async def crear_reporte(
     supervisor_id: str = Form(...),
     descripcion: str = Form(""),
     actividad_id: Optional[int] = Form(None),
+    id_local: Optional[str] = Form(None),
     fotos: List[UploadFile] = File(default=[]),
     user: dict = Depends(require_role()),
 ):
@@ -1766,6 +1771,18 @@ async def crear_reporte(
         raise HTTPException(400, "El reporte necesita una descripción o al menos una foto")
     if len(fotos) > MAX_FOTOS_POR_REPORTE:
         raise HTTPException(422, f"Máximo {MAX_FOTOS_POR_REPORTE} fotos por reporte")
+
+    # F4: idempotencia del outbox offline — si este id_local ya entró (reintento
+    # tras respuesta perdida), devolver el reporte existente sin duplicar nada.
+    id_local = (id_local or "").strip()[:64] or None
+    if id_local:
+        pool = await db()
+        ya = await pool.fetchrow(
+            """SELECT r.id, COUNT(f.id) AS fotos FROM campo_reportes r
+               LEFT JOIN campo_fotos f ON f.reporte_id = r.id
+               WHERE r.id_local = $1 GROUP BY r.id""", id_local)
+        if ya:
+            return {"ok": True, "id": ya["id"], "fotos": ya["fotos"], "duplicado": True}
 
     # Procesar/escribir las fotos ANTES de la transacción. Si CUALQUIER paso
     # posterior falla (otra foto inválida, FK en la BD…), los archivos ya
@@ -1795,10 +1812,13 @@ async def crear_reporte(
                 try:
                     rid = await con.fetchval(
                         """INSERT INTO campo_reportes
-                           (proyecto_id, fecha, otm_id, actividad_id, supervisor_id, descripcion)
-                           VALUES ($1,$2,$3,$4,$5,$6) RETURNING id""",
+                           (proyecto_id, fecha, otm_id, actividad_id, supervisor_id, descripcion, id_local)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id""",
                         proyecto_id, f_rep, otm_id.strip(), actividad_id,
-                        supervisor_id.strip(), descripcion.strip() or None)
+                        supervisor_id.strip(), descripcion.strip() or None, id_local)
+                except asyncpg.UniqueViolationError:
+                    # Carrera de reintentos simultáneos del outbox: el otro ganó.
+                    raise _ReporteYaExiste()
                 except _ERRORES_DATO:
                     raise HTTPException(400, "OTM, actividad o supervisor inválido: revisa los datos")
                 for g in guardadas:
@@ -1813,6 +1833,16 @@ async def crear_reporte(
                     await con.execute(
                         "UPDATE prog_actividades SET estado='EJECUTADO', actualizado_en=now() "
                         "WHERE id = $1 AND estado = 'PROGRAMADO'", actividad_id)
+    except _ReporteYaExiste:
+        _limpiar_huerfanas()
+        pool = await db()
+        ya = await pool.fetchrow(
+            """SELECT r.id, COUNT(f.id) AS fotos FROM campo_reportes r
+               LEFT JOIN campo_fotos f ON f.reporte_id = r.id
+               WHERE r.id_local = $1 GROUP BY r.id""", id_local)
+        if ya:
+            return {"ok": True, "id": ya["id"], "fotos": ya["fotos"], "duplicado": True}
+        raise HTTPException(409, "Conflicto al registrar el reporte — reintenta")
     except BaseException:
         _limpiar_huerfanas()
         raise

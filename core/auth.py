@@ -80,8 +80,11 @@ def _b64u_dec(s: str) -> bytes:
 
 
 def make_token(sub: str, rol: str, nombre: str = "", extra: Optional[dict] = None) -> str:
+    # F4: el rol supervisor trabaja offline en campo — su sesión dura 7 días
+    # (configurable) para que el outbox sincronice sin re-login toda la semana.
+    ttl = config.TOKEN_TTL_SUPERVISOR if rol == "supervisor" else config.TOKEN_TTL
     payload = {"sub": sub, "rol": rol, "nombre": nombre,
-               "exp": int(time.time()) + config.TOKEN_TTL}
+               "exp": int(time.time()) + ttl}
     if extra:
         payload.update(extra)
     body = _b64u(json.dumps(payload, separators=(",", ":")).encode())

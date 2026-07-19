@@ -96,3 +96,19 @@ def test_admin_pasa_cualquier_rol_exigido(monkeypatch):
     dep = auth.require_role("oficina")
     res = _run(dep(x_api_key="", authorization="Bearer " + token))
     assert res["rol"] == "admin"
+
+
+# ── F4: TTL por rol — el supervisor de campo trabaja offline toda la semana ──
+
+def test_token_supervisor_dura_7_dias():
+    import time
+    p = auth.verify_token(auth.make_token("u1", "supervisor", "Sup"))
+    restante = p["exp"] - time.time()
+    assert restante > 6.9 * 24 * 3600, "el token de supervisor debe durar ~7 días"
+
+
+def test_token_oficina_conserva_ttl_corto():
+    import time
+    p = auth.verify_token(auth.make_token("u2", "oficina", "Ofi"))
+    restante = p["exp"] - time.time()
+    assert restante <= config.TOKEN_TTL + 5, "los roles de oficina no heredan el TTL largo"

@@ -17,6 +17,8 @@ _DEFAULT_JWT_SECRET = "kampfer-cambia-este-secreto-en-produccion"
 _DEFAULT_ADMIN_PW   = "admin123"
 JWT_SECRET = (os.getenv("JWT_SECRET", "").strip() or _DEFAULT_JWT_SECRET)
 TOKEN_TTL  = int(os.getenv("TOKEN_TTL_SEG", str(60 * 60 * 12)))   # 12 h por defecto
+# F4: rol supervisor (app de campo offline) — 7 días para cubrir la semana sin re-login
+TOKEN_TTL_SUPERVISOR = int(os.getenv("TOKEN_TTL_SUPERVISOR_SEG", str(60 * 60 * 24 * 7)))
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", _DEFAULT_ADMIN_PW)   # solo para el seed inicial
 
 # ── Media (fotos de reportes de campo) ────────────────────────

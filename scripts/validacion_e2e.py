@@ -836,6 +836,46 @@ def main():
           and dia_t.get("trabajadores", 0) >= 1 and len(con_hh) >= 1,
           f"status={r.status_code} dia={dia_t} ratios_con_hh={len(con_hh)}")
 
+    # P40 — IDEMPOTENCIA DEL OUTBOX (F4, 0029): el mismo reporte reenviado con
+    # su id_local NO se duplica — el segundo intento devuelve el existente.
+    buf40 = BytesIO()
+    Image.new("RGB", (400, 300), (30, 90, 180)).save(buf40, "JPEG")
+    dat40 = {"proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-E2E",
+             "supervisor_id": "SUPE2E", "descripcion": "E2E outbox reintento",
+             "id_local": "e2e-uuid-p40"}
+    r1 = c.post(f"{API}/campo/reportes", data=dat40,
+                files=[("fotos", ("f.jpg", buf40.getvalue(), "image/jpeg"))])
+    r2 = c.post(f"{API}/campo/reportes", data=dat40,
+                files=[("fotos", ("f.jpg", buf40.getvalue(), "image/jpeg"))])
+    cur.execute("SELECT COUNT(*) FROM campo_reportes WHERE id_local='e2e-uuid-p40'")
+    n40 = cur.fetchone()[0]
+    check("P40 outbox: reenviar el mismo reporte (id_local) no duplica",
+          r1.status_code == 200 and not r1.json().get("duplicado")
+          and r2.status_code == 200 and r2.json().get("duplicado") is True
+          and r2.json().get("id") == r1.json().get("id") and n40 == 1,
+          f"r1={r1.status_code} r2={r2.status_code} filas={n40}")
+
+    # P41 — TTL POR ROL (F4): el login de un usuario supervisor emite token de
+    # ~7 días (la app de campo offline no puede re-loguear sin señal).
+    import base64 as _b64
+    import json as _json
+    import time as _time
+    c.post(f"{API}/api/admin/usuarios",
+           json={"username": "supe2e", "password": "clave-e2e",
+                 "rol": "supervisor", "supervisor_id": "SUPE2E"})  # 409 si ya existe: ok
+    r = c.post(f"{API}/api/auth/login",
+               json={"username": "supe2e", "password": "clave-e2e"})
+    tk41 = r.json().get("token", "") if r.status_code == 200 else ""
+    exp41 = 0
+    if tk41:
+        cuerpo = tk41.split(".")[0]
+        cuerpo += "=" * (-len(cuerpo) % 4)
+        exp41 = _json.loads(_b64.urlsafe_b64decode(cuerpo)).get("exp", 0)
+    restante41 = exp41 - _time.time()
+    check("P41 login supervisor emite token de ~7 dias (outbox sin re-login)",
+          r.status_code == 200 and restante41 > 6.9 * 24 * 3600,
+          f"status={r.status_code} restante_h={restante41/3600:.1f}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
