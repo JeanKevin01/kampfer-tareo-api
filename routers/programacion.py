@@ -996,7 +996,7 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             pids)] if pids else []
         dias_semana, feriados = await _calendario(con, proyecto_id, base, fin)
         deps = await con.fetch(
-            """SELECT d.actividad_id, d.predecesora_id, d.lag_dias,
+            """SELECT d.id AS dep_id, d.actividad_id, d.predecesora_id, d.lag_dias,
                       p.titulo AS pred_titulo, COALESCE(p.fecha_fin, p.fecha) AS pred_fin
                FROM prog_dependencias d
                JOIN prog_actividades p ON p.id = d.predecesora_id
@@ -1007,7 +1007,7 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
     sucs_map: dict = {}
     for r in deps:
         preds_map.setdefault(r["actividad_id"], []).append({
-            "id": r["predecesora_id"], "titulo": r["pred_titulo"],
+            "id": r["predecesora_id"], "dep_id": r["dep_id"], "titulo": r["pred_titulo"],
             "fecha_fin": str(r["pred_fin"]), "lag_dias": r["lag_dias"]})
         sucs_map.setdefault(r["predecesora_id"], []).append(r["actividad_id"])
 
