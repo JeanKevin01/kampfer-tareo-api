@@ -105,9 +105,13 @@ async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) 
         saltos intencionales de la actividad (dias_salto);
       · los días que YA tienen avance real registrado quedan CONGELADOS
         (su programado es la línea contra la que se compara el cumplimiento);
-      · el SALDO (metrado − real acumulado) se re-prorratea entre los días
-        hábiles restantes — así la actividad sigue apuntando a terminar en
-        su F.Fin con lo que falta.
+      · las celdas MANUALES dentro del rango (escritas por el planner vía
+        metrado-dias, 0027) se respetan: su cantidad descuenta del saldo y
+        no se recalculan; fuera del rango vigente (reprogramación) el plan
+        manual viejo se descarta salvo que el día tenga real;
+      · el SALDO (metrado − real acumulado − plan manual pendiente) se
+        re-prorratea entre los días hábiles restantes — así la actividad
+        sigue apuntando a terminar en su F.Fin con lo que falta.
     Con solo_despues_de (al registrar un avance): los días ANTERIORES no se
     tocan ("eso ya se hizo") y el saldo cae solo en los días posteriores."""
     desde, hasta = act["fecha"], act["fecha_fin"] or act["fecha"]
@@ -134,7 +138,13 @@ async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) 
                        ORDER BY h.es_principal DESC, h.peso DESC, h.id LIMIT 1))""",
             act["partida_id"], act.get("hito_id"))}
 
-    intactos = set(reales)
+    # Celdas manuales del rango vigente: plan fino del planner, se protege.
+    manuales = {r["fecha"]: float(r["cantidad"]) for r in await con.fetch(
+        """SELECT fecha, cantidad FROM prog_metrado_dia
+           WHERE actividad_id = $1 AND manual AND fecha BETWEEN $2 AND $3""",
+        act["id"], desde, hasta)}
+
+    intactos = set(reales) | set(manuales)
     if solo_despues_de:
         intactos |= {d for d in habiles if d <= solo_despues_de}
     # Se borran solo las celdas que se van a recalcular.
@@ -144,14 +154,20 @@ async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) 
     metrado = float(act["metrado_prog"] or 0)
     if metrado <= 0:
         return
-    saldo = round(metrado - sum(reales.values()), 3)
+    # El plan manual PENDIENTE (días sin real, aún por delante) descuenta del
+    # saldo; un día manual ya pasado sin real es línea base congelada (como
+    # cualquier día congelado) y no descuenta.
+    plan_manual = sum(c for d, c in manuales.items()
+                      if d not in reales
+                      and (solo_despues_de is None or d > solo_despues_de))
+    saldo = round(metrado - sum(reales.values()) - plan_manual, 3)
     restantes = [d for d in habiles if d not in intactos]
     if saldo <= 0 or not restantes:
         return
     medios = set(act.get("dias_medio") or [])             # pesan 0.5 (F4 v2)
     await con.executemany(
         "INSERT INTO prog_metrado_dia (actividad_id, fecha, cantidad) VALUES ($1,$2,$3)"
-        " ON CONFLICT (actividad_id, fecha) DO UPDATE SET cantidad = $3",
+        " ON CONFLICT (actividad_id, fecha) DO UPDATE SET cantidad = $3, manual = false",
         [(act["id"], f, c) for f, c in _distribuir(saldo, restantes, medios).items() if c > 0])
 
 
@@ -972,7 +988,7 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
         ids = [a["id"] for a in acts]
         pids = sorted({a["partida_id"] for a in acts if a["partida_id"]})
         prog_rows = await con.fetch(
-            """SELECT actividad_id, fecha::text AS f, cantidad FROM prog_metrado_dia
+            """SELECT actividad_id, fecha::text AS f, cantidad, manual FROM prog_metrado_dia
                WHERE actividad_id = ANY($1) AND fecha BETWEEN $2 AND $3""",
             ids, base, fin) if ids else []
         real_rows = await con.fetch(
@@ -1012,8 +1028,11 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
         sucs_map.setdefault(r["predecesora_id"], []).append(r["actividad_id"])
 
     prog_map: dict = {}
+    manual_map: dict = {}
     for r in prog_rows:
         prog_map.setdefault(r["actividad_id"], {})[r["f"]] = float(r["cantidad"])
+        if r["manual"]:
+            manual_map.setdefault(r["actividad_id"], []).append(r["f"])
     # Reales por (partida, etapa): NULL = hito principal (convención 0025).
     real_map: dict = {}
     for r in real_rows:
@@ -1063,6 +1082,7 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "hito_desc": (hito_info.get(a["hito_id"]) or {}).get("descripcion") if a["hito_id"] else None,
             "hito_peso": float(hito_info[a["hito_id"]]["peso"]) if a["hito_id"] in hito_info else None,
             "prog": prog_map.get(a["id"], {}),
+            "prog_manual": sorted(manual_map.get(a["id"], [])),
             "real": real_map.get((a["partida_id"], hkey), {}) if a["partida_id"] else {},
         }
         clave = a["otm_id"] or ""
@@ -1083,9 +1103,12 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
 
 @router.put("/actividades/{act_id}/metrado-dias")
 async def editar_metrado_dias(act_id: int, data: dict):
-    """Edición celda a celda del metrado programado (como escribir en el día
-    del Excel). cantidad 0 o null borra la celda. El total metrado_prog de la
-    actividad pasa a ser la suma de sus celdas."""
+    """Replanificar un día del PROGRAMADO (la misma lógica del avance real,
+    aplicada al plan — encargo Jean 2026-07-19): la celda escrita queda
+    MANUAL (protegida, 0027) y el saldo del metrado META (que NO cambia) se
+    re-prorratea en los demás días hábiles sin real y sin celda manual.
+    cantidad null/'' libera la celda: vuelve al prorrateo automático.
+    cantidad 0 = día sin programación (protegido en 0)."""
     dias = data.get("dias") or {}
     if not isinstance(dias, dict) or not dias:
         raise HTTPException(400, "dias requerido: {\"YYYY-MM-DD\": cantidad}")
@@ -1103,12 +1126,12 @@ async def editar_metrado_dias(act_id: int, data: dict):
             raise HTTPException(400, f"cantidad inválida para {k}")
         if cant < 0:
             raise HTTPException(400, "la cantidad no puede ser negativa")
-        celdas.append((f, cant or None))
+        celdas.append((f, cant))
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
-            existe = await con.fetchval("SELECT 1 FROM prog_actividades WHERE id = $1", act_id)
-            if not existe:
+            act = await con.fetchrow("SELECT * FROM prog_actividades WHERE id = $1", act_id)
+            if not act:
                 raise HTTPException(404, "Actividad no encontrada")
             for f, cant in celdas:
                 if cant is None:
@@ -1117,17 +1140,14 @@ async def editar_metrado_dias(act_id: int, data: dict):
                         act_id, f)
                 else:
                     await con.execute(
-                        """INSERT INTO prog_metrado_dia (actividad_id, fecha, cantidad)
-                           VALUES ($1,$2,$3)
-                           ON CONFLICT (actividad_id, fecha) DO UPDATE SET cantidad = $3""",
+                        """INSERT INTO prog_metrado_dia (actividad_id, fecha, cantidad, manual)
+                           VALUES ($1,$2,$3,true)
+                           ON CONFLICT (actividad_id, fecha)
+                           DO UPDATE SET cantidad = $3, manual = true""",
                         act_id, f, cant)
-            total = float(await con.fetchval(
-                "SELECT COALESCE(SUM(cantidad),0) FROM prog_metrado_dia WHERE actividad_id = $1",
-                act_id))
-            await con.execute(
-                """UPDATE prog_actividades SET metrado_prog = NULLIF($2, 0),
-                       actualizado_en = now() WHERE id = $1""", act_id, total)
-    return {"ok": True, "metrado_prog": total or None}
+            await _redistribuir(con, dict(act))
+    m = float(act["metrado_prog"]) if act["metrado_prog"] is not None else None
+    return {"ok": True, "metrado_prog": m}
 
 
 @router.post("/avance-dia")
@@ -1370,51 +1390,126 @@ async def borrar_restriccion(rest_id: int):
 
 @router.get("/ppc")
 async def ppc(proyecto_id: int = 1, semanas: int = 8):
-    """PPC (Porcentaje de Plan Cumplido) semanal + Pareto de causas de no
-    cumplimiento + detalle por supervisor — el nivel de APRENDIZAJE del LPS.
-    Comprometidas = actividades no canceladas de la semana; cumplidas = EJECUTADO."""
+    """PPC (Porcentaje de Plan Cumplido) semanal + Pareto de causas + detalle
+    por supervisor — el nivel de APRENDIZAJE del LPS.
+
+    Cumplimiento AUTOMÁTICO por metrado (encargo Jean 2026-07-19, «al cierre
+    + SI anticipado»): el compromiso de una actividad en una semana es su
+    metrado PROGRAMADO de esa semana; se cumple apenas el real registrado lo
+    alcanza o supera (aunque la semana siga corriendo) y recién cuenta como
+    NO cumplida cuando la semana CERRÓ sin llegar — mientras corre queda "en
+    curso" (comprometida sin veredicto). Los estados manuales mandan:
+    NO_CUMPLIDA → no cumplida (su causa alimenta el Pareto) · EJECUTADO →
+    cumplida · CANCELADO se excluye. Las actividades sin celdas programadas
+    (sin metrado) se evalúan por estado en la semana de su F.Inicio."""
     semanas = max(1, min(int(semanas or 8), 26))
-    hasta = _lunes_de(fecha_lima()) + timedelta(days=6)
-    desde = _lunes_de(fecha_lima()) - timedelta(days=(semanas - 1) * 7)
+    hoy = fecha_lima()
+    hasta = _lunes_de(hoy) + timedelta(days=6)
+    desde = _lunes_de(hoy) - timedelta(days=(semanas - 1) * 7)
     pool = await db()
-    filas = await pool.fetch(
-        """SELECT (fecha - ((EXTRACT(ISODOW FROM fecha)::int) - 1)) AS lunes,
-                  count(*) FILTER (WHERE estado <> 'CANCELADO') AS comprometidas,
-                  count(*) FILTER (WHERE estado = 'EJECUTADO') AS cumplidas,
-                  count(*) FILTER (WHERE estado = 'NO_CUMPLIDA') AS no_cumplidas
-           FROM prog_actividades
-           WHERE proyecto_id = $1 AND fecha BETWEEN $2 AND $3
-           GROUP BY 1 ORDER BY 1""", proyecto_id, desde, hasta)
-    # Regla (F3 v2): en el Pareto manda la causa del PLANNER si existe (es la
-    # depurada por oficina); si no, cae a la reportada desde campo.
-    cnc_rows = await pool.fetch(
-        """SELECT COALESCE(causa_nc_planner_cat, causa_nc_cat, 'OTROS') AS causa, count(*) AS n
-           FROM prog_actividades
-           WHERE proyecto_id = $1 AND estado = 'NO_CUMPLIDA' AND fecha BETWEEN $2 AND $3
-           GROUP BY 1 ORDER BY n DESC""", proyecto_id, desde, hasta)
-    sup_rows = await pool.fetch(
-        """SELECT a.supervisor_id, s.nombre,
-                  count(*) FILTER (WHERE a.estado <> 'CANCELADO') AS comprometidas,
-                  count(*) FILTER (WHERE a.estado = 'EJECUTADO') AS cumplidas
-           FROM prog_actividades a LEFT JOIN supervisores s ON s.id = a.supervisor_id
-           WHERE a.proyecto_id = $1 AND a.fecha BETWEEN $2 AND $3
-             AND a.supervisor_id IS NOT NULL
-           GROUP BY a.supervisor_id, s.nombre ORDER BY s.nombre""",
-        proyecto_id, desde, hasta)
+    async with pool.acquire() as con:
+        acts = [dict(r) for r in await con.fetch(
+            """SELECT id, partida_id, hito_id, estado, fecha, supervisor_id
+               FROM prog_actividades
+               WHERE proyecto_id = $1
+                 AND fecha <= $3 AND COALESCE(fecha_fin, fecha) >= $2""",
+            proyecto_id, desde, hasta)]
+        ids = [a["id"] for a in acts]
+        pids = sorted({a["partida_id"] for a in acts if a["partida_id"]})
+        prog_rows = await con.fetch(
+            """SELECT actividad_id,
+                      (fecha - ((EXTRACT(ISODOW FROM fecha)::int) - 1)) AS lunes,
+                      SUM(cantidad) AS c
+               FROM prog_metrado_dia
+               WHERE actividad_id = ANY($1) AND fecha BETWEEN $2 AND $3
+               GROUP BY 1, 2""", ids, desde, hasta) if ids else []
+        real_rows = await con.fetch(
+            """SELECT partida_id, hito_id,
+                      (fecha - ((EXTRACT(ISODOW FROM fecha)::int) - 1)) AS lunes,
+                      SUM(cantidad_dia) AS c
+               FROM ev_avances_diarios
+               WHERE partida_id = ANY($1) AND fecha BETWEEN $2 AND $3
+                 AND cantidad_dia IS NOT NULL
+               GROUP BY 1, 2, 3""", pids, desde, hasta) if pids else []
+        principal = {r["partida_id"]: r["id"] for r in await con.fetch(
+            """SELECT DISTINCT ON (partida_id) partida_id, id FROM ev_hitos
+               WHERE partida_id = ANY($1)
+               ORDER BY partida_id, es_principal DESC, peso DESC, id""",
+            pids)} if pids else {}
+        supervisores = {r["id"]: r["nombre"] for r in await con.fetch(
+            "SELECT id, nombre FROM supervisores")}
+        # Pareto (F3 v2): manda la causa del PLANNER; si no existe, la de campo.
+        cnc_rows = await con.fetch(
+            """SELECT COALESCE(causa_nc_planner_cat, causa_nc_cat, 'OTROS') AS causa, count(*) AS n
+               FROM prog_actividades
+               WHERE proyecto_id = $1 AND estado = 'NO_CUMPLIDA' AND fecha BETWEEN $2 AND $3
+               GROUP BY 1 ORDER BY n DESC""", proyecto_id, desde, hasta)
+
+    prog_de: dict = {}
+    for r in prog_rows:
+        prog_de.setdefault(r["actividad_id"], {})[r["lunes"]] = float(r["c"] or 0)
+    reales = {(r["partida_id"], r["hito_id"], r["lunes"]): float(r["c"] or 0)
+              for r in real_rows}
+
+    def _etapa(a: dict):
+        """Etapa normalizada: el hito principal se guarda como NULL en el diario."""
+        h = a["hito_id"]
+        return None if h is not None and h == principal.get(a["partida_id"]) else h
+
+    sem: dict = {}
+    sup: dict = {}
+
+    def _suma(lunes, sup_id, comp, cump, noc):
+        s = sem.setdefault(lunes, {"comprometidas": 0, "cumplidas": 0, "no_cumplidas": 0})
+        s["comprometidas"] += comp; s["cumplidas"] += cump; s["no_cumplidas"] += noc
+        if sup_id:
+            v = sup.setdefault(sup_id, {"comprometidas": 0, "cumplidas": 0})
+            v["comprometidas"] += comp; v["cumplidas"] += cump
+
+    for a in acts:
+        if a["estado"] == "CANCELADO":
+            continue
+        por_semana = prog_de.get(a["id"])
+        if por_semana:
+            for lun, comprom in por_semana.items():
+                if comprom <= 0:
+                    continue
+                alcanz = (reales.get((a["partida_id"], _etapa(a), lun), 0.0)
+                          if a["partida_id"] else 0.0)
+                cerrada = lun + timedelta(days=6) < hoy
+                if a["estado"] == "NO_CUMPLIDA":
+                    cump, noc = 0, 1
+                elif a["estado"] == "EJECUTADO" or alcanz >= comprom - 5e-4:
+                    cump, noc = 1, 0
+                elif cerrada:
+                    cump, noc = 0, 1
+                else:
+                    cump, noc = 0, 0                    # en curso: sin veredicto
+                _suma(lun, a["supervisor_id"], 1, cump, noc)
+        else:
+            lun = _lunes_de(a["fecha"])
+            if not (desde <= lun <= hasta):
+                continue
+            _suma(lun, a["supervisor_id"], 1,
+                  1 if a["estado"] == "EJECUTADO" else 0,
+                  1 if a["estado"] == "NO_CUMPLIDA" else 0)
 
     def _ppc(c, e):
         return round(e / c, 4) if c else None
 
     return {
         "desde": str(desde), "hasta": str(hasta), "cnc_catalogo": CNC,
-        "semanal": [{"lunes": str(r["lunes"]), "comprometidas": r["comprometidas"],
-                     "cumplidas": r["cumplidas"], "no_cumplidas": r["no_cumplidas"],
-                     "ppc": _ppc(r["comprometidas"], r["cumplidas"])} for r in filas],
+        "semanal": [{"lunes": str(lun), "comprometidas": v["comprometidas"],
+                     "cumplidas": v["cumplidas"], "no_cumplidas": v["no_cumplidas"],
+                     "ppc": _ppc(v["comprometidas"], v["cumplidas"])}
+                    for lun, v in sorted(sem.items())],
         "cnc": [{"causa": r["causa"], "etiqueta": CNC.get(r["causa"], r["causa"]),
                  "n": r["n"]} for r in cnc_rows],
-        "por_supervisor": [{"supervisor_id": r["supervisor_id"], "nombre": r["nombre"],
-                            "comprometidas": r["comprometidas"], "cumplidas": r["cumplidas"],
-                            "ppc": _ppc(r["comprometidas"], r["cumplidas"])} for r in sup_rows],
+        "por_supervisor": [{"supervisor_id": sid, "nombre": supervisores.get(sid),
+                            "comprometidas": v["comprometidas"], "cumplidas": v["cumplidas"],
+                            "ppc": _ppc(v["comprometidas"], v["cumplidas"])}
+                           for sid, v in sorted(sup.items(),
+                                                key=lambda kv: supervisores.get(kv[0]) or "")],
     }
 
 

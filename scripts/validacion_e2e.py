@@ -358,11 +358,22 @@ def main():
           and len(grid.get("fechas", [])) == 14,
           f"status={r.status_code} prog={ga.get('prog')}")
 
+    # P16 (nueva semántica 0027): replanificar un día NO cambia el META; la
+    # celda queda MANUAL y el saldo se re-prorratea en los demás días.
     r = c.put(f"{API}/ev/programacion/actividades/{act4.get('id')}/metrado-dias",
               json={"dias": {"2026-06-03": 50}})
-    check("P16 editar una celda recalcula el total (30+50+30=110)",
-          r.status_code == 200 and r.json().get("metrado_prog") == 110,
-          f"status={r.status_code} total={r.json().get('metrado_prog') if r.status_code == 200 else '-'}")
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": FECHA_TAREO, "semanas": 1})
+    g4 = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+               if a["id"] == act4.get("id")), {})
+    check("P16 replanificar un día: celda manual 50, META intacto (90) y saldo 40 en 20/20",
+          r.status_code == 200 and r.json().get("metrado_prog") == 90
+          and g4.get("prog", {}).get("2026-06-03") == 50
+          and g4.get("prog", {}).get(FECHA_TAREO) == 20
+          and g4.get("prog", {}).get("2026-06-04") == 20
+          and "2026-06-03" in g4.get("prog_manual", []),
+          f"status={r.status_code} meta={r.json().get('metrado_prog') if r.status_code == 200 else '-'} "
+          f"prog={g4.get('prog')} manual={g4.get('prog_manual')}")
 
     r = c.post(f"{API}/ev/programacion/avance-dia",
                json={"partida_id": p2["id"], "fecha": FECHA_TAREO, "cantidad": 2.5})
@@ -730,6 +741,68 @@ def main():
           and prog35.get("2026-06-15") == 10
           and g35.get("saldo") == 16,
           f"put={r.status_code} prog={prog35} saldo={g35.get('saldo')}")
+
+    # P36 — PPC AUTOMÁTICO por metrado (al cierre + SI anticipado): en una
+    # semana YA CERRADA (2026-05-04), la actividad que alcanzó su programado
+    # cuenta cumplida sola y la que no llegó cuenta no cumplida sola.
+    cur.execute("INSERT INTO ev_partidas (codigo, fase, descripcion, unidad, "
+                "metrado_presup, hh_presup, otm_id) VALUES "
+                "('E2E-005','F-E2E','Partida ppc ok','und',10,40,'OTM-E2E') RETURNING id")
+    p5 = cur.fetchone()[0]
+    cur.execute("INSERT INTO ev_partidas (codigo, fase, descripcion, unidad, "
+                "metrado_presup, hh_presup, otm_id) VALUES "
+                "('E2E-006','F-E2E','Partida ppc atrasada','und',20,80,'OTM-E2E') RETURNING id")
+    p6 = cur.fetchone()[0]
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-05-04", "fecha_fin": "2026-05-05",
+        "otm_id": "OTM-E2E", "titulo": "E2E PPC cumplida", "partida_id": p5,
+        "metrado_prog": 10})
+    act_ok = r.json() if r.status_code == 200 else {}
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-05-04", "fecha_fin": "2026-05-05",
+        "otm_id": "OTM-E2E", "titulo": "E2E PPC atrasada", "partida_id": p6,
+        "metrado_prog": 20})
+    act_no = r.json() if r.status_code == 200 else {}
+    c.post(f"{API}/ev/programacion/actividades/{act_ok.get('id')}/avance-dia",
+           json={"fecha": "2026-05-04", "cantidad": 10})
+    c.post(f"{API}/ev/programacion/actividades/{act_no.get('id')}/avance-dia",
+           json={"fecha": "2026-05-04", "cantidad": 5})
+    r = c.get(f"{API}/ev/programacion/ppc", params={"proyecto_id": 1, "semanas": 26})
+    s36 = next((s for s in r.json().get("semanal", []) if s["lunes"] == "2026-05-04"), {})
+    check("P36 PPC automático: alcanzó → cumplida sola; semana cerrada sin llegar → no cumplida",
+          r.status_code == 200 and s36.get("comprometidas") == 2
+          and s36.get("cumplidas") == 1 and s36.get("no_cumplidas") == 1
+          and s36.get("ppc") == 0.5,
+          f"status={r.status_code} semana={s36}")
+
+    # P37 — CELDA MANUAL PROTEGIDA: sobrevive al re-prorrateo por avance real
+    # y al cambio de fechas; el saldo siempre la respeta.
+    cur.execute("INSERT INTO ev_partidas (codigo, fase, descripcion, unidad, "
+                "metrado_presup, hh_presup, otm_id) VALUES "
+                "('E2E-007','F-E2E','Partida manual','und',30,120,'OTM-E2E') RETURNING id")
+    p7 = cur.fetchone()[0]
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-06-22", "fecha_fin": "2026-06-24",
+        "otm_id": "OTM-E2E", "titulo": "E2E Manual protegida", "partida_id": p7,
+        "metrado_prog": 30})
+    act_m = r.json() if r.status_code == 200 else {}
+    c.put(f"{API}/ev/programacion/actividades/{act_m.get('id')}/metrado-dias",
+          json={"dias": {"2026-06-23": 4}})
+    c.post(f"{API}/ev/programacion/actividades/{act_m.get('id')}/avance-dia",
+           json={"fecha": "2026-06-22", "cantidad": 6})
+    r2 = c.put(f"{API}/ev/programacion/actividades/{act_m.get('id')}",
+               json={"fecha_fin": "2026-06-25"})
+    r3 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-22", "semanas": 1})
+    g37 = next((a for g in r3.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act_m.get("id")), {})
+    check("P37 celda manual protegida: tras real y ampliación de F.Fin sigue en 4 y el saldo 20 va 10/10",
+          r2.status_code == 200
+          and g37.get("prog", {}).get("2026-06-23") == 4
+          and g37.get("prog", {}).get("2026-06-24") == 10
+          and g37.get("prog", {}).get("2026-06-25") == 10
+          and "2026-06-23" in g37.get("prog_manual", []),
+          f"prog={g37.get('prog')} manual={g37.get('prog_manual')}")
 
     print()
     if _fallas:
