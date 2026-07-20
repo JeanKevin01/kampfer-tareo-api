@@ -10,6 +10,7 @@
 # actividad PROGRAMADO, la actividad pasa sola a EJECUTADO.
 # ============================================================
 import asyncio
+import json
 from datetime import date, timedelta
 from typing import List, Optional
 
@@ -38,6 +39,20 @@ _ERRORES_DATO = (asyncpg.IntegrityConstraintViolationError, asyncpg.DataError)
 
 class _ReporteYaExiste(Exception):
     """Dos reintentos del outbox llegaron a la vez con el mismo id_local (F4)."""
+
+
+def _lista_json(txt: str) -> list:
+    """Campo multipart que viaja como JSON (viñetas, restricciones). Tolerante:
+    un valor vacío o malformado no tumba el reporte del supervisor."""
+    if not (txt or "").strip():
+        return []
+    try:
+        v = json.loads(txt)
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(v, list):
+        return []
+    return [x for x in v if (isinstance(x, str) and x.strip()) or isinstance(x, dict)]
 
 # Catálogo de Causas de No Cumplimiento (Last Planner): categoría cerrada para
 # poder hacer el Pareto; el detalle libre acompaña en causa_nc.
@@ -1714,19 +1729,53 @@ async def mis_actividades(supervisor_id: str, fecha: str = "",
     pool = await db()
     rows = await pool.fetch(
         """SELECT a.id, a.titulo, a.descripcion, a.estado, a.causa_nc, a.causa_nc_cat,
-                  a.otm_id, o.descripcion AS otm_desc, a.responsable,
+                  a.otm_id, o.descripcion AS otm_desc, o.area AS otm_area, a.responsable,
+                  a.partida_id, a.hito_id,
                   ev.codigo AS partida_codigo, ev.descripcion AS partida_desc,
                   COALESCE(ev.unidad, a.und) AS und,
-                  pm.cantidad AS metrado_dia
+                  pm.cantidad AS metrado_dia,
+                  h.descripcion AS hito_desc,
+                  (SELECT count(*) FROM campo_reportes cr
+                    WHERE cr.actividad_id = a.id AND cr.fecha = $1) AS reportes_hoy
            FROM prog_actividades a
            LEFT JOIN otms o ON o.id = a.otm_id
            LEFT JOIN ev_partidas ev ON ev.id = a.partida_id
+           LEFT JOIN ev_hitos h ON h.id = a.hito_id
            LEFT JOIN prog_metrado_dia pm ON pm.actividad_id = a.id AND pm.fecha = $1
            WHERE $1 BETWEEN a.fecha AND COALESCE(a.fecha_fin, a.fecha)
              AND NOT ($1 = ANY(a.dias_salto))
              AND a.supervisor_id = $2 AND a.estado <> 'CANCELADO'
            ORDER BY a.id""", f, supervisor_id)
     return [dict(r) for r in rows]
+
+
+@router_campo.get("/reporte-plantilla")
+async def reporte_plantilla(actividad_id: int, user: dict = Depends(require_role())):
+    """Último reporte de ESA misma partida/hito, para reusarlo como plantilla:
+    el supervisor solo cambia lo que cambió en vez de escribir todo de nuevo.
+    Devuelve {} si es la primera vez que se reporta esa partida."""
+    pool = await db()
+    act = await pool.fetchrow(
+        "SELECT partida_id, hito_id, otm_id FROM prog_actividades WHERE id = $1", actividad_id)
+    if not act:
+        raise HTTPException(404, "Actividad no encontrada")
+    if act["partida_id"] is None:
+        return {}
+    prev = await pool.fetchrow(
+        """SELECT r.id, r.fecha::text AS fecha, r.area, r.turno, r.anotaciones, r.restricciones
+           FROM campo_reportes r
+           JOIN prog_actividades a ON a.id = r.actividad_id
+          WHERE a.partida_id = $1
+            AND (a.hito_id IS NOT DISTINCT FROM $2)
+            AND r.actividad_id <> $3
+            AND (r.anotaciones IS NOT NULL OR r.area IS NOT NULL)
+          ORDER BY r.fecha DESC, r.id DESC LIMIT 1""",
+        act["partida_id"], act["hito_id"], actividad_id)
+    if not prev:
+        return {}
+    return {"fecha": prev["fecha"], "area": prev["area"], "turno": prev["turno"],
+            "anotaciones": json.loads(prev["anotaciones"]) if prev["anotaciones"] else [],
+            "restricciones": json.loads(prev["restricciones"]) if prev["restricciones"] else []}
 
 
 @router_campo.post("/actividades/{act_id}/no-cumplida")
@@ -1753,6 +1802,100 @@ async def marcar_no_cumplida(act_id: int, data: dict,
     return {"ok": True, "estado": "NO_CUMPLIDA"}
 
 
+# ── Parte diario del supervisor (texto para el grupo de WhatsApp) ──
+# Función PURA: la app de campo genera el mismo texto sin red (offline) y el
+# panel lo ofrece para copiar. Formato acordado con Jean (2026-07-19).
+
+CNC_TXT = {
+    "MATERIALES": "Falta de materiales", "MANO_OBRA": "Falta de mano de obra",
+    "EQUIPOS": "Falta de equipos", "INFORMACION": "Falta de información / planos",
+    "CLIMA": "Clima", "INTERFERENCIA": "Interferencia con otra disciplina",
+    "PRERREQUISITO": "Prerrequisito no terminado", "CLIENTE": "Cambio de prioridad del cliente",
+    "PROGRAMACION": "Mala programación", "OTROS": "Otros",
+}
+
+
+def armar_texto_reporte(fecha: date, turno: str, responsable: str,
+                        personal: list, bloques: list, restricciones: list) -> str:
+    """Arma el parte diario.
+
+    personal: [{cargo, n}] (cargo exacto del padrón — decisión de Jean)
+    bloques:  [{area, items:[str]}]
+    restricciones: [{cat, detalle}]
+    """
+    L = [f"Fecha: {fecha.strftime('%d/%m')}",
+         f"Turno: {(turno or 'DIA').upper()}",
+         f"Responsable: {responsable or '—'}",
+         "-" * 41]
+    total = sum(int(p.get("n") or 0) for p in personal)
+    L.append(f"CANTIDAD TOTAL PERSONAL: {total}")
+    for p in personal:
+        L.append(f"* {str(p.get('cargo') or 'SIN CARGO').title()}: {int(p.get('n') or 0):02d}")
+    L.append("-" * 41)
+    L.append("")
+    L.append("ACTIVIDADES REALIZADAS")
+    for b in bloques:
+        if b.get("area"):
+            L.append(f"AREA: {b['area']}")
+        for it in b.get("items", []):
+            if str(it).strip():
+                L.append(f"* {str(it).strip()}")
+        L.append("")
+    if restricciones:
+        L.append("RESTRICCIONES.")
+        for r in restricciones:
+            det = str(r.get("detalle") or "").strip()
+            cat = CNC_TXT.get(str(r.get("cat") or "").upper(), "")
+            L.append(f"* {det or cat}" + (f" ({cat})" if det and cat else ""))
+    return "\n".join(L).strip()
+
+
+@router.get("/reporte-dia")
+async def reporte_dia(fecha: str = "", supervisor_id: str = "", proyecto_id: int = 1):
+    """Parte diario listo para copiar (lo mismo que ve el supervisor en su app).
+    Sin supervisor_id devuelve el de todos, uno por supervisor."""
+    f = parse_fecha(fecha) or fecha_lima()
+    sup = (supervisor_id or "").strip()
+    pool = await db()
+    reps = await pool.fetch(
+        """SELECT r.supervisor_id, s.nombre AS supervisor_nombre, r.turno, r.area,
+                  r.anotaciones, r.restricciones, r.descripcion, r.otm_id
+           FROM campo_reportes r
+           LEFT JOIN supervisores s ON s.id = r.supervisor_id
+           WHERE r.fecha = $1 AND r.proyecto_id = $2
+             AND ($3 = '' OR r.supervisor_id = $3)
+           ORDER BY r.supervisor_id, r.id""", f, proyecto_id, sup)
+    # Personal del día por supervisor y cargo (del tareo real)
+    hh = await pool.fetch(
+        """SELECT tp.supervisor_id, COALESCE(t.cargo,'SIN CARGO') AS cargo,
+                  COUNT(DISTINCT tp.trabajador_id) AS n
+           FROM tareo_partida tp
+           LEFT JOIN trabajadores t ON t.id = tp.trabajador_id
+           WHERE tp.fecha = $1 AND ($2 = '' OR tp.supervisor_id = $2)
+           GROUP BY 1, 2 ORDER BY n DESC, cargo""", f, sup)
+
+    out = []
+    for sup in dict.fromkeys([r["supervisor_id"] for r in reps]):
+        mios = [r for r in reps if r["supervisor_id"] == sup]
+        bloques, rests = [], []
+        for r in mios:
+            items = json.loads(r["anotaciones"]) if r["anotaciones"] else (
+                [ln.lstrip("•- ").strip() for ln in (r["descripcion"] or "").split("\n") if ln.strip()])
+            if items:
+                bloques.append({"area": r["area"] or "", "items": items})
+            if r["restricciones"]:
+                rests += json.loads(r["restricciones"])
+        out.append({
+            "supervisor_id": sup,
+            "supervisor": mios[0]["supervisor_nombre"] or sup,
+            "texto": armar_texto_reporte(
+                f, mios[0]["turno"] or "DIA", mios[0]["supervisor_nombre"] or sup,
+                [{"cargo": x["cargo"], "n": x["n"]} for x in hh if x["supervisor_id"] == sup],
+                bloques, rests),
+        })
+    return {"fecha": f.isoformat(), "partes": out}
+
+
 @router_campo.post("/reportes")
 async def crear_reporte(
     proyecto_id: int = Form(1),
@@ -1762,11 +1905,26 @@ async def crear_reporte(
     descripcion: str = Form(""),
     actividad_id: Optional[int] = Form(None),
     id_local: Optional[str] = Form(None),
+    area: str = Form(""),
+    turno: str = Form("DIA"),
+    anotaciones: str = Form(""),      # JSON: ["viñeta", …]
+    restricciones: str = Form(""),    # JSON: [{"cat":"MATERIALES","detalle":"…"}, …]
     fotos: List[UploadFile] = File(default=[]),
     user: dict = Depends(require_role()),
 ):
     exigir_identidad_supervisor(user, supervisor_id)
     f_rep = parse_fecha(fecha) or fecha_lima()
+    # Reporte estructurado (0032): viñetas de lo realizado + restricciones con
+    # categoría del catálogo CNC. `descripcion` se conserva por compatibilidad
+    # (si no viene, se arma con las viñetas).
+    notas = _lista_json(anotaciones)
+    rests = [
+        {"cat": _validar_cnc(x.get("cat")) or "OTROS", "detalle": str(x.get("detalle") or "").strip()}
+        for x in _lista_json(restricciones) if isinstance(x, dict)
+    ]
+    turno = turno.strip().upper() if turno.strip().upper() in ("DIA", "NOCHE") else "DIA"
+    if not descripcion.strip() and notas:
+        descripcion = "\n".join(f"• {n}" for n in notas)
     if not descripcion.strip() and not fotos:
         raise HTTPException(400, "El reporte necesita una descripción o al menos una foto")
     if len(fotos) > MAX_FOTOS_POR_REPORTE:
@@ -1812,10 +1970,14 @@ async def crear_reporte(
                 try:
                     rid = await con.fetchval(
                         """INSERT INTO campo_reportes
-                           (proyecto_id, fecha, otm_id, actividad_id, supervisor_id, descripcion, id_local)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id""",
+                           (proyecto_id, fecha, otm_id, actividad_id, supervisor_id, descripcion,
+                            id_local, area, turno, anotaciones, restricciones)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id""",
                         proyecto_id, f_rep, otm_id.strip(), actividad_id,
-                        supervisor_id.strip(), descripcion.strip() or None, id_local)
+                        supervisor_id.strip(), descripcion.strip() or None, id_local,
+                        area.strip() or None, turno,
+                        json.dumps(notas) if notas else None,
+                        json.dumps(rests) if rests else None)
                 except asyncpg.UniqueViolationError:
                     # Carrera de reintentos simultáneos del outbox: el otro ganó.
                     raise _ReporteYaExiste()

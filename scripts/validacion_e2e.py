@@ -18,6 +18,7 @@ Uso (Windows Git Bash / Linux):
 Idempotente: limpia sus propios datos (OTM-E2E / E2E-%) al inicio.
 Sale con código 0 si TODO pasa; 1 si algo falla.
 """
+import json
 import os
 import sys
 
@@ -979,6 +980,67 @@ def main():
     check("P46 padrón unificado: todo supervisor activo tiene ficha de trabajador activa",
           sueltos == 0 and inactivos == 0,
           f"sin_ficha={sueltos} con_ficha_inactiva={inactivos}")
+
+    # P47 — REPORTE ESTRUCTURADO (0032): el supervisor manda viñetas de lo
+    # hecho + restricciones con categoría CNC + área/turno; la actividad queda
+    # EJECUTADA y el parte del día sale armado para copiar al grupo.
+    buf47 = BytesIO()
+    Image.new("RGB", (500, 400), (60, 120, 60)).save(buf47, "JPEG")
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-E2E",
+        "titulo": "E2E Cerco perimetral", "supervisor_id": "SUPE2E"})
+    act47 = r.json() if r.status_code == 200 else {}
+    r = c.post(f"{API}/campo/reportes",
+               data={"proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-E2E",
+                     "supervisor_id": "SUPE2E", "actividad_id": act47.get("id"),
+                     "area": "PLANTA SX / EW", "turno": "DIA",
+                     "anotaciones": json.dumps(["Corte de esparragos",
+                                                "Instalacion del cerco completo"]),
+                     "restricciones": json.dumps([
+                         {"cat": "EQUIPOS", "detalle": "No hubo camion grua"}])},
+               files=[("fotos", ("cerco.jpg", buf47.getvalue(), "image/jpeg"))])
+    rep47 = r.json() if r.status_code == 200 else {}
+    cur.execute("SELECT area, turno, anotaciones, restricciones, descripcion "
+                "FROM campo_reportes WHERE id = %s", (rep47.get("id"),))
+    fila47 = cur.fetchone()
+    check("P47 reporte estructurado: área, turno, viñetas y restricción CNC guardadas",
+          r.status_code == 200 and fila47 is not None
+          and fila47[0] == "PLANTA SX / EW" and fila47[1] == "DIA"
+          and len(fila47[2]) == 2 and fila47[3][0]["cat"] == "EQUIPOS"
+          and "• Corte de esparragos" in (fila47[4] or ""),
+          f"status={r.status_code} fila={fila47}")
+
+    # P48 — PARTE DIARIO listo para WhatsApp (mismo formato que la app).
+    r = c.get(f"{API}/ev/programacion/reporte-dia",
+              params={"fecha": FECHA_TAREO, "supervisor_id": "SUPE2E"})
+    partes = r.json().get("partes", []) if r.status_code == 200 else []
+    txt = partes[0]["texto"] if partes else ""
+    check("P48 parte diario: cabecera, personal por cargo del tareo, área y restricciones",
+          r.status_code == 200 and "Turno: DIA" in txt
+          and "CANTIDAD TOTAL PERSONAL:" in txt and "AREA: PLANTA SX / EW" in txt
+          and "* Corte de esparragos" in txt
+          and "RESTRICCIONES." in txt and "camion grua" in txt,
+          f"status={r.status_code} texto={txt[:200]!r}")
+
+    # P49 — PLANTILLA: al reportar otra vez la misma partida/hito, la app
+    # ofrece lo escrito la vez anterior para no volver a tipearlo.
+    cur.execute("SELECT partida_id, hito_id FROM prog_actividades WHERE id = %s",
+                (act47.get("id"),))
+    ph = cur.fetchone()
+    cur.execute("UPDATE prog_actividades SET partida_id = %s WHERE id = %s",
+                (p1["id"], act47.get("id")))
+    r0 = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-E2E",
+        "titulo": "E2E Cerco perimetral dia 2", "supervisor_id": "SUPE2E",
+        "partida_id": p1["id"]})
+    act49 = r0.json() if r0.status_code == 200 else {}
+    r = c.get(f"{API}/campo/reporte-plantilla", params={"actividad_id": act49.get("id")})
+    pl = r.json() if r.status_code == 200 else {}
+    check("P49 plantilla: el reporte anterior de esa partida se ofrece para reusar",
+          r.status_code == 200 and pl.get("area") == "PLANTA SX / EW"
+          and "Corte de esparragos" in (pl.get("anotaciones") or [])
+          and (pl.get("restricciones") or [{}])[0].get("cat") == "EQUIPOS",
+          f"status={r.status_code} plantilla={pl} ph={ph}")
 
     print()
     if _fallas:
