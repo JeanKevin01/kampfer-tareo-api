@@ -1066,13 +1066,28 @@ def main():
     part = bloque.get("partida", {})
     reps51 = bloque.get("reportes", [])
     fechas51 = [x["fecha"] for x in reps51]
+    txt51 = reps51[0].get("texto") or "" if reps51 else ""
     check("P51 reporte por partida: cifras de la partida + partes cronológicos con fotos",
           r.status_code == 200 and part.get("codigo") == "E2E-001"
           and part.get("metrado_presup") == 10 and part.get("hh_gastadas", 0) > 0
           and len(reps51) >= 1 and fechas51 == sorted(fechas51)
-          and "CANTIDAD TOTAL PERSONAL" in (reps51[0].get("texto") or "")
+          and "CANTIDAD TOTAL PERSONAL" in txt51
           and any(len(x.get("fotos", [])) > 0 for x in reps51),
           f"status={r.status_code} partida={part} n_reportes={len(reps51)}")
+
+    # P53 — COHERENCIA DEL SUSTENTO: la cuadrilla del parte sale del tareo de
+    # ESA partida (no del día entero del supervisor), cada parte trae sus HH,
+    # las actividades realizadas aparecen y las restricciones NO (el sustento
+    # acredita lo ejecutado; las restricciones viven en el PPC).
+    per51 = [x for x in reps51 if x.get("hh_dia", 0) > 0]
+    check("P53 sustento coherente: cuadrilla y HH de la partida, sin restricciones",
+          "CANTIDAD TOTAL PERSONAL: 0" not in txt51
+          and len(per51) >= 1 and part.get("sin_tareo") is False
+          and part.get("hh_rango", 0) > 0
+          and "* Corte de esparragos" in txt51
+          and "RESTRICCIONES." not in txt51 and "camion grua" not in txt51,
+          f"hh_dia={[x.get('hh_dia') for x in reps51]} sin_tareo={part.get('sin_tareo')} "
+          f"texto={txt51[:220]!r}")
 
     # P52 — el rango de fechas filtra (vacío = todo el historial)
     r = c.get(f"{API}/ev/programacion/reporte-partida",

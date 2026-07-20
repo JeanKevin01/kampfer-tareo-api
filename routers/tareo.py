@@ -319,6 +319,7 @@ async def enviar_con_partidas(data: dict, user: dict = Depends(require_role())):
 
     enviados = 0
     fallidos = 0
+    omitidos = 0
 
     try:
         # Todo el registro va en UNA transacción: o entra completo o no entra nada
@@ -363,8 +364,18 @@ async def enviar_con_partidas(data: dict, user: dict = Depends(require_role())):
                     # aborta el envío completo, solo se cuenta en `fallidos`.
                     for asig in asignaciones:
                         pid = asig.get("partida_id")
-                        hh  = float(asig.get("hh", hh_dia))
+                        try:
+                            hh = float(asig.get("hh") or hh_dia)
+                        except (TypeError, ValueError):
+                            hh = 0.0
                         if not pid or hh <= 0:
+                            # Antes se descartaba en SILENCIO: la app decía
+                            # "enviado" y la partida se quedaba con 0 HH en el
+                            # ISP y en el sustento. Ahora se cuenta y se avisa.
+                            omitidos += 1
+                            log.warning(
+                                f"[tareo_partida] omitida asignación trab={trab_id} "
+                                f"pid={pid} hh={asig.get('hh')}")
                             continue
                         try:
                             async with con.transaction():
@@ -389,6 +400,6 @@ async def enviar_con_partidas(data: dict, user: dict = Depends(require_role())):
         raise HTTPException(500, f"Error al registrar tareo: {e}")
 
     return {"ok": True, "enviados": enviados, "tareo_fallidos": fallidos,
-            "sesion_id": sesion_id, "hh_dia": hh_dia}
+            "tareo_omitidos": omitidos, "sesion_id": sesion_id, "hh_dia": hh_dia}
 
 

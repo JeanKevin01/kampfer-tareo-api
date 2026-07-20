@@ -1595,10 +1595,12 @@ async def reporte_partida(partidas: str, desde: str = "", hasta: str = ""):
                WHERE h.partida_id = ANY($1)
                ORDER BY h.partida_id, h.es_principal DESC, a.semana DESC""", pids)}
         reps = await con.fetch(
-            """SELECT r.*, s.nombre AS supervisor_nombre, a.partida_id, a.titulo AS act_titulo
+            """SELECT r.*, s.nombre AS supervisor_nombre, a.partida_id,
+                      a.titulo AS act_titulo, o.area AS otm_area
                FROM campo_reportes r
                JOIN prog_actividades a ON a.id = r.actividad_id
                LEFT JOIN supervisores s ON s.id = r.supervisor_id
+               LEFT JOIN otms o ON o.id = r.otm_id
                WHERE a.partida_id = ANY($1) AND r.fecha BETWEEN $2 AND $3
                ORDER BY r.fecha, r.id""", pids, f_desde, f_hasta)
         fotos = [dict(r) for r in await con.fetch(
@@ -1607,14 +1609,19 @@ async def reporte_partida(partidas: str, desde: str = "", hasta: str = ""):
                JOIN prog_actividades a ON a.id = r.actividad_id
                WHERE a.partida_id = ANY($1) AND r.fecha BETWEEN $2 AND $3
                ORDER BY f.id""", pids, f_desde, f_hasta)]
-        # Personal por (fecha, supervisor) desde el tareo real, para la cabecera
-        # de cada parte — el mismo criterio del reporte diario.
+        # Personal por (fecha, supervisor, PARTIDA) desde el tareo real. Ojo: se
+        # acota a la partida a propósito — este documento sustenta UNA partida,
+        # así que la cuadrilla que muestra tiene que ser la que trabajó en ella
+        # (antes contaba todo el día del supervisor y podía mostrar gente de
+        # otra OTM mientras las HH de la partida salían en 0).
         hh_dia = await con.fetch(
-            """SELECT tp.fecha, tp.supervisor_id, COALESCE(t.cargo,'SIN CARGO') AS cargo,
-                      COUNT(DISTINCT tp.trabajador_id) AS n
+            """SELECT tp.fecha, tp.supervisor_id, tp.partida_id,
+                      COALESCE(t.cargo,'SIN CARGO') AS cargo,
+                      COUNT(DISTINCT tp.trabajador_id) AS n,
+                      SUM(tp.hh) AS hh
                FROM tareo_partida tp LEFT JOIN trabajadores t ON t.id = tp.trabajador_id
-               WHERE tp.fecha BETWEEN $1 AND $2
-               GROUP BY 1,2,3 ORDER BY n DESC""", f_desde, f_hasta)
+               WHERE tp.partida_id = ANY($1) AND tp.fecha BETWEEN $2 AND $3
+               GROUP BY 1,2,3,4 ORDER BY n DESC""", pids, f_desde, f_hasta)
         # HH gastadas por partida: fuente única del motor (manual > tareo > histórico)
         from routers.ev._datos import _hh_gastadas_unificada
         hh_unif = await _hh_gastadas_unificada(con)
@@ -1632,25 +1639,40 @@ async def reporte_partida(partidas: str, desde: str = "", hasta: str = ""):
         for r in [x for x in reps if x["partida_id"] == p["id"]]:
             notas = json.loads(r["anotaciones"]) if r["anotaciones"] else (
                 [ln.lstrip("•- ").strip() for ln in (r["descripcion"] or "").split("\n") if ln.strip()])
-            rests = json.loads(r["restricciones"]) if r["restricciones"] else []
-            personal = [{"cargo": x["cargo"], "n": x["n"]} for x in hh_dia
-                        if x["fecha"] == r["fecha"] and x["supervisor_id"] == r["supervisor_id"]]
+            # Si el supervisor no escribió viñetas, el sustento no puede quedar
+            # con "ACTIVIDADES REALIZADAS" en blanco: cae al título de la
+            # actividad programada, que es lo que efectivamente se ejecutó.
+            if not notas and r["act_titulo"]:
+                notas = [r["act_titulo"]]
+            filas_dia = [x for x in hh_dia
+                         if x["fecha"] == r["fecha"] and x["partida_id"] == p["id"]
+                         and x["supervisor_id"] == r["supervisor_id"]]
+            personal = [{"cargo": x["cargo"], "n": x["n"]} for x in filas_dia]
             bloques.append({
                 "id": r["id"], "fecha": str(r["fecha"]), "area": r["area"],
                 "turno": r["turno"], "actividad": r["act_titulo"],
                 "supervisor": r["supervisor_nombre"] or r["supervisor_id"],
+                "hh_dia": round(sum(float(x["hh"] or 0) for x in filas_dia), 2),
+                # Sin restricciones: el sustento de valorización acredita lo
+                # EJECUTADO; las restricciones viven en el PPC, no aquí.
                 "texto": armar_texto_reporte(
                     r["fecha"], r["turno"] or "DIA", r["supervisor_nombre"] or r["supervisor_id"],
-                    personal, [{"area": r["area"] or "", "items": notas}], rests),
+                    personal, [{"area": r["area"] or r["otm_area"] or "", "items": notas}], []),
                 "fotos": [_foto_out(f) for f in fotos if f["rid"] == r["id"]],
             })
+        hh_rango = round(sum(float(x["hh"] or 0) for x in hh_dia if x["partida_id"] == p["id"]), 2)
+        hh_tot = round(hh_por_partida.get(p["id"], 0.0), 2)
         out.append({
             "partida": {"id": p["id"], "codigo": p["codigo"], "descripcion": p["descripcion"],
                         "unidad": p["unidad"], "otm_id": p["otm_id"], "otm_desc": p["otm_desc"],
                         "metrado_presup": mp, "metrado_ejec": me,
                         "avance": round(me / mp, 4) if mp else None,
                         "hh_presup": float(p["hh_presup"] or 0),
-                        "hh_gastadas": round(hh_por_partida.get(p["id"], 0.0), 2)},
+                        "hh_gastadas": hh_tot, "hh_rango": hh_rango,
+                        # Aviso honesto: hay partes de campo pero ninguna HH del
+                        # tareo cayó en esta partida (el tareo se envió sin
+                        # partida, con 0 HH, o lo reemplazó un envío posterior).
+                        "sin_tareo": bool(bloques) and hh_tot == 0},
             "reportes": bloques,
         })
     return {"desde": str(f_desde) if desde else None,
