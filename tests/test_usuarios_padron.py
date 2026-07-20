@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from core import auth
 from main import app
-from routers.usuarios import slug_username
+from core.personal import norm_nombre, slug_username
 
 c = TestClient(app)
 
@@ -52,3 +52,11 @@ def test_desde_personal_requiere_admin():
 def test_sincronizar_requiere_admin():
     r = c.post("/api/admin/usuarios/sincronizar-supervisores", headers=_hdr("oficina"))
     assert r.status_code == 403
+
+
+# ── norm_nombre: comparación tolerante para reutilizar perfiles ──
+
+def test_norm_nombre_ignora_tildes_y_espacios():
+    assert norm_nombre("  Ñaupa   Quispe  Ángel ") == norm_nombre("NAUPA QUISPE ANGEL")
+    assert norm_nombre("Mamani Ccopa David") == "MAMANI CCOPA DAVID"
+    assert norm_nombre(None) == ""

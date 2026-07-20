@@ -1,14 +1,16 @@
 # ============================================================
 # routers/usuarios.py — login JWT + gestión de usuarios (Fase 2 seguridad)
 # ============================================================
-import re
-import unicodedata
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.auth import _check_pw, _hash_pw, current_user, make_token, require_role
 from core.db import db as core_db
+# El padrón unificado vive en core/personal.py (una persona = una ficha de
+# trabajador; supervisor es un rol adicional ligado a ella).
+from core.personal import (CLAVE_INICIAL, asegurar_supervisor,  # noqa: F401  (re-export)
+                           crear_usuario_supervisor, slug_username)
 
 router = APIRouter(tags=["usuarios"])
 
@@ -116,60 +118,6 @@ async def usuarios_baja(uid: int, _u: dict = Depends(require_role("admin"))):
 # salta la pantalla "¿Quién eres?" (el token lleva sup_id, F0.6).
 # ══════════════════════════════════════════════════════════════
 
-CLAVE_INICIAL = "1234"
-
-
-def slug_username(nombre: str) -> str:
-    """Genera el usuario a partir del nombre del padrón.
-
-    Formato peruano «APELLIDO APELLIDO NOMBRES» → inicial del nombre + primer
-    apellido, en minúsculas y sin tildes: MAMANI CCOPA DAVID → dmamani
-    (decisión de Jean: corto, se teclea con guantes en el celular).
-    """
-    limpio = unicodedata.normalize("NFKD", str(nombre or "")).encode("ascii", "ignore").decode()
-    # Los signos se quitan SIN partir la palabra (O'CONNOR → OCONNOR)
-    partes = [p for p in re.sub(r"[^A-Za-z ]", "", limpio).upper().split() if p]
-    if not partes:
-        return ""
-    if len(partes) == 1:
-        base = partes[0]
-    else:
-        # ≥3 palabras: los 2 primeros son apellidos y el 3º el nombre de pila.
-        pila = partes[2] if len(partes) >= 3 else partes[1]
-        base = pila[0] + partes[0]
-    return base.lower()[:20]
-
-
-async def _username_libre(con, base: str) -> str:
-    """Primer username disponible a partir de la base (dmamani, dmamani2…)."""
-    base = base or "usuario"
-    cand, n = base, 1
-    while await con.fetchval("SELECT 1 FROM usuarios WHERE lower(username) = lower($1)", cand):
-        n += 1
-        cand = f"{base}{n}"
-    return cand
-
-
-async def crear_usuario_supervisor(con, supervisor_id: str, nombre: str,
-                                   username: str = "", password: str = "") -> Optional[dict]:
-    """Crea el acceso de un supervisor del padrón. Devuelve None si ese
-    supervisor YA tiene usuario activo (idempotente: el import puede repetirse).
-    """
-    ya = await con.fetchval(
-        "SELECT username FROM usuarios WHERE supervisor_id = $1 AND activo = true", supervisor_id)
-    if ya:
-        return None
-    clave = password or CLAVE_INICIAL
-    user = (username or "").strip().lower() or await _username_libre(con, slug_username(nombre))
-    await con.execute(
-        "INSERT INTO usuarios (username, password_hash, rol, nombre, supervisor_id, clave_inicial) "
-        "VALUES ($1, $2, 'supervisor', $3, $4, $5)",
-        user, _hash_pw(clave), nombre, supervisor_id, clave == CLAVE_INICIAL,
-    )
-    return {"supervisor_id": supervisor_id, "nombre": nombre,
-            "username": user, "password": clave}
-
-
 @router.get("/api/admin/personal-elegible")
 async def personal_elegible(_u: dict = Depends(require_role("admin"))):
     """Personal del padrón para el selector de Usuarios: supervisores y
@@ -219,16 +167,9 @@ async def usuario_desde_personal(data: dict, _u: dict = Depends(require_role("ad
                     "SELECT id, nombre FROM trabajadores WHERE id = $1 AND activo = true", pid)
                 if not trab:
                     raise HTTPException(400, "Ese trabajador no existe o está inactivo")
-                sup_id = await con.fetchval(
-                    "SELECT id FROM supervisores WHERE trabajador_id = $1", pid)
-                if not sup_id:
-                    # Promoción: alta en el padrón de supervisores ligada al trabajador
-                    max_id = await con.fetchval(
-                        r"SELECT MAX(CAST(id AS INTEGER)) FROM supervisores WHERE id ~ '^\d+$'")
-                    sup_id = str((max_id or 0) + 1).zfill(2)
-                    await con.execute(
-                        "INSERT INTO supervisores (id, nombre, activo, trabajador_id) "
-                        "VALUES ($1, $2, true, $3)", sup_id, trab["nombre"], pid)
+                # Promoción: rol de supervisor ligado a su ficha (o adopción
+                # de la ficha suelta que tuviera del padrón viejo).
+                sup_id = (await asegurar_supervisor(con, pid, trab["nombre"]))["id"]
                 nombre = trab["nombre"]
                 promovido = True
             else:

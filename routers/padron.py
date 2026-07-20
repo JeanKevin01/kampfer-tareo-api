@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from core.auth import require_role
 from core.db import db as core_db
-from routers.usuarios import crear_usuario_supervisor
+from core.personal import alta_persona
 
 router = APIRouter(tags=["padron"])
 
@@ -108,10 +108,18 @@ async def trabajadores_merge(data: dict, _u: dict = Depends(require_role("oficin
 # ── TRABAJADORES (admin CRUD) ────────────────────────────────
 @router.post("/admin/trabajador")
 async def crear_trabajador(data: dict, _u: dict = Depends(require_role("oficina"))):
+    """Alta de personal. TODA persona entra al padrón de trabajadores —directos,
+    indirectos y supervisores—; `es_supervisor=true` añade el ROL (ficha de
+    supervisor ligada + acceso a la app con la clave inicial).
+
+    Idempotente: si la persona ya existe (por DNI o nombre) se REUTILIZA su
+    perfil —y su contraseña actual si ya tenía acceso— en vez de duplicarla.
+    """
     nombre = data.get("nombre", "").strip().upper()
     cargo  = data.get("cargo",  "").strip().upper()
     dni    = data.get("dni",    "").strip()
     tipo   = data.get("tipo",   "").strip().upper()
+    es_sup = bool(data.get("es_supervisor", False))
 
     if not nombre or not cargo:
         raise HTTPException(400, "Nombre y cargo son requeridos")
@@ -120,16 +128,13 @@ async def crear_trabajador(data: dict, _u: dict = Depends(require_role("oficina"
         tipo = "DIRECTO"
 
     pool = await core_db()
-    max_id = await pool.fetchval(
-        r"SELECT MAX(CAST(id AS INTEGER)) FROM trabajadores WHERE id ~ '^\d+$'")
-    next_id = str((max_id or 0) + 1).zfill(3)
-
-    await pool.execute(
-        "INSERT INTO trabajadores (id, nombre, cargo, dni, tipo) "
-        "VALUES ($1, $2, $3, $4, $5)",
-        next_id, nombre, cargo, dni, tipo,
-    )
-    return {"status": "ok", "id": next_id, "nombre": nombre, "cargo": cargo, "tipo": tipo}
+    async with pool.acquire() as con:
+        async with con.transaction():
+            r = await alta_persona(con, nombre, cargo, dni, tipo,
+                                   es_supervisor=es_sup, email=data.get("email", ""))
+    return {"status": "ok", "id": r["id"], "nombre": r["nombre"], "cargo": cargo, "tipo": tipo,
+            "nuevo": r["nuevo"], "supervisor_id": r["supervisor_id"],
+            "usuario": r["usuario"], "password": r["password"]}
 
 
 @router.get("/admin/trabajadores")
@@ -194,7 +199,7 @@ async def listar_supervisores_admin():
     pool = await core_db()
     # Orden numérico solo para ids numéricos (un id atípico no debe romper el listado).
     rows = await pool.fetch(
-        "SELECT id, nombre, email, activo FROM supervisores "
+        "SELECT id, nombre, email, activo, trabajador_id FROM supervisores "
         r"ORDER BY (CASE WHEN id ~ '^\d+$' THEN CAST(id AS INTEGER) END) NULLS LAST, id"
     )
     return [dict(r) for r in rows]
@@ -211,20 +216,14 @@ async def crear_supervisor(data: dict, _u: dict = Depends(require_role("oficina"
     pool = await core_db()
     async with pool.acquire() as con:
         async with con.transaction():
-            max_id = await con.fetchval(
-                r"SELECT MAX(CAST(id AS INTEGER)) FROM supervisores WHERE id ~ '^\d+$'")
-            next_id = str((max_id or 0) + 1).zfill(2)
-            await con.execute(
-                "INSERT INTO supervisores (id, nombre, email, activo) VALUES ($1, $2, $3, true)",
-                next_id, nombre, email,
-            )
-            # Quien reporta necesita entrar a la app: el acceso nace junto con
-            # el supervisor, con la clave inicial (cubre también el import de
-            # personal con ES_SUPERVISOR=SI). Idempotente y no bloqueante.
-            acceso = await crear_usuario_supervisor(con, next_id, nombre)
-    return {"status": "ok", "id": next_id, "nombre": nombre,
-            "usuario": acceso["username"] if acceso else None,
-            "password": acceso["password"] if acceso else None}
+            # Un supervisor es personal del proyecto: entra al padrón de
+            # trabajadores (reutilizando su ficha si ya estaba) y encima recibe
+            # el rol y su acceso a la app con la clave inicial.
+            r = await alta_persona(con, nombre, data.get("cargo", "SUPERVISOR"),
+                                   data.get("dni", ""), "INDIRECTO",
+                                   es_supervisor=True, email=email)
+    return {"status": "ok", "id": r["supervisor_id"], "nombre": r["nombre"],
+            "trabajador_id": r["id"], "usuario": r["usuario"], "password": r["password"]}
 
 
 @router.put("/admin/supervisor/{sup_id}")

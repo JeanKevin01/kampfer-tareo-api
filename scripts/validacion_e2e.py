@@ -70,16 +70,21 @@ def limpiar_y_sembrar(cur):
 
     # Usuarios y supervisores creados por los checks del padrón (P42-P44):
     # los usuarios van PRIMERO (referencian supervisores por FK).
-    cur.execute("DELETE FROM usuarios WHERE username IN ('supe2e','e2etrab','mpacheco') "
+    cur.execute("DELETE FROM usuarios WHERE username IN ('supe2e','e2etrab','mpacheco','lticona') "
                 "OR supervisor_id IN (SELECT id FROM supervisores WHERE nombre LIKE '%E2E%')")
     cur.execute("DELETE FROM supervisores WHERE trabajador_id IN ('901','902') "
-                "OR nombre LIKE 'PACHECO ROJAS%'")
+                "OR nombre LIKE 'PACHECO ROJAS%' OR nombre LIKE 'TICONA HUANCA%'")
+    cur.execute("DELETE FROM trabajadores WHERE nombre IN "
+                "('PACHECO ROJAS MARIO E2E','TICONA HUANCA LUIS E2E')")
 
-    cur.execute("INSERT INTO supervisores (id, nombre) VALUES ('SUPE2E','Supervisor E2E') "
-                "ON CONFLICT (id) DO NOTHING")
     cur.execute("INSERT INTO trabajadores (id, nombre, cargo) VALUES "
+                "('900','Supervisor E2E','SUPERVISOR'),"
                 "('901','Trabajador E2E Uno','OFICIAL'),('902','Trabajador E2E Dos','OPERARIO') "
                 "ON CONFLICT (id) DO NOTHING")
+    # Padrón unificado: el supervisor de prueba también tiene su ficha (0031)
+    cur.execute("INSERT INTO supervisores (id, nombre, trabajador_id) "
+                "VALUES ('SUPE2E','Supervisor E2E','900') "
+                "ON CONFLICT (id) DO UPDATE SET trabajador_id = '900'")
     cur.execute("DELETE FROM otms WHERE descripcion LIKE 'E2E PROYECTO%'")
     cur.execute("INSERT INTO otms (id, descripcion, proyecto_id) VALUES "
                 "('OTM-E2E','OTM de validación E2E',1) ON CONFLICT (id) DO NOTHING")
@@ -883,19 +888,42 @@ def main():
           r.status_code == 200 and restante41 > 6.9 * 24 * 3600,
           f"status={r.status_code} restante_h={restante41/3600:.1f}")
 
-    # P42 — ALTA DE SUPERVISOR CREA SU ACCESO (cubre el import con
-    # ES_SUPERVISOR=SI): usuario derivado del nombre + clave inicial 1234, y
-    # el login trae su identidad (sup_id) para saltarse "¿Quién eres?".
+    # P42 — ALTA DE SUPERVISOR: entra al PADRÓN DE TRABAJADORES (regla de
+    # padrón unificado) y además recibe rol + acceso con clave 1234; el login
+    # trae su identidad (sup_id) para saltarse "¿Quién eres?".
     r = c.post(f"{API}/admin/supervisor", json={"nombre": "PACHECO ROJAS MARIO E2E"})
     alta = r.json() if r.status_code == 200 else {}
     rl = c.post(f"{API}/api/auth/login",
                 json={"username": alta.get("usuario", "x"), "password": "1234"})
     lg = rl.json() if rl.status_code == 200 else {}
-    check("P42 alta de supervisor crea su acceso (usuario del nombre + clave 1234)",
+    cur.execute("SELECT id FROM trabajadores WHERE nombre = 'PACHECO ROJAS MARIO E2E'")
+    ficha = cur.fetchone()
+    check("P42 alta de supervisor: ficha en trabajadores + rol + acceso (clave 1234)",
           r.status_code == 200 and alta.get("usuario") == "mpacheco"
-          and alta.get("password") == "1234" and rl.status_code == 200
+          and alta.get("password") == "1234" and ficha is not None
+          and alta.get("trabajador_id") == ficha[0] and rl.status_code == 200
           and lg.get("rol") == "supervisor" and lg.get("supervisor_id") == alta.get("id"),
-          f"alta={alta} login={rl.status_code}")
+          f"alta={alta} login={rl.status_code} ficha={ficha}")
+
+    # P42b — IMPORT DE PERSONAL: una sola puerta (/admin/trabajador). Con
+    # es_supervisor=true la persona queda en el padrón Y con acceso; repetir la
+    # importación REUTILIZA su perfil (no duplica ni cambia su contraseña).
+    body = {"nombre": "TICONA HUANCA LUIS E2E", "cargo": "SUPERVISOR DE CAMPO",
+            "dni": "77777777", "tipo": "INDIRECTO", "es_supervisor": True}
+    r = c.post(f"{API}/admin/trabajador", json=body)
+    imp1 = r.json() if r.status_code == 200 else {}
+    r2 = c.post(f"{API}/admin/trabajador", json=body)
+    imp2 = r2.json() if r2.status_code == 200 else {}
+    cur.execute("SELECT COUNT(*) FROM trabajadores WHERE nombre = 'TICONA HUANCA LUIS E2E'")
+    n_fichas = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM usuarios WHERE supervisor_id = %s", (imp1.get("supervisor_id"),))
+    n_users = cur.fetchone()[0]
+    check("P42b import: todos al padrón; reimportar reutiliza el perfil sin duplicar",
+          r.status_code == 200 and imp1.get("nuevo") is True and imp1.get("usuario") == "lticona"
+          and r2.status_code == 200 and imp2.get("nuevo") is False
+          and imp2.get("id") == imp1.get("id") and imp2.get("usuario") is None
+          and n_fichas == 1 and n_users == 1,
+          f"1ra={imp1} 2da={imp2} fichas={n_fichas} usuarios={n_users}")
 
     # P43 — PROMOVER A UN TRABAJADOR: elegirlo desde el panel Usuarios lo
     # registra como supervisor (ligado a su ficha) y le crea el acceso; el
@@ -939,6 +967,18 @@ def main():
           and r2.status_code == 200 and len(s2.get("creados", [])) == 0
           and s2.get("ya_tenian", 0) >= 1,
           f"1ra={len(s1.get('creados', []))} creados / 2da={s2}")
+
+    # P46 — INVARIANTE DEL PADRÓN UNIFICADO (0031): no puede quedar ningún
+    # supervisor activo sin su ficha en trabajadores (antes el import los
+    # creaba solo en `supervisores` y no aparecían en el padrón).
+    cur.execute("SELECT COUNT(*) FROM supervisores WHERE activo AND trabajador_id IS NULL")
+    sueltos = cur.fetchone()[0]
+    cur.execute("SELECT COUNT(*) FROM supervisores s JOIN trabajadores t ON t.id = s.trabajador_id "
+                "WHERE s.activo AND NOT t.activo")
+    inactivos = cur.fetchone()[0]
+    check("P46 padrón unificado: todo supervisor activo tiene ficha de trabajador activa",
+          sueltos == 0 and inactivos == 0,
+          f"sin_ficha={sueltos} con_ficha_inactiva={inactivos}")
 
     print()
     if _fallas:
