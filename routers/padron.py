@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from core.auth import require_role
 from core.db import db as core_db
+from routers.usuarios import crear_usuario_supervisor
 
 router = APIRouter(tags=["padron"])
 
@@ -208,15 +209,22 @@ async def crear_supervisor(data: dict, _u: dict = Depends(require_role("oficina"
         raise HTTPException(400, "Nombre es requerido")
 
     pool = await core_db()
-    max_id = await pool.fetchval(
-        r"SELECT MAX(CAST(id AS INTEGER)) FROM supervisores WHERE id ~ '^\d+$'")
-    next_id = str((max_id or 0) + 1).zfill(2)
-
-    await pool.execute(
-        "INSERT INTO supervisores (id, nombre, email, activo) VALUES ($1, $2, $3, true)",
-        next_id, nombre, email,
-    )
-    return {"status": "ok", "id": next_id, "nombre": nombre}
+    async with pool.acquire() as con:
+        async with con.transaction():
+            max_id = await con.fetchval(
+                r"SELECT MAX(CAST(id AS INTEGER)) FROM supervisores WHERE id ~ '^\d+$'")
+            next_id = str((max_id or 0) + 1).zfill(2)
+            await con.execute(
+                "INSERT INTO supervisores (id, nombre, email, activo) VALUES ($1, $2, $3, true)",
+                next_id, nombre, email,
+            )
+            # Quien reporta necesita entrar a la app: el acceso nace junto con
+            # el supervisor, con la clave inicial (cubre también el import de
+            # personal con ES_SUPERVISOR=SI). Idempotente y no bloqueante.
+            acceso = await crear_usuario_supervisor(con, next_id, nombre)
+    return {"status": "ok", "id": next_id, "nombre": nombre,
+            "usuario": acceso["username"] if acceso else None,
+            "password": acceso["password"] if acceso else None}
 
 
 @router.put("/admin/supervisor/{sup_id}")

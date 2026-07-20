@@ -68,6 +68,13 @@ def limpiar_y_sembrar(cur):
                 "(SELECT id FROM ev_partidas WHERE codigo LIKE 'E2E-%')")
     cur.execute("DELETE FROM ev_partidas WHERE codigo LIKE 'E2E-%'")
 
+    # Usuarios y supervisores creados por los checks del padrón (P42-P44):
+    # los usuarios van PRIMERO (referencian supervisores por FK).
+    cur.execute("DELETE FROM usuarios WHERE username IN ('supe2e','e2etrab','mpacheco') "
+                "OR supervisor_id IN (SELECT id FROM supervisores WHERE nombre LIKE '%E2E%')")
+    cur.execute("DELETE FROM supervisores WHERE trabajador_id IN ('901','902') "
+                "OR nombre LIKE 'PACHECO ROJAS%'")
+
     cur.execute("INSERT INTO supervisores (id, nombre) VALUES ('SUPE2E','Supervisor E2E') "
                 "ON CONFLICT (id) DO NOTHING")
     cur.execute("INSERT INTO trabajadores (id, nombre, cargo) VALUES "
@@ -875,6 +882,63 @@ def main():
     check("P41 login supervisor emite token de ~7 dias (outbox sin re-login)",
           r.status_code == 200 and restante41 > 6.9 * 24 * 3600,
           f"status={r.status_code} restante_h={restante41/3600:.1f}")
+
+    # P42 — ALTA DE SUPERVISOR CREA SU ACCESO (cubre el import con
+    # ES_SUPERVISOR=SI): usuario derivado del nombre + clave inicial 1234, y
+    # el login trae su identidad (sup_id) para saltarse "¿Quién eres?".
+    r = c.post(f"{API}/admin/supervisor", json={"nombre": "PACHECO ROJAS MARIO E2E"})
+    alta = r.json() if r.status_code == 200 else {}
+    rl = c.post(f"{API}/api/auth/login",
+                json={"username": alta.get("usuario", "x"), "password": "1234"})
+    lg = rl.json() if rl.status_code == 200 else {}
+    check("P42 alta de supervisor crea su acceso (usuario del nombre + clave 1234)",
+          r.status_code == 200 and alta.get("usuario") == "mpacheco"
+          and alta.get("password") == "1234" and rl.status_code == 200
+          and lg.get("rol") == "supervisor" and lg.get("supervisor_id") == alta.get("id"),
+          f"alta={alta} login={rl.status_code}")
+
+    # P43 — PROMOVER A UN TRABAJADOR: elegirlo desde el panel Usuarios lo
+    # registra como supervisor (ligado a su ficha) y le crea el acceso; el
+    # segundo intento avisa que ya lo tiene.
+    r = c.post(f"{API}/api/admin/usuarios/desde-personal",
+               json={"origen": "TRABAJADOR", "id": "901", "username": "e2etrab"})
+    pro = r.json() if r.status_code == 200 else {}
+    r2 = c.post(f"{API}/api/admin/usuarios/desde-personal",
+                json={"origen": "TRABAJADOR", "id": "901"})
+    cur.execute("SELECT id FROM supervisores WHERE trabajador_id = '901'")
+    sup_pro = cur.fetchone()
+    rl = c.post(f"{API}/api/auth/login", json={"username": "e2etrab", "password": "1234"})
+    check("P43 promover trabajador a supervisor: crea padrón + acceso; repetir da 409",
+          r.status_code == 200 and pro.get("promovido") is True
+          and pro.get("username") == "e2etrab" and sup_pro is not None
+          and pro.get("supervisor_id") == sup_pro[0] and r2.status_code == 409
+          and rl.status_code == 200 and rl.json().get("supervisor_id") == sup_pro[0],
+          f"status={r.status_code} pro={pro} repetido={r2.status_code} sup={sup_pro}")
+
+    # P44 — PERSONAL ELEGIBLE: el promovido sale como SUPERVISOR con su
+    # usuario y ya no como TRABAJADOR; el resto trae username sugerido.
+    r = c.get(f"{API}/api/admin/personal-elegible")
+    pers = r.json() if r.status_code == 200 else []
+    p901 = [p for p in pers if p["origen"] == "TRABAJADOR" and p["id"] == "901"]
+    p902 = next((p for p in pers if p["origen"] == "TRABAJADOR" and p["id"] == "902"), None)
+    psup = next((p for p in pers if p["origen"] == "SUPERVISOR"
+                 and p.get("username") == "e2etrab"), None)
+    check("P44 personal elegible: promovido ya no duplica y los demás traen usuario sugerido",
+          r.status_code == 200 and not p901 and psup is not None
+          and p902 is not None and bool(p902.get("username_sugerido"))
+          and p902.get("username") is None,
+          f"status={r.status_code} dup901={len(p901)} sup={psup} t902={p902}")
+
+    # P45 — SINCRONIZAR: crea de golpe los accesos faltantes y es idempotente.
+    r = c.post(f"{API}/api/admin/usuarios/sincronizar-supervisores")
+    s1 = r.json() if r.status_code == 200 else {}
+    r2 = c.post(f"{API}/api/admin/usuarios/sincronizar-supervisores")
+    s2 = r2.json() if r2.status_code == 200 else {}
+    check("P45 sincronizar supervisores: crea los faltantes y no duplica al repetir",
+          r.status_code == 200 and s1.get("clave_inicial") == "1234"
+          and r2.status_code == 200 and len(s2.get("creados", [])) == 0
+          and s2.get("ya_tenian", 0) >= 1,
+          f"1ra={len(s1.get('creados', []))} creados / 2da={s2}")
 
     print()
     if _fallas:
