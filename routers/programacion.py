@@ -1463,6 +1463,14 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
                FROM prog_actividades
                WHERE proyecto_id = $1 AND estado = 'NO_CUMPLIDA' AND fecha BETWEEN $2 AND $3
                GROUP BY 1 ORDER BY n DESC""", proyecto_id, desde, hasta)
+        # Restricciones reportadas por el supervisor (0032): la actividad SÍ se
+        # hizo pero algo le bajó el rendimiento. Van aparte de las causas de
+        # no cumplimiento — son cosas distintas y mezclarlas ensucia el PPC.
+        rest_rows = await con.fetch(
+            """SELECT r.actividad_id, r.fecha, r.restricciones, r.supervisor_id
+               FROM campo_reportes r
+               WHERE r.proyecto_id = $1 AND r.fecha BETWEEN $2 AND $3
+                 AND r.restricciones IS NOT NULL""", proyecto_id, desde, hasta)
 
     prog_de: dict = {}
     for r in prog_rows:
@@ -1516,8 +1524,31 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
     def _ppc(c, e):
         return round(e / c, 4) if c else None
 
+    # Restricciones: detalle por actividad (para la tabla F030b) + su propio
+    # Pareto (qué problema se repite aunque el trabajo sí se haya hecho).
+    rest_por_act: dict = {}
+    rest_cont: dict = {}
+    for r in rest_rows:
+        try:
+            items = json.loads(r["restricciones"]) or []
+        except (ValueError, TypeError):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            cat = str(it.get("cat") or "OTROS").upper()
+            det = str(it.get("detalle") or "").strip()
+            if r["actividad_id"]:
+                rest_por_act.setdefault(r["actividad_id"], []).append(
+                    {"cat": cat, "detalle": det, "fecha": str(r["fecha"])})
+            rest_cont[cat] = rest_cont.get(cat, 0) + 1
+
     return {
         "desde": str(desde), "hasta": str(hasta), "cnc_catalogo": CNC,
+        "restricciones": {str(k): v for k, v in rest_por_act.items()},
+        "pareto_restricciones": [
+            {"causa": c, "etiqueta": CNC.get(c, c), "n": n}
+            for c, n in sorted(rest_cont.items(), key=lambda kv: -kv[1])],
         "semanal": [{"lunes": str(lun), "comprometidas": v["comprometidas"],
                      "cumplidas": v["cumplidas"], "no_cumplidas": v["no_cumplidas"],
                      "ppc": _ppc(v["comprometidas"], v["cumplidas"])}
@@ -1530,6 +1561,100 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
                            for sid, v in sorted(sup.items(),
                                                 key=lambda kv: supervisores.get(kv[0]) or "")],
     }
+
+
+@router.get("/reporte-partida")
+async def reporte_partida(partidas: str, desde: str = "", hasta: str = ""):
+    """Sustento de valorización por partida: cabecera con las cifras de la
+    partida + todos los partes de campo en orden cronológico (del más antiguo
+    al más nuevo) con sus fotos. `partidas` = ids separados por coma; el rango
+    de fechas es opcional (vacío = todo el historial).
+
+    Las fotos purgadas (retención de disco) se devuelven marcadas para que el
+    documento muestre el hueco en vez de mentir: el texto del parte queda.
+    """
+    pids = [int(x) for x in str(partidas).split(",") if str(x).strip().isdigit()]
+    if not pids:
+        raise HTTPException(400, "Elige al menos una partida")
+    f_desde = parse_fecha(desde) or date(2000, 1, 1)
+    f_hasta = parse_fecha(hasta) or date(2100, 1, 1)
+
+    pool = await db()
+    async with pool.acquire() as con:
+        parts = await con.fetch(
+            """SELECT p.id, p.codigo, p.descripcion, p.unidad, p.otm_id,
+                      p.metrado_presup, p.hh_presup, o.descripcion AS otm_desc
+               FROM ev_partidas p LEFT JOIN otms o ON o.id = p.otm_id
+               WHERE p.id = ANY($1) ORDER BY p.codigo""", pids)
+        if not parts:
+            raise HTTPException(404, "No encontré esas partidas")
+        # Cantidad instalada = acumulado del hito principal (mismo criterio del motor EV)
+        ejec = {r["partida_id"]: float(r["cant"] or 0) for r in await con.fetch(
+            """SELECT DISTINCT ON (h.partida_id) h.partida_id, a.cantidad_acum AS cant
+               FROM ev_avances a JOIN ev_hitos h ON h.id = a.hito_id
+               WHERE h.partida_id = ANY($1)
+               ORDER BY h.partida_id, h.es_principal DESC, a.semana DESC""", pids)}
+        reps = await con.fetch(
+            """SELECT r.*, s.nombre AS supervisor_nombre, a.partida_id, a.titulo AS act_titulo
+               FROM campo_reportes r
+               JOIN prog_actividades a ON a.id = r.actividad_id
+               LEFT JOIN supervisores s ON s.id = r.supervisor_id
+               WHERE a.partida_id = ANY($1) AND r.fecha BETWEEN $2 AND $3
+               ORDER BY r.fecha, r.id""", pids, f_desde, f_hasta)
+        fotos = [dict(r) for r in await con.fetch(
+            """SELECT f.*, r.id AS rid FROM campo_fotos f
+               JOIN campo_reportes r ON r.id = f.reporte_id
+               JOIN prog_actividades a ON a.id = r.actividad_id
+               WHERE a.partida_id = ANY($1) AND r.fecha BETWEEN $2 AND $3
+               ORDER BY f.id""", pids, f_desde, f_hasta)]
+        # Personal por (fecha, supervisor) desde el tareo real, para la cabecera
+        # de cada parte — el mismo criterio del reporte diario.
+        hh_dia = await con.fetch(
+            """SELECT tp.fecha, tp.supervisor_id, COALESCE(t.cargo,'SIN CARGO') AS cargo,
+                      COUNT(DISTINCT tp.trabajador_id) AS n
+               FROM tareo_partida tp LEFT JOIN trabajadores t ON t.id = tp.trabajador_id
+               WHERE tp.fecha BETWEEN $1 AND $2
+               GROUP BY 1,2,3 ORDER BY n DESC""", f_desde, f_hasta)
+        # HH gastadas por partida: fuente única del motor (manual > tareo > histórico)
+        from routers.ev._datos import _hh_gastadas_unificada
+        hh_unif = await _hh_gastadas_unificada(con)
+
+    hh_por_partida: dict = {}
+    for (pid, _sem), v in hh_unif.items():
+        if pid in pids:
+            hh_por_partida[pid] = hh_por_partida.get(pid, 0.0) + float(v or 0)
+
+    out = []
+    for p in parts:
+        mp = float(p["metrado_presup"] or 0)
+        me = ejec.get(p["id"], 0.0)
+        bloques = []
+        for r in [x for x in reps if x["partida_id"] == p["id"]]:
+            notas = json.loads(r["anotaciones"]) if r["anotaciones"] else (
+                [ln.lstrip("•- ").strip() for ln in (r["descripcion"] or "").split("\n") if ln.strip()])
+            rests = json.loads(r["restricciones"]) if r["restricciones"] else []
+            personal = [{"cargo": x["cargo"], "n": x["n"]} for x in hh_dia
+                        if x["fecha"] == r["fecha"] and x["supervisor_id"] == r["supervisor_id"]]
+            bloques.append({
+                "id": r["id"], "fecha": str(r["fecha"]), "area": r["area"],
+                "turno": r["turno"], "actividad": r["act_titulo"],
+                "supervisor": r["supervisor_nombre"] or r["supervisor_id"],
+                "texto": armar_texto_reporte(
+                    r["fecha"], r["turno"] or "DIA", r["supervisor_nombre"] or r["supervisor_id"],
+                    personal, [{"area": r["area"] or "", "items": notas}], rests),
+                "fotos": [_foto_out(f) for f in fotos if f["rid"] == r["id"]],
+            })
+        out.append({
+            "partida": {"id": p["id"], "codigo": p["codigo"], "descripcion": p["descripcion"],
+                        "unidad": p["unidad"], "otm_id": p["otm_id"], "otm_desc": p["otm_desc"],
+                        "metrado_presup": mp, "metrado_ejec": me,
+                        "avance": round(me / mp, 4) if mp else None,
+                        "hh_presup": float(p["hh_presup"] or 0),
+                        "hh_gastadas": round(hh_por_partida.get(p["id"], 0.0), 2)},
+            "reportes": bloques,
+        })
+    return {"desde": str(f_desde) if desde else None,
+            "hasta": str(f_hasta) if hasta else None, "partidas": out}
 
 
 # ── Histograma MO + Ratios HH (espejo del Anexo 01, Fase S·S6) ──

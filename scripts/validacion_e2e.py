@@ -1042,6 +1042,47 @@ def main():
           and (pl.get("restricciones") or [{}])[0].get("cat") == "EQUIPOS",
           f"status={r.status_code} plantilla={pl} ph={ph}")
 
+    # P50 — RESTRICCIONES EN EL PPC: las que reportó el supervisor (con la
+    # actividad SÍ ejecutada) salen por actividad para la tabla F030b y en su
+    # propio Pareto, SIN mezclarse con las causas de no cumplimiento.
+    r = c.get(f"{API}/ev/programacion/ppc",
+              params={"proyecto_id": 1, "desde": FECHA_BASE, "hasta": "2026-06-30"})
+    ppc50 = r.json() if r.status_code == 200 else {}
+    rest_act = (ppc50.get("restricciones") or {}).get(str(act47.get("id")), [])
+    par_rest = ppc50.get("pareto_restricciones") or []
+    cnc_cats = [x["causa"] for x in (ppc50.get("cnc") or [])]
+    check("P50 PPC: restricciones por actividad y Pareto propio (separado del CNC)",
+          r.status_code == 200 and len(rest_act) == 1
+          and rest_act[0]["cat"] == "EQUIPOS" and "camion grua" in rest_act[0]["detalle"]
+          and any(x["causa"] == "EQUIPOS" and x["n"] >= 1 for x in par_rest)
+          and "EQUIPOS" not in cnc_cats,
+          f"status={r.status_code} act={rest_act} pareto={par_rest} cnc={cnc_cats}")
+
+    # P51 — REPORTE POR PARTIDA (sustento de valorización): cabecera con las
+    # cifras de la partida + partes en orden cronológico con sus fotos.
+    r = c.get(f"{API}/ev/programacion/reporte-partida", params={"partidas": p1["id"]})
+    rp = r.json() if r.status_code == 200 else {}
+    bloque = (rp.get("partidas") or [{}])[0]
+    part = bloque.get("partida", {})
+    reps51 = bloque.get("reportes", [])
+    fechas51 = [x["fecha"] for x in reps51]
+    check("P51 reporte por partida: cifras de la partida + partes cronológicos con fotos",
+          r.status_code == 200 and part.get("codigo") == "E2E-001"
+          and part.get("metrado_presup") == 10 and part.get("hh_gastadas", 0) > 0
+          and len(reps51) >= 1 and fechas51 == sorted(fechas51)
+          and "CANTIDAD TOTAL PERSONAL" in (reps51[0].get("texto") or "")
+          and any(len(x.get("fotos", [])) > 0 for x in reps51),
+          f"status={r.status_code} partida={part} n_reportes={len(reps51)}")
+
+    # P52 — el rango de fechas filtra (vacío = todo el historial)
+    r = c.get(f"{API}/ev/programacion/reporte-partida",
+              params={"partidas": p1["id"], "desde": "2027-01-01", "hasta": "2027-12-31"})
+    vacio = (r.json().get("partidas") or [{}])[0] if r.status_code == 200 else {}
+    check("P52 reporte por partida: el rango de fechas filtra los partes",
+          r.status_code == 200 and len(vacio.get("reportes", [])) == 0
+          and vacio.get("partida", {}).get("codigo") == "E2E-001",
+          f"status={r.status_code} reportes={len(vacio.get('reportes', []))}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
