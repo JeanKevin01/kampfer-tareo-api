@@ -223,6 +223,16 @@ _ACT_SQL = """
 """
 
 
+def _norm_frente(v) -> Optional[str]:
+    """Normaliza el frente/zona: MAYÚSCULAS, sin espacios repetidos, máx 60.
+
+    Es lo que evita que el catálogo se llene de variantes de lo mismo
+    ('Bahia 4', 'BAHIA  4', 'bahia 4' → 'BAHIA 4'). Devuelve None si viene
+    vacío (el frente es opcional: no todo parte lo necesita)."""
+    t = " ".join(str(v or "").split()).upper()
+    return t[:60] or None
+
+
 def _foto_out(f: dict) -> dict:
     purgada = f["purgada"]
     # ancho/alto (los guarda Pillow al subir) viajan SIEMPRE, aun purgada: el
@@ -1657,6 +1667,7 @@ async def _datos_reporte_partida(con, pids: list, f_desde: date, f_hasta: date) 
             personal = [{"cargo": x["cargo"], "n": x["n"]} for x in filas_dia]
             bloques.append({
                 "id": r["id"], "fecha": str(r["fecha"]), "area": r["area"],
+                "frente": r["frente"],
                 "turno": r["turno"], "actividad": r["act_titulo"],
                 "supervisor": r["supervisor_nombre"] or r["supervisor_id"],
                 "hh_dia": round(sum(float(x["hh"] or 0) for x in filas_dia), 2),
@@ -1664,7 +1675,8 @@ async def _datos_reporte_partida(con, pids: list, f_desde: date, f_hasta: date) 
                 # EJECUTADO; las restricciones viven en el PPC, no aquí.
                 "texto": armar_texto_reporte(
                     r["fecha"], r["turno"] or "DIA", r["supervisor_nombre"] or r["supervisor_id"],
-                    personal, [{"area": r["area"] or r["otm_area"] or "", "items": notas}], []),
+                    personal, [{"area": r["area"] or r["otm_area"] or "",
+                                "frente": r["frente"], "items": notas}], []),
                 # Fotos CRUDAS (con `ruta`): cada endpoint las adapta a su salida.
                 "fotos": [f for f in fotos if f["rid"] == r["id"]],
             })
@@ -1973,6 +1985,21 @@ async def mis_actividades(supervisor_id: str, fecha: str = "",
     return [dict(r) for r in rows]
 
 
+@router_campo.get("/frentes")
+async def frentes_otm(otm_id: str = "", user: dict = Depends(require_role())):
+    """Catálogo de frentes/zonas ya usados en esa OTM — se auto-alimenta con el
+    uso: el supervisor escribe uno la primera vez y después solo lo toca.
+    Devuelve los más frecuentes primero (los que de verdad se usan)."""
+    if not otm_id.strip():
+        return []
+    pool = await db()
+    rows = await pool.fetch(
+        """SELECT frente, COUNT(*) AS n FROM campo_reportes
+           WHERE otm_id = $1 AND frente IS NOT NULL AND frente <> ''
+           GROUP BY frente ORDER BY n DESC, frente LIMIT 20""", otm_id.strip())
+    return [r["frente"] for r in rows]
+
+
 @router_campo.get("/reporte-plantilla")
 async def reporte_plantilla(actividad_id: int, user: dict = Depends(require_role())):
     """Último reporte de ESA misma partida/hito, para reusarlo como plantilla:
@@ -1986,7 +2013,8 @@ async def reporte_plantilla(actividad_id: int, user: dict = Depends(require_role
     if act["partida_id"] is None:
         return {}
     prev = await pool.fetchrow(
-        """SELECT r.id, r.fecha::text AS fecha, r.area, r.turno, r.anotaciones, r.restricciones
+        """SELECT r.id, r.fecha::text AS fecha, r.area, r.frente, r.turno,
+                  r.anotaciones, r.restricciones
            FROM campo_reportes r
            JOIN prog_actividades a ON a.id = r.actividad_id
           WHERE a.partida_id = $1
@@ -1997,7 +2025,8 @@ async def reporte_plantilla(actividad_id: int, user: dict = Depends(require_role
         act["partida_id"], act["hito_id"], actividad_id)
     if not prev:
         return {}
-    return {"fecha": prev["fecha"], "area": prev["area"], "turno": prev["turno"],
+    return {"fecha": prev["fecha"], "area": prev["area"], "frente": prev["frente"],
+            "turno": prev["turno"],
             "anotaciones": json.loads(prev["anotaciones"]) if prev["anotaciones"] else [],
             "restricciones": json.loads(prev["restricciones"]) if prev["restricciones"] else []}
 
@@ -2044,7 +2073,8 @@ def armar_texto_reporte(fecha: date, turno: str, responsable: str,
     """Arma el parte diario.
 
     personal: [{cargo, n}] (cargo exacto del padrón — decisión de Jean)
-    bloques:  [{area, items:[str]}]
+    bloques:  [{area, frente, items:[str]}] — `area` la fija el proyecto y
+              `frente` (0033) es la zona concreta que eligió el supervisor.
     restricciones: [{cat, detalle}]
     """
     L = [f"Fecha: {fecha.strftime('%d/%m')}",
@@ -2061,6 +2091,8 @@ def armar_texto_reporte(fecha: date, turno: str, responsable: str,
     for b in bloques:
         if b.get("area"):
             L.append(f"AREA: {b['area']}")
+        if b.get("frente"):
+            L.append(f"FRENTE: {b['frente']}")
         for it in b.get("items", []):
             if str(it).strip():
                 L.append(f"* {str(it).strip()}")
@@ -2082,7 +2114,7 @@ async def reporte_dia(fecha: str = "", supervisor_id: str = "", proyecto_id: int
     sup = (supervisor_id or "").strip()
     pool = await db()
     reps = await pool.fetch(
-        """SELECT r.supervisor_id, s.nombre AS supervisor_nombre, r.turno, r.area,
+        """SELECT r.supervisor_id, s.nombre AS supervisor_nombre, r.turno, r.area, r.frente,
                   r.anotaciones, r.restricciones, r.descripcion, r.otm_id
            FROM campo_reportes r
            LEFT JOIN supervisores s ON s.id = r.supervisor_id
@@ -2106,7 +2138,7 @@ async def reporte_dia(fecha: str = "", supervisor_id: str = "", proyecto_id: int
             items = json.loads(r["anotaciones"]) if r["anotaciones"] else (
                 [ln.lstrip("•- ").strip() for ln in (r["descripcion"] or "").split("\n") if ln.strip()])
             if items:
-                bloques.append({"area": r["area"] or "", "items": items})
+                bloques.append({"area": r["area"] or "", "frente": r["frente"], "items": items})
             if r["restricciones"]:
                 rests += json.loads(r["restricciones"])
         out.append({
@@ -2129,7 +2161,8 @@ async def crear_reporte(
     descripcion: str = Form(""),
     actividad_id: Optional[int] = Form(None),
     id_local: Optional[str] = Form(None),
-    area: str = Form(""),
+    area: str = Form(""),             # legado: se IGNORA (el área la fija el proyecto)
+    frente: str = Form(""),           # zona concreta donde trabajó la cuadrilla
     turno: str = Form("DIA"),
     anotaciones: str = Form(""),      # JSON: ["viñeta", …]
     restricciones: str = Form(""),    # JSON: [{"cat":"MATERIALES","detalle":"…"}, …]
@@ -2147,6 +2180,10 @@ async def crear_reporte(
         for x in _lista_json(restricciones) if isinstance(x, dict)
     ]
     turno = turno.strip().upper() if turno.strip().upper() in ("DIA", "NOCHE") else "DIA"
+    # 0033: el ÁREA ya no la escribe el supervisor — se copia del proyecto para
+    # que el parte y la matriz Área×Disciplina del EV nunca digan cosas
+    # distintas. El FRENTE sí es suyo, normalizado para no duplicar variantes.
+    frente = _norm_frente(frente)
     if not descripcion.strip() and notas:
         descripcion = "\n".join(f"• {n}" for n in notas)
     if not descripcion.strip() and not fotos:
@@ -2192,14 +2229,19 @@ async def crear_reporte(
         async with pool.acquire() as con:
             async with con.transaction():
                 try:
+                    # El área se copia del proyecto (foto histórica): así el
+                    # parte impreso y el análisis EV siempre coinciden, y si
+                    # mañana cambia otms.area los partes viejos no se alteran.
+                    area_proy = await con.fetchval(
+                        "SELECT area FROM otms WHERE id = $1", otm_id.strip())
                     rid = await con.fetchval(
                         """INSERT INTO campo_reportes
                            (proyecto_id, fecha, otm_id, actividad_id, supervisor_id, descripcion,
-                            id_local, area, turno, anotaciones, restricciones)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id""",
+                            id_local, area, frente, turno, anotaciones, restricciones)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id""",
                         proyecto_id, f_rep, otm_id.strip(), actividad_id,
                         supervisor_id.strip(), descripcion.strip() or None, id_local,
-                        area.strip() or None, turno,
+                        (area_proy or "").strip() or None, frente, turno,
                         json.dumps(notas) if notas else None,
                         json.dumps(rests) if rests else None)
                 except asyncpg.UniqueViolationError:

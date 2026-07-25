@@ -374,3 +374,34 @@ def test_media_path_traversal_403():
     sig = _firma("../main.py", exp)
     r = _client().get(f"/media/%2E%2E%2Fmain.py?exp={exp}&sig={sig}")
     assert r.status_code == 403
+
+
+# ── 0033: área fija del proyecto + frente seleccionable ──────
+def test_norm_frente_colapsa_variantes():
+    """El catálogo de frentes no debe llenarse de variantes de lo mismo."""
+    from routers.programacion import _norm_frente
+    assert _norm_frente("  bahia   4 ") == "BAHIA 4"
+    assert _norm_frente("BAHIA  4") == "BAHIA 4"
+    assert _norm_frente("Bahia 4") == "BAHIA 4"
+    assert _norm_frente("") is None
+    assert _norm_frente(None) is None
+    assert len(_norm_frente("X" * 80)) == 60      # se acota, no revienta
+
+
+def test_parte_imprime_area_y_frente():
+    """El parte lleva AREA (del proyecto) y FRENTE (del supervisor)."""
+    from datetime import date
+    from routers.programacion import armar_texto_reporte
+    t = armar_texto_reporte(
+        date(2026, 7, 19), "DIA", "MARIO", [{"cargo": "OPERARIO", "n": 2}],
+        [{"area": "GSC", "frente": "BAHIA 4", "items": ["Vaciado losa"]}], [])
+    assert "AREA: GSC" in t
+    assert "FRENTE: BAHIA 4" in t
+    # Sin frente, el parte no debe imprimir una línea vacía
+    t2 = armar_texto_reporte(
+        date(2026, 7, 19), "DIA", "MARIO", [], [{"area": "GSC", "items": ["x"]}], [])
+    assert "FRENTE:" not in t2
+
+
+def test_frentes_sin_credenciales_401():
+    assert _client().get("/campo/frentes?otm_id=OTM-0001").status_code == 401
