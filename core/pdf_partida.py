@@ -99,6 +99,10 @@ class _Doc(FPDF):
         self.set_line_width(0.6)
         self.line(MARGEN, 22, 210 - MARGEN, 22)
         self.set_line_width(0.2)
+        # CLAVE: fpdf2 NO reposiciona el cursor tras header(); hay que bajarlo
+        # explícitamente debajo de la línea o el cuerpo (título de la partida)
+        # se dibuja encima y la línea lo "tacha".
+        self.set_xy(MARGEN, 28)
 
     def footer(self):
         self.set_y(-14)
@@ -273,7 +277,8 @@ def pdf_sustento_partida(bloque: dict, periodo: str) -> bytes:
     # Encabezado de la partida
     pdf.set_text_color(*CARBON)
     pdf.set_font("helvetica", "B", 14)
-    pdf.multi_cell(ANCHO_CONT, 6.5, _latin1(f"{p.get('codigo')} — {p.get('descripcion')}"))
+    pdf.multi_cell(ANCHO_CONT, 6.5, _latin1(f"{p.get('codigo')} — {p.get('descripcion')}"),
+                   new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("helvetica", "", 9.5)
     pdf.set_text_color(*TINTA2)
     otm = p.get("otm_id") or ""
