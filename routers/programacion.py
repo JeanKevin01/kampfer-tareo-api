@@ -224,7 +224,11 @@ _ACT_SQL = """
 
 def _foto_out(f: dict) -> dict:
     purgada = f["purgada"]
+    # ancho/alto (los guarda Pillow al subir) viajan SIEMPRE, aun purgada: el
+    # documento arma la galería justificada con la forma de cada foto sin tener
+    # que descargarla, y reserva el hueco correcto de las que ya no están.
     return {"id": f["id"], "purgada": purgada, "bytes": f["bytes"],
+            "ancho": f.get("ancho"), "alto": f.get("alto"),
             "url": None if purgada else url_firmada(f["ruta"]),
             "url_thumb": None if purgada else url_firmada(f["ruta_thumb"])}
 

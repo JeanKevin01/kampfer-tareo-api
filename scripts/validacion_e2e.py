@@ -1067,13 +1067,18 @@ def main():
     reps51 = bloque.get("reportes", [])
     fechas51 = [x["fecha"] for x in reps51]
     txt51 = reps51[0].get("texto") or "" if reps51 else ""
+    fotos51 = [f for x in reps51 for f in x.get("fotos", [])]
     check("P51 reporte por partida: cifras de la partida + partes cronológicos con fotos",
           r.status_code == 200 and part.get("codigo") == "E2E-001"
           and part.get("metrado_presup") == 10 and part.get("hh_gastadas", 0) > 0
           and len(reps51) >= 1 and fechas51 == sorted(fechas51)
           and "CANTIDAD TOTAL PERSONAL" in txt51
-          and any(len(x.get("fotos", [])) > 0 for x in reps51),
-          f"status={r.status_code} partida={part} n_reportes={len(reps51)}")
+          and len(fotos51) > 0
+          # La galería del PDF arma las filas de altura uniforme con la forma de
+          # cada foto: ancho/alto deben viajar (Pillow los guardó al subirla).
+          and all(f.get("ancho") and f.get("alto") for f in fotos51),
+          f"status={r.status_code} partida={part} n_fotos={len(fotos51)} "
+          f"dims={[(f.get('ancho'), f.get('alto')) for f in fotos51]}")
 
     # P53 — COHERENCIA DEL SUSTENTO: la cuadrilla del parte sale del tareo de
     # ESA partida (no del día entero del supervisor), cada parte trae sus HH,
