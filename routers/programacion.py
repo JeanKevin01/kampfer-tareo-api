@@ -16,6 +16,7 @@ from typing import List, Optional
 
 import asyncpg
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import Response
 
 from core.auth import exigir_identidad_supervisor, require_role
 from core.db import db
@@ -1567,68 +1568,70 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
     }
 
 
-@router.get("/reporte-partida")
-async def reporte_partida(partidas: str, desde: str = "", hasta: str = ""):
-    """Sustento de valorización por partida: cabecera con las cifras de la
-    partida + todos los partes de campo en orden cronológico (del más antiguo
-    al más nuevo) con sus fotos. `partidas` = ids separados por coma; el rango
-    de fechas es opcional (vacío = todo el historial).
-
-    Las fotos purgadas (retención de disco) se devuelven marcadas para que el
-    documento muestre el hueco en vez de mentir: el texto del parte queda.
-    """
+def _parse_part_args(partidas: str, desde: str, hasta: str):
     pids = [int(x) for x in str(partidas).split(",") if str(x).strip().isdigit()]
     if not pids:
         raise HTTPException(400, "Elige al menos una partida")
-    f_desde = parse_fecha(desde) or date(2000, 1, 1)
-    f_hasta = parse_fecha(hasta) or date(2100, 1, 1)
+    return (pids, parse_fecha(desde) or date(2000, 1, 1),
+            parse_fecha(hasta) or date(2100, 1, 1))
 
-    pool = await db()
-    async with pool.acquire() as con:
-        parts = await con.fetch(
-            """SELECT p.id, p.codigo, p.descripcion, p.unidad, p.otm_id,
-                      p.metrado_presup, p.hh_presup, o.descripcion AS otm_desc
-               FROM ev_partidas p LEFT JOIN otms o ON o.id = p.otm_id
-               WHERE p.id = ANY($1) ORDER BY p.codigo""", pids)
-        if not parts:
-            raise HTTPException(404, "No encontré esas partidas")
-        # Cantidad instalada = acumulado del hito principal (mismo criterio del motor EV)
-        ejec = {r["partida_id"]: float(r["cant"] or 0) for r in await con.fetch(
-            """SELECT DISTINCT ON (h.partida_id) h.partida_id, a.cantidad_acum AS cant
-               FROM ev_avances a JOIN ev_hitos h ON h.id = a.hito_id
-               WHERE h.partida_id = ANY($1)
-               ORDER BY h.partida_id, h.es_principal DESC, a.semana DESC""", pids)}
-        reps = await con.fetch(
-            """SELECT r.*, s.nombre AS supervisor_nombre, a.partida_id,
-                      a.titulo AS act_titulo, o.area AS otm_area
-               FROM campo_reportes r
-               JOIN prog_actividades a ON a.id = r.actividad_id
-               LEFT JOIN supervisores s ON s.id = r.supervisor_id
-               LEFT JOIN otms o ON o.id = r.otm_id
-               WHERE a.partida_id = ANY($1) AND r.fecha BETWEEN $2 AND $3
-               ORDER BY r.fecha, r.id""", pids, f_desde, f_hasta)
-        fotos = [dict(r) for r in await con.fetch(
-            """SELECT f.*, r.id AS rid FROM campo_fotos f
-               JOIN campo_reportes r ON r.id = f.reporte_id
-               JOIN prog_actividades a ON a.id = r.actividad_id
-               WHERE a.partida_id = ANY($1) AND r.fecha BETWEEN $2 AND $3
-               ORDER BY f.id""", pids, f_desde, f_hasta)]
-        # Personal por (fecha, supervisor, PARTIDA) desde el tareo real. Ojo: se
-        # acota a la partida a propósito — este documento sustenta UNA partida,
-        # así que la cuadrilla que muestra tiene que ser la que trabajó en ella
-        # (antes contaba todo el día del supervisor y podía mostrar gente de
-        # otra OTM mientras las HH de la partida salían en 0).
-        hh_dia = await con.fetch(
-            """SELECT tp.fecha, tp.supervisor_id, tp.partida_id,
-                      COALESCE(t.cargo,'SIN CARGO') AS cargo,
-                      COUNT(DISTINCT tp.trabajador_id) AS n,
-                      SUM(tp.hh) AS hh
-               FROM tareo_partida tp LEFT JOIN trabajadores t ON t.id = tp.trabajador_id
-               WHERE tp.partida_id = ANY($1) AND tp.fecha BETWEEN $2 AND $3
-               GROUP BY 1,2,3,4 ORDER BY n DESC""", pids, f_desde, f_hasta)
-        # HH gastadas por partida: fuente única del motor (manual > tareo > histórico)
-        from routers.ev._datos import _hh_gastadas_unificada
-        hh_unif = await _hh_gastadas_unificada(con)
+
+def _periodo_txt(desde: str, hasta: str) -> str:
+    if desde or hasta:
+        return f"Periodo: {desde or 'inicio'} — {hasta or 'hoy'}"
+    return "Todo el historial registrado"
+
+
+async def _datos_reporte_partida(con, pids: list, f_desde: date, f_hasta: date) -> list:
+    """Ensamblado compartido del sustento por partida: un bloque por partida con
+    sus cifras + los partes de campo (orden cronológico, del más antiguo al más
+    nuevo) y sus fotos CRUDAS (traen `ruta`/`purgada`/`ancho`/`alto`). El
+    endpoint JSON mapea las fotos con `_foto_out` (URLs firmadas); el ZIP las
+    lee del disco para embeberlas en el PDF."""
+    parts = await con.fetch(
+        """SELECT p.id, p.codigo, p.descripcion, p.unidad, p.otm_id,
+                  p.metrado_presup, p.hh_presup, o.descripcion AS otm_desc
+           FROM ev_partidas p LEFT JOIN otms o ON o.id = p.otm_id
+           WHERE p.id = ANY($1) ORDER BY p.codigo""", pids)
+    if not parts:
+        raise HTTPException(404, "No encontré esas partidas")
+    # Cantidad instalada = acumulado del hito principal (mismo criterio del motor EV)
+    ejec = {r["partida_id"]: float(r["cant"] or 0) for r in await con.fetch(
+        """SELECT DISTINCT ON (h.partida_id) h.partida_id, a.cantidad_acum AS cant
+           FROM ev_avances a JOIN ev_hitos h ON h.id = a.hito_id
+           WHERE h.partida_id = ANY($1)
+           ORDER BY h.partida_id, h.es_principal DESC, a.semana DESC""", pids)}
+    reps = await con.fetch(
+        """SELECT r.*, s.nombre AS supervisor_nombre, a.partida_id,
+                  a.titulo AS act_titulo, o.area AS otm_area
+           FROM campo_reportes r
+           JOIN prog_actividades a ON a.id = r.actividad_id
+           LEFT JOIN supervisores s ON s.id = r.supervisor_id
+           LEFT JOIN otms o ON o.id = r.otm_id
+           WHERE a.partida_id = ANY($1) AND r.fecha BETWEEN $2 AND $3
+           ORDER BY r.fecha, r.id""", pids, f_desde, f_hasta)
+    fotos = [dict(r) for r in await con.fetch(
+        """SELECT f.*, r.id AS rid FROM campo_fotos f
+           JOIN campo_reportes r ON r.id = f.reporte_id
+           JOIN prog_actividades a ON a.id = r.actividad_id
+           WHERE a.partida_id = ANY($1) AND r.fecha BETWEEN $2 AND $3
+           ORDER BY f.id""", pids, f_desde, f_hasta)]
+    # Personal por (fecha, supervisor, PARTIDA) desde el tareo real. Ojo: se
+    # acota a la partida a propósito — este documento sustenta UNA partida,
+    # así que la cuadrilla que muestra tiene que ser la que trabajó en ella
+    # (antes contaba todo el día del supervisor y podía mostrar gente de
+    # otra OTM mientras las HH de la partida salían en 0).
+    hh_dia = await con.fetch(
+        """SELECT tp.fecha, tp.supervisor_id, tp.partida_id,
+                  COALESCE(t.cargo,'SIN CARGO') AS cargo,
+                  COUNT(DISTINCT tp.trabajador_id) AS n,
+                  SUM(tp.hh) AS hh
+           FROM tareo_partida tp LEFT JOIN trabajadores t ON t.id = tp.trabajador_id
+           WHERE tp.partida_id = ANY($1) AND tp.fecha BETWEEN $2 AND $3
+           GROUP BY 1,2,3,4 ORDER BY n DESC""", pids, f_desde, f_hasta)
+    # HH gastadas por partida: fuente única del motor (manual > tareo > histórico)
+    from routers.ev._datos import _hh_gastadas_unificada
+    hh_unif = await _hh_gastadas_unificada(con)
 
     hh_por_partida: dict = {}
     for (pid, _sem), v in hh_unif.items():
@@ -1662,7 +1665,8 @@ async def reporte_partida(partidas: str, desde: str = "", hasta: str = ""):
                 "texto": armar_texto_reporte(
                     r["fecha"], r["turno"] or "DIA", r["supervisor_nombre"] or r["supervisor_id"],
                     personal, [{"area": r["area"] or r["otm_area"] or "", "items": notas}], []),
-                "fotos": [_foto_out(f) for f in fotos if f["rid"] == r["id"]],
+                # Fotos CRUDAS (con `ruta`): cada endpoint las adapta a su salida.
+                "fotos": [f for f in fotos if f["rid"] == r["id"]],
             })
         hh_rango = round(sum(float(x["hh"] or 0) for x in hh_dia if x["partida_id"] == p["id"]), 2)
         hh_tot = round(hh_por_partida.get(p["id"], 0.0), 2)
@@ -1679,8 +1683,77 @@ async def reporte_partida(partidas: str, desde: str = "", hasta: str = ""):
                         "sin_tareo": bool(bloques) and hh_tot == 0},
             "reportes": bloques,
         })
+    return out
+
+
+@router.get("/reporte-partida")
+async def reporte_partida(partidas: str, desde: str = "", hasta: str = ""):
+    """Sustento de valorización por partida (JSON): cabecera con las cifras +
+    todos los partes de campo en orden cronológico con sus fotos (URLs
+    firmadas). `partidas` = ids separados por coma; el rango de fechas es
+    opcional (vacío = todo el historial).
+
+    Las fotos purgadas (retención de disco) se devuelven marcadas para que el
+    documento muestre el hueco en vez de mentir: el texto del parte queda.
+    """
+    pids, f_desde, f_hasta = _parse_part_args(partidas, desde, hasta)
+    pool = await db()
+    async with pool.acquire() as con:
+        out = await _datos_reporte_partida(con, pids, f_desde, f_hasta)
+    # Las fotos crudas se convierten aquí a la salida pública (URLs firmadas).
+    for b in out:
+        for rep in b["reportes"]:
+            rep["fotos"] = [_foto_out(f) for f in rep["fotos"]]
     return {"desde": str(f_desde) if desde else None,
             "hasta": str(f_hasta) if hasta else None, "partidas": out}
+
+
+@router.get("/reporte-partida.zip")
+async def reporte_partida_zip(partidas: str, desde: str = "", hasta: str = "",
+                              user: dict = Depends(require_role("oficina"))):
+    """Sustento de valorización como ZIP: UN PDF por partida (para adjuntar a
+    cada línea de la valorización). Mismos datos que `/reporte-partida` (por
+    partida, dentro por día), pero las fotos se embeben directo desde el disco
+    del VPS — sin URLs firmadas. El PDF se arma con fpdf2 (Python puro)."""
+    import io
+    import zipfile
+
+    from core.pdf_partida import pdf_sustento_partida
+
+    pids, f_desde, f_hasta = _parse_part_args(partidas, desde, hasta)
+    pool = await db()
+    async with pool.acquire() as con:
+        out = await _datos_reporte_partida(con, pids, f_desde, f_hasta)
+    periodo = _periodo_txt(desde, hasta)
+
+    buf = io.BytesIO()
+    usados: set = set()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for b in out:
+            nombre = _nombre_pdf(b["partida"], usados)
+            # Cada PDF (CPU + lectura de fotos del disco) fuera del event loop.
+            pdf_bytes = await asyncio.to_thread(pdf_sustento_partida, b, periodo)
+            z.writestr(nombre, pdf_bytes)
+
+    fname = (f"sustento_{f_desde}_{f_hasta}.zip" if (desde or hasta)
+             else "sustento_valorizacion.zip")
+    return Response(content=buf.getvalue(), media_type="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+def _nombre_pdf(p: dict, usados: set) -> str:
+    """Nombre de archivo seguro y único dentro del ZIP: «CODIGO_Descripcion.pdf»."""
+    import re
+    base = f"{p.get('codigo') or 'partida'} {p.get('descripcion') or ''}".strip()
+    base = re.sub(r"[^A-Za-z0-9._\- ]+", "", base).strip().replace(" ", "_")[:60]
+    base = base or f"partida_{p.get('id')}"
+    nombre = f"{base}.pdf"
+    i = 2
+    while nombre in usados:
+        nombre = f"{base}_{i}.pdf"
+        i += 1
+    usados.add(nombre)
+    return nombre
 
 
 # ── Histograma MO + Ratios HH (espejo del Anexo 01, Fase S·S6) ──

@@ -11,3 +11,7 @@ alembic==1.13.2
 SQLAlchemy==2.0.31
 psycopg2-binary==2.9.9
 Pillow==10.4.0
+# Sustento de valorización en PDF (ZIP con un PDF por partida). Python puro,
+# solo pip, SIN librerías de sistema ni navegador headless: embebe las fotos
+# desde el disco del VPS (MEDIA_DIR) con Pillow, que ya está.
+fpdf2==2.8.1
