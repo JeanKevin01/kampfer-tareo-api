@@ -705,6 +705,49 @@ def main():
           and len(inv.get("omitidos") or []) == 2,
           f"status={r.status_code} inv={inv}")
 
+    # P60 — CAMBIAR EL TIPO DE UN VÍNCULO REPROGRAMA (bug que reportó Jean:
+    # «si se le cambia el tipo no hace nada»). La causa era la regla de
+    # arrastre «nunca adelanta»: al pasar de FS a SS la restricción nueva es
+    # MÁS TEMPRANA y se descartaba. Editar el vínculo a propósito ahora
+    # reprograma la sucesora EXACTAMENTE sobre él, también hacia atrás.
+    c.put(f"{API}/ev/programacion/config", json={"proyecto_id": 1, "dias_semana": [1, 2, 3, 4, 5, 6, 7]})
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-09-07", "otm_id": "OTM-E2E",
+        "titulo": "E2E Vinculo A", "metrado_prog": 100, "plazo_dias": 3})
+    a60 = r.json() if r.status_code == 200 else {}
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-09-07", "otm_id": "OTM-E2E",
+        "titulo": "E2E Vinculo B", "metrado_prog": 100, "plazo_dias": 2})
+    b60 = r.json() if r.status_code == 200 else {}
+    rangos = {}
+    for tipo in ("FS", "SS", "FF"):
+        rr = c.post(f"{API}/ev/programacion/actividades/{b60.get('id')}/dependencias",
+                    json={"predecesora_id": a60.get("id"), "tipo": tipo, "lag_dias": 0})
+        g = c.get(f"{API}/ev/programacion/lookahead-grid",
+                  params={"proyecto_id": 1, "desde": "2026-09-07", "semanas": 2})
+        b = next((x for gr in g.json().get("grupos", []) for x in gr["actividades"]
+                  if x["id"] == b60.get("id")), {})
+        rangos[tipo] = (rr.status_code, b.get("fecha"), b.get("fecha_fin"),
+                        (b.get("predecesoras") or [{}])[0].get("tipo"))
+    check("P60 cambiar el tipo del vínculo reprograma: FS 10-11 → SS 07-08 → FF 08-09",
+          rangos["FS"] == (200, "2026-09-10", "2026-09-11", "FS")
+          and rangos["SS"] == (200, "2026-09-07", "2026-09-08", "SS")
+          and rangos["FF"] == (200, "2026-09-08", "2026-09-09", "FF"),
+          f"rangos={rangos}")
+
+    # P61 — pero el ARRASTRE sigue sin adelantar: acortar la antecesora no
+    # trae de vuelta a la sucesora (protege el plan del planner).
+    r = c.put(f"{API}/ev/programacion/actividades/{a60.get('id')}",
+              json={"plazo_dias": 1})
+    g = c.get(f"{API}/ev/programacion/lookahead-grid",
+              params={"proyecto_id": 1, "desde": "2026-09-07", "semanas": 2})
+    b61 = next((x for gr in g.json().get("grupos", []) for x in gr["actividades"]
+                if x["id"] == b60.get("id")), {})
+    check("P61 el arrastre no adelanta: acortar la antecesora deja a la sucesora en 08-09",
+          r.status_code == 200 and b61.get("fecha") == "2026-09-08"
+          and b61.get("fecha_fin") == "2026-09-09",
+          f"status={r.status_code} rango={b61.get('fecha')}..{b61.get('fecha_fin')}")
+
     c.put(f"{API}/ev/programacion/config",           # se restaura el calendario
           json={"proyecto_id": 1, "dias_semana": [1, 2, 3, 4, 5, 6, 7]})
 

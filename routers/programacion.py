@@ -1017,16 +1017,31 @@ def _restriccion_dep(tipo: str, lag: int, pred_ini: date, pred_fin: date,
     return "inicio", _habil_desplazado(pred_fin, lag + 1, dias_semana, feriados)
 
 
-async def recalcular_cascada(con, actividad_id_movida: int) -> list:
+async def recalcular_cascada(con, actividad_id_movida: int,
+                             forzar: Optional[set] = None) -> list:
     """Auto-cascada de la red (FS/SS/FF, 0034): al mover una actividad, cada
-    sucesora se desplaza SOLO HACIA ADELANTE hasta cumplir TODAS sus
-    antecesoras — se evalúa la restricción más exigente de todas, no una a
-    una, porque una sucesora puede colgar de varias con tipos distintos.
+    sucesora se desplaza hasta cumplir TODAS sus antecesoras — se evalúa la
+    restricción más exigente de todas, no una a una, porque una sucesora puede
+    colgar de varias con tipos distintos.
+
+    Dos comportamientos, a propósito distintos:
+
+    · **Arrastre** (por defecto): la sucesora SOLO se empuja hacia adelante,
+      nunca se adelanta. Protege el plan: acortar una antecesora no debe
+      arrastrar media programación hacia atrás sola.
+    · **`forzar`** (ids): la actividad se reprograma EXACTAMENTE sobre su
+      restricción, también hacia atrás. Es para cuando el planner edita el
+      vínculo a propósito (lo crea, le cambia el tipo o el lag): ahí sí espera
+      que la actividad se acomode, como en MS Project. Sin esto, pasar un FS a
+      SS «no hacía nada» — la restricción nueva era más temprana y la regla de
+      arrastre la descartaba.
 
     El rango nuevo conserva el PLAZO de la sucesora (esa es la invariante:
-    empujar una actividad no la estira ni la encoge); los saltos y medios que
-    caen fuera se descartan y el metrado se re-prorratea. BFS en orden; los
-    ciclos ya están vetados al crear el vínculo."""
+    reprogramar una actividad no la estira ni la encoge); los saltos y medios
+    que caen fuera se descartan y el metrado se re-prorratea. Solo se fuerza a
+    la actividad editada: sus propias sucesoras siguen la regla de arrastre.
+    BFS en orden; los ciclos ya están vetados al crear el vínculo."""
+    forzar = forzar or set()
     movidas: list = []
     cola, vistas = [actividad_id_movida], set()
     while cola:
@@ -1060,28 +1075,32 @@ async def recalcular_cascada(con, actividad_id_movida: int) -> list:
                      else _plazo_de(ini_suc, fin_suc, dias_semana, feriados, saltos, medios))
 
             # La restricción que manda es la más tardía de todas.
-            nuevo_ini, nuevo_fin = ini_suc, fin_suc
+            req_ini = req_fin = None
             for d in deps:
                 borde, minimo = _restriccion_dep(
                     d["tipo"] or "FS", int(d["lag_dias"] or 0),
                     d["pred_ini"], d["pred_fin"], dias_semana, feriados)
                 if borde == "inicio":
-                    nuevo_ini = max(nuevo_ini, minimo)
+                    req_ini = minimo if req_ini is None else max(req_ini, minimo)
                 else:
-                    nuevo_fin = max(nuevo_fin, minimo)
-            # Cada restricción incumplida propone un rango COMPLETO que conserva
-            # el plazo; gana la que arranque más tarde. Así la duración es
-            # invariante aunque concurran un FS y un FF sobre la misma actividad.
+                    req_fin = minimo if req_fin is None else max(req_fin, minimo)
+            # Cada restricción propone un rango COMPLETO que conserva el plazo;
+            # gana la que arranque más tarde. Así la duración es invariante
+            # aunque concurran un FS y un FF sobre la misma actividad. En
+            # arrastre solo cuentan las que EMPUJAN; con `forzar`, todas.
+            exacto = suc_id in forzar
             candidatos = []
-            if nuevo_ini > ini_suc:                       # empuja por el inicio
-                f, m = _fin_desde_plazo(nuevo_ini, plazo, dias_semana, feriados, saltos, medios)
-                candidatos.append((nuevo_ini, f, m))
-            if nuevo_fin > fin_suc:                       # empuja por el fin (FF)
-                i, m = _inicio_desde_plazo(nuevo_fin, plazo, dias_semana, feriados, saltos, medios)
-                candidatos.append((i, nuevo_fin, m))
+            if req_ini is not None and (exacto or req_ini > ini_suc):
+                f, m = _fin_desde_plazo(req_ini, plazo, dias_semana, feriados, saltos, medios)
+                candidatos.append((req_ini, f, m))
+            if req_fin is not None and (exacto or req_fin > fin_suc):
+                i, m = _inicio_desde_plazo(req_fin, plazo, dias_semana, feriados, saltos, medios)
+                candidatos.append((i, req_fin, m))
             if not candidatos:
                 continue                                  # ya cumple: no se toca
             nuevo_ini, nuevo_fin, medios_n = max(candidatos, key=lambda c: c[0])
+            if (nuevo_ini, nuevo_fin) == (ini_suc, fin_suc):
+                continue                                  # ya estaba donde toca
 
             rango = {nuevo_ini + timedelta(days=i)
                      for i in range((nuevo_fin - nuevo_ini).days + 1)}
@@ -1262,8 +1281,10 @@ async def crear_dependencia(act_id: int, data: dict):
                     act_id, pred_id, lag, tipo)
             except _ERRORES_DATO:
                 raise HTTPException(400, "Actividad o antecesora inexistente")
-            # La nueva dependencia puede exigir empujar la sucesora ya mismo.
-            movidas = await recalcular_cascada(con, pred_id)
+            # El planner acaba de decidir este vínculo: la sucesora se acomoda
+            # EXACTAMENTE sobre él (también hacia atrás — cambiar un FS por un
+            # SS tiene que mover la actividad, no quedarse quieto).
+            movidas = await recalcular_cascada(con, pred_id, forzar={act_id})
     return {**dict(row), "movidas": movidas}
 
 
@@ -1315,7 +1336,9 @@ async def encadenar_dependencias(data: dict):
                 except _ERRORES_DATO:
                     raise HTTPException(400, f"Actividad inexistente en la secuencia (#{act_id} o #{pred_id})")
                 creados += 1
-            movidas = await recalcular_cascada(con, ids[0]) if creados else []
+            # Toda la secuencia se acomoda sobre los vínculos recién decididos.
+            movidas = (await recalcular_cascada(con, ids[0], forzar=set(ids[1:]))
+                       if creados else [])
     return {"vinculos": creados, "omitidos": omitidos, "movidas": movidas}
 
 
