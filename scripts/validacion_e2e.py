@@ -87,8 +87,11 @@ def limpiar_y_sembrar(cur):
                 "VALUES ('SUPE2E','Supervisor E2E','900') "
                 "ON CONFLICT (id) DO UPDATE SET trabajador_id = '900'")
     cur.execute("DELETE FROM otms WHERE descripcion LIKE 'E2E PROYECTO%'")
-    cur.execute("INSERT INTO otms (id, descripcion, proyecto_id) VALUES "
-                "('OTM-E2E','OTM de validación E2E',1) ON CONFLICT (id) DO NOTHING")
+    # El ÁREA es del proyecto/OTM (0033): el parte de campo ya no la digita,
+    # la hereda. Lo que el supervisor escribe ahora es el FRENTE.
+    cur.execute("INSERT INTO otms (id, descripcion, proyecto_id, area) VALUES "
+                "('OTM-E2E','OTM de validación E2E',1,'PLANTA SX / EW') "
+                "ON CONFLICT (id) DO UPDATE SET area = 'PLANTA SX / EW'")
     cur.execute("INSERT INTO ev_config (clave, valor) VALUES ('fecha_base', %s) "
                 "ON CONFLICT (clave) DO UPDATE SET valor=%s", (FECHA_BASE, FECHA_BASE))
 
@@ -607,6 +610,104 @@ def main():
           and g8b.get("fecha") == "2026-06-12" and g8b.get("fecha_fin") == "2026-06-13",
           f"movidas={r.json().get('movidas')} rango={g8b.get('fecha')}..{g8b.get('fecha_fin')}")
 
+    # ── Plazo y tipos de vínculo FS/SS/FF (0034, planner 2026-07-26) ──
+    # Bloque autocontenido: pone el calendario en L-S y lo restaura al final.
+    # Junio 2026: el 15 es lunes, el 19 viernes, el 20 sábado y el 21 domingo.
+    c.put(f"{API}/ev/programacion/config", json={"proyecto_id": 1, "dias_semana": [1, 2, 3, 4, 5, 6]})
+
+    # P54 — INICIO + PLAZO 1.5: el fin se deriva y el medio día cae al final,
+    # así que el metrado se reparte 2:1 (lo que el planner pidió poder hacer).
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-06-15", "otm_id": "OTM-E2E",
+        "titulo": "E2E Plazo dia y medio", "metrado_prog": 90, "plazo_dias": 1.5})
+    act54 = r.json() if r.status_code == 200 else {}
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-15", "semanas": 2})
+    g54 = next((a for g in r2.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act54.get("id")), {})
+    check("P54 inicio+plazo 1.5: fin derivado al 16, medio día al final y 90 -> 60/30",
+          r.status_code == 200 and g54.get("fecha") == "2026-06-15"
+          and g54.get("fecha_fin") == "2026-06-16" and g54.get("plazo_dias") == 1.5
+          and g54.get("dias_medio") == ["2026-06-16"]
+          and g54.get("prog", {}).get("2026-06-15") == 60
+          and g54.get("prog", {}).get("2026-06-16") == 30,
+          f"status={r.status_code} rango={g54.get('fecha')}..{g54.get('fecha_fin')} "
+          f"plazo={g54.get('plazo_dias')} prog={g54.get('prog')}")
+
+    # P55 — el plazo se cuenta en días HÁBILES: 3 días desde el viernes 19
+    # llegan al lunes 22 porque el domingo 21 no se trabaja.
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-06-19", "otm_id": "OTM-E2E",
+        "titulo": "E2E Plazo salta domingo", "metrado_prog": 30, "plazo_dias": 3})
+    act55 = r.json() if r.status_code == 200 else {}
+    check("P55 el plazo cuenta días hábiles: 3 días desde el vie 19 terminan el lun 22",
+          r.status_code == 200 and str(act55.get("fecha_fin")) == "2026-06-22",
+          f"status={r.status_code} fin={act55.get('fecha_fin')}")
+
+    # P56 — mover el INICIO desplaza la barra sin estirarla (modo INICIO_PLAZO)
+    # y las marcas de medio día viejas no quedan colgando fuera del rango.
+    r = c.put(f"{API}/ev/programacion/actividades/{act54.get('id')}",
+              json={"fecha": "2026-06-17"})
+    a54b = r.json() if r.status_code == 200 else {}
+    check("P56 mover el inicio conserva el plazo: 17-18 y el medio día se recoloca",
+          r.status_code == 200 and str(a54b.get("fecha_fin")) == "2026-06-18"
+          and float(a54b.get("plazo_dias") or 0) == 1.5
+          and [str(d) for d in (a54b.get("dias_medio") or [])] == ["2026-06-18"],
+          f"status={r.status_code} fin={a54b.get('fecha_fin')} "
+          f"plazo={a54b.get('plazo_dias')} medios={a54b.get('dias_medio')}")
+
+    # P57 — vínculo SS con lag 1: la sucesora no arranca con la antecesora
+    # sino un día hábil después, conservando SU plazo (traslape típico de obra).
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-06-15", "otm_id": "OTM-E2E",
+        "titulo": "E2E SS sucesora", "metrado_prog": 40, "plazo_dias": 2})
+    act57 = r.json() if r.status_code == 200 else {}
+    r2 = c.post(f"{API}/ev/programacion/actividades/{act57.get('id')}/dependencias",
+                json={"predecesora_id": act55.get("id"), "tipo": "SS", "lag_dias": 1})
+    r3 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-15", "semanas": 2})
+    g57 = next((a for g in r3.json().get("grupos", []) for a in g["actividades"]
+                if a["id"] == act57.get("id")), {})
+    check("P57 vínculo SS+1: arranca 1 día hábil tras el inicio de la antecesora (20-22)",
+          r2.status_code == 200 and g57.get("fecha") == "2026-06-20"
+          and g57.get("fecha_fin") == "2026-06-22"       # sáb 20 + lun 22 (dom no)
+          and (g57.get("predecesoras") or [{}])[0].get("tipo") == "SS",
+          f"dep={r2.status_code} rango={g57.get('fecha')}..{g57.get('fecha_fin')} "
+          f"preds={g57.get('predecesoras')}")
+
+    # P58 — ENCADENAR en secuencia: el gesto masivo del planner. 3 actividades
+    # sueltas quedan 1→2→3 en FS con un solo POST, y la cascada las ordena.
+    ids58 = []
+    for i in range(3):
+        r = c.post(f"{API}/ev/programacion/actividades", json={
+            "proyecto_id": 1, "fecha": "2026-06-15", "otm_id": "OTM-E2E",
+            "titulo": f"E2E Cadena {i + 1}", "metrado_prog": 10, "plazo_dias": 1})
+        ids58.append(r.json().get("id") if r.status_code == 200 else None)
+    r = c.post(f"{API}/ev/programacion/dependencias/encadenar",
+               json={"ids": ids58, "tipo": "FS", "lag_dias": 0})
+    enc = r.json() if r.status_code == 200 else {}
+    r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
+               params={"proyecto_id": 1, "desde": "2026-06-15", "semanas": 2})
+    porid58 = {a["id"]: a for g in r2.json().get("grupos", []) for a in g["actividades"]}
+    fechas58 = [porid58.get(i, {}).get("fecha") for i in ids58]
+    check("P58 encadenar: un POST crea los 2 vínculos y la cadena queda 15/16/17",
+          r.status_code == 200 and enc.get("vinculos") == 2 and enc.get("omitidos") == []
+          and fechas58 == ["2026-06-15", "2026-06-16", "2026-06-17"],
+          f"status={r.status_code} enc={enc} fechas={fechas58}")
+
+    # P59 — encadenar es idempotente y no acepta ciclos: repetir la secuencia
+    # invertida sobre la misma cadena no debe romper nada.
+    r = c.post(f"{API}/ev/programacion/dependencias/encadenar",
+               json={"ids": list(reversed(ids58))})
+    inv = r.json() if r.status_code == 200 else {}
+    check("P59 encadenar al revés no crea ciclos: los 2 pares se informan omitidos",
+          r.status_code == 200 and inv.get("vinculos") == 0
+          and len(inv.get("omitidos") or []) == 2,
+          f"status={r.status_code} inv={inv}")
+
+    c.put(f"{API}/ev/programacion/config",           # se restaura el calendario
+          json={"proyecto_id": 1, "dias_semana": [1, 2, 3, 4, 5, 6, 7]})
+
     # ── Hitos + fuente única (migración 0025, encargo 2026-07-18) ──
 
     # P29 — ROLLUP: cada registro diario deriva ev_avances del hito principal
@@ -993,31 +1094,42 @@ def main():
     r = c.post(f"{API}/campo/reportes",
                data={"proyecto_id": 1, "fecha": FECHA_TAREO, "otm_id": "OTM-E2E",
                      "supervisor_id": "SUPE2E", "actividad_id": act47.get("id"),
-                     "area": "PLANTA SX / EW", "turno": "DIA",
+                     # el área NO se manda: se hereda de la OTM. El frente sí,
+                     # y se normaliza a MAYÚSCULAS sin espacios repetidos.
+                     "frente": "  bahia  4 ", "turno": "DIA",
                      "anotaciones": json.dumps(["Corte de esparragos",
                                                 "Instalacion del cerco completo"]),
                      "restricciones": json.dumps([
                          {"cat": "EQUIPOS", "detalle": "No hubo camion grua"}])},
                files=[("fotos", ("cerco.jpg", buf47.getvalue(), "image/jpeg"))])
     rep47 = r.json() if r.status_code == 200 else {}
-    cur.execute("SELECT area, turno, anotaciones, restricciones, descripcion "
+    cur.execute("SELECT area, turno, anotaciones, restricciones, descripcion, frente "
                 "FROM campo_reportes WHERE id = %s", (rep47.get("id"),))
     fila47 = cur.fetchone()
-    check("P47 reporte estructurado: área, turno, viñetas y restricción CNC guardadas",
+    check("P47 reporte estructurado: área heredada, frente normalizado, viñetas y CNC",
           r.status_code == 200 and fila47 is not None
           and fila47[0] == "PLANTA SX / EW" and fila47[1] == "DIA"
           and len(fila47[2]) == 2 and fila47[3][0]["cat"] == "EQUIPOS"
-          and "• Corte de esparragos" in (fila47[4] or ""),
+          and "• Corte de esparragos" in (fila47[4] or "")
+          and fila47[5] == "BAHIA 4",
           f"status={r.status_code} fila={fila47}")
+
+    # P47b — el catálogo de frentes se autoalimenta con lo ya escrito.
+    r = c.get(f"{API}/campo/frentes", params={"otm_id": "OTM-E2E"})
+    frentes = r.json() if r.status_code == 200 else []
+    check("P47b catálogo de frentes: se autoalimenta con lo que ya se usó",
+          r.status_code == 200 and "BAHIA 4" in frentes,
+          f"status={r.status_code} frentes={frentes}")
 
     # P48 — PARTE DIARIO listo para WhatsApp (mismo formato que la app).
     r = c.get(f"{API}/ev/programacion/reporte-dia",
               params={"fecha": FECHA_TAREO, "supervisor_id": "SUPE2E"})
     partes = r.json().get("partes", []) if r.status_code == 200 else []
     txt = partes[0]["texto"] if partes else ""
-    check("P48 parte diario: cabecera, personal por cargo del tareo, área y restricciones",
+    check("P48 parte diario: cabecera, personal del tareo, área, frente y restricciones",
           r.status_code == 200 and "Turno: DIA" in txt
           and "CANTIDAD TOTAL PERSONAL:" in txt and "AREA: PLANTA SX / EW" in txt
+          and "FRENTE: BAHIA 4" in txt
           and "* Corte de esparragos" in txt
           and "RESTRICCIONES." in txt and "camion grua" in txt,
           f"status={r.status_code} texto={txt[:200]!r}")
@@ -1037,7 +1149,7 @@ def main():
     r = c.get(f"{API}/campo/reporte-plantilla", params={"actividad_id": act49.get("id")})
     pl = r.json() if r.status_code == 200 else {}
     check("P49 plantilla: el reporte anterior de esa partida se ofrece para reusar",
-          r.status_code == 200 and pl.get("area") == "PLANTA SX / EW"
+          r.status_code == 200 and pl.get("frente") == "BAHIA 4"
           and "Corte de esparragos" in (pl.get("anotaciones") or [])
           and (pl.get("restricciones") or [{}])[0].get("cat") == "EQUIPOS",
           f"status={r.status_code} plantilla={pl} ph={ph}")

@@ -118,6 +118,157 @@ def _dias_habiles(desde: date, hasta: date, dias_semana: set, feriados: set,
             and d not in feriados and d not in saltos]
 
 
+# ── Plazo (duración) — el dato con el que razona el planner (0034) ──
+# El plazo es la duración en DÍAS HÁBILES PONDERADOS del calendario del
+# proyecto: día completo 1, medio día 0.5, salto 0. Con él, "arranca el lunes
+# y dura 1.5 días" es programable, y la cascada puede mover una actividad
+# conservando su duración en vez de deducirla contando celdas.
+_EPS = 1e-9
+_MAX_PLAZO = 999.0
+_MAX_BUSQUEDA = 2000          # tope de días recorridos: evita bucles infinitos
+                              # si el calendario no tuviera ningún día hábil
+
+
+def _es_habil(d: date, dias_semana: set, feriados: set, saltos: set = frozenset()) -> bool:
+    return d.isoweekday() in dias_semana and d not in feriados and d not in saltos
+
+
+def _habil_anterior(d: date, dias_semana: set, feriados: set) -> date:
+    """Primer día ESTRICTAMENTE anterior a d que es hábil del calendario."""
+    x = d - timedelta(days=1)
+    for _ in range(_MAX_BUSQUEDA):
+        if _es_habil(x, dias_semana, feriados):
+            return x
+        x -= timedelta(days=1)
+    return x
+
+
+def _habil_desplazado(d: date, n: int, dias_semana: set, feriados: set) -> date:
+    """El día hábil que resulta de moverse n días hábiles desde d.
+    n = 0 → el propio d (o el siguiente hábil si d no lo es); n < 0 va atrás.
+    Es la base de los lags: un lag de 0 en FS = "el día hábil siguiente al
+    fin de la antecesora", que es exactamente el comportamiento anterior."""
+    x = d
+    for _ in range(_MAX_BUSQUEDA):
+        if _es_habil(x, dias_semana, feriados):
+            break
+        x += timedelta(days=1)
+    paso = _siguiente_habil if n > 0 else _habil_anterior
+    for _ in range(abs(int(n))):
+        x = paso(x, dias_semana, feriados)
+    return x
+
+
+def _plazo_de(desde: date, hasta: date, dias_semana: set, feriados: set,
+              saltos: set, medios: set) -> float:
+    """Plazo del rango = Σ de los pesos de sus días hábiles."""
+    return round(sum(0.5 if d in medios else 1.0
+                     for d in _dias_habiles(desde, hasta, dias_semana, feriados, saltos)), 1)
+
+
+def _fin_desde_plazo(inicio: date, plazo: float, dias_semana: set, feriados: set,
+                     saltos: set, medios: set) -> tuple:
+    """Avanza desde `inicio` acumulando pesos hasta completar `plazo`.
+    Devuelve (fecha_fin, medios) — `medios` puede crecer: si el plazo termina
+    en .5 y el último día todavía pesaba completo, ese día se marca como medio
+    para que el rango cuadre. El planner puede mover luego esa marca a
+    cualquier otro día del rango: el plazo se recalcula solo (§ _plazo_de)."""
+    medios = set(medios)
+    acum, d, ultimo = 0.0, inicio, inicio
+    for _ in range(_MAX_BUSQUEDA):
+        if acum >= plazo - _EPS:
+            break
+        if _es_habil(d, dias_semana, feriados, saltos):
+            peso = 0.5 if d in medios else 1.0
+            falta = plazo - acum
+            if peso > falta + _EPS:        # solo ocurre con falta == 0.5
+                medios.add(d)
+                peso = falta
+            acum += peso
+            ultimo = d
+        d += timedelta(days=1)
+    return ultimo, sorted(medios)
+
+
+def _inicio_desde_plazo(fin: date, plazo: float, dias_semana: set, feriados: set,
+                        saltos: set, medios: set) -> tuple:
+    """Espejo de _fin_desde_plazo hacia atrás (modo FIN_PLAZO): fija el fin y
+    calcula desde qué día hay que arrancar para que quepa el plazo."""
+    medios = set(medios)
+    acum, d, primero = 0.0, fin, fin
+    for _ in range(_MAX_BUSQUEDA):
+        if acum >= plazo - _EPS:
+            break
+        if _es_habil(d, dias_semana, feriados, saltos):
+            peso = 0.5 if d in medios else 1.0
+            falta = plazo - acum
+            if peso > falta + _EPS:
+                medios.add(d)
+                peso = falta
+            acum += peso
+            primero = d
+        d -= timedelta(days=1)
+    return primero, sorted(medios)
+
+
+def _parse_plazo(v) -> Optional[float]:
+    """El plazo se expresa en múltiplos de medio día: 1, 1.5, 2… Cualquier
+    otra fracción no es representable con los pesos del prorrateo."""
+    if v in (None, ""):
+        return None
+    try:
+        p = float(v)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "plazo_dias debe ser un número")
+    if p <= 0:
+        raise HTTPException(400, "plazo_dias debe ser mayor que cero")
+    if p > _MAX_PLAZO:
+        raise HTTPException(400, f"plazo_dias no puede pasar de {_MAX_PLAZO:g} días")
+    if abs(p * 2 - round(p * 2)) > 1e-6:
+        raise HTTPException(400, "plazo_dias debe ser múltiplo de 0.5 (medio día)")
+    return round(p, 1)
+
+
+def _resolver_fechas(modo: str, campo: str, inicio: date, fin: date, plazo: Optional[float],
+                     dias_semana: set, feriados: set, saltos: set, medios: set) -> tuple:
+    """Dado el modo de programación y QUÉ tocó el planner, recalcula el dato
+    derivado. Devuelve (inicio, fin, plazo, medios). Es la tabla de P6/Project:
+
+      modo          editas inicio/fin/plazo → se recalcula
+      INICIO_PLAZO  inicio|plazo|dias → fin     · fin → plazo
+      FIN_PLAZO     fin|plazo|dias    → inicio  · inicio → plazo
+      INICIO_FIN    inicio|fin|dias   → plazo   · plazo → fin
+
+    `campo` ∈ inicio | fin | plazo | dias (saltos/medios) | modo.
+    Con campo='dias' la actividad CONSERVA su plazo y estira el rango (agregar
+    un salto la alarga), salvo en INICIO_FIN donde manda el rango."""
+    def _podar(i: date, f: date, p: float, m) -> tuple:
+        """Los medios días que quedaron fuera del rango nuevo se descartan:
+        si no, al reprogramar la actividad arrastraría marcas viejas que ya no
+        pinta nadie y el plazo dejaría de cuadrar con lo que se ve."""
+        return i, f, p, sorted(d for d in m if i <= d <= f)
+
+    recalc_plazo = lambda: _podar(                                          # noqa: E731
+        inicio, fin, _plazo_de(inicio, fin, dias_semana, feriados, saltos, medios), medios)
+    if plazo is None or campo in ("modo", "ambas"):
+        return recalc_plazo()
+    if modo == "INICIO_PLAZO":
+        if campo == "fin":
+            return recalc_plazo()
+        f, m = _fin_desde_plazo(inicio, plazo, dias_semana, feriados, saltos, medios)
+        return _podar(inicio, f, plazo, m)
+    if modo == "FIN_PLAZO":
+        if campo == "inicio":
+            return recalc_plazo()
+        i, m = _inicio_desde_plazo(fin, plazo, dias_semana, feriados, saltos, medios)
+        return _podar(i, fin, plazo, m)
+    # INICIO_FIN: mandan las dos fechas; el plazo solo se lee…
+    if campo == "plazo":
+        f, m = _fin_desde_plazo(inicio, plazo, dias_semana, feriados, saltos, medios)
+        return _podar(inicio, f, plazo, m)
+    return recalc_plazo()                    # …salvo que se escriba a propósito
+
+
 async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) -> None:
     """Recalcula la distribución diaria del metrado de la actividad. El metrado
     META es inmutable aquí (solo se cambia desde el formulario):
@@ -282,6 +433,31 @@ async def semana(proyecto_id: int = 1, lunes: str = ""):
             "actividades": acts, "reportes": reps}
 
 
+_MODOS_FECHA = ("INICIO_PLAZO", "FIN_PLAZO", "INICIO_FIN")
+
+
+def _parse_modo(v) -> str:
+    m = str(v or "").strip().upper() or "INICIO_PLAZO"
+    if m not in _MODOS_FECHA:
+        raise HTTPException(422, f"modo_fecha inválido (usa {'/'.join(_MODOS_FECHA)})")
+    return m
+
+
+async def _resolver_act(con, act: dict, campo: str) -> tuple:
+    """Envuelve _resolver_fechas con el calendario del proyecto cargado.
+    La ventana del calendario se abre generosamente a ambos lados porque el
+    fin puede caer bastante más allá del rango que la actividad tenía."""
+    inicio = act["fecha"]
+    fin = act["fecha_fin"] or inicio
+    plazo = None if act.get("plazo_dias") is None else float(act["plazo_dias"])
+    dias_semana, feriados = await _calendario(
+        con, act["proyecto_id"],
+        min(inicio, fin) - timedelta(days=400), max(inicio, fin) + timedelta(days=400))
+    return _resolver_fechas(act.get("modo_fecha") or "INICIO_PLAZO", campo, inicio, fin,
+                            plazo, dias_semana, feriados,
+                            set(act.get("dias_salto") or []), set(act.get("dias_medio") or []))
+
+
 def _parse_metrado(v) -> Optional[float]:
     if v in (None, ""):
         return None
@@ -311,24 +487,35 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
         raise HTTPException(400, "Un día no puede ser salto y medio día a la vez")
     partida_id = int(data["partida_id"]) if data.get("partida_id") else None
     hito_id = int(data["hito_id"]) if data.get("hito_id") else None
+    proyecto_id = int(data.get("proyecto_id") or 1)
+    modo = _parse_modo(data.get("modo_fecha"))
+    plazo = _parse_plazo(data.get("plazo_dias"))
     pool = await db()
     async with pool.acquire() as con:
         if hito_id:
             await _validar_hito(con, partida_id, hito_id)
+        # Con plazo se deriva la fecha que falte (0034); sin él, el plazo sale
+        # del rango — así el alta de siempre (inicio+fin) sigue igual.
+        fecha, fecha_fin, plazo, medios = await _resolver_act(
+            con, {"proyecto_id": proyecto_id, "fecha": fecha, "fecha_fin": fecha_fin,
+                  "plazo_dias": plazo, "modo_fecha": modo,
+                  "dias_salto": saltos, "dias_medio": medios},
+            "plazo" if plazo is not None else "dias")
         async with con.transaction():
             try:
                 row = await con.fetchrow(
                     """INSERT INTO prog_actividades
                        (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo, descripcion,
                         responsable, supervisor_id, metrado_prog, und, dias_salto, dias_medio,
-                        hito_id, creado_por)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *""",
-                    int(data.get("proyecto_id") or 1), fecha, fecha_fin,
+                        hito_id, creado_por, plazo_dias, modo_fecha)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                       RETURNING *""",
+                    proyecto_id, fecha, fecha_fin,
                     (str(data["otm_id"]).strip() or None) if data.get("otm_id") else None,
                     partida_id,
                     titulo, data.get("descripcion") or None, data.get("responsable") or None,
                     (str(data["supervisor_id"]).strip() or None) if data.get("supervisor_id") else None,
-                    metrado, und, saltos, medios, hito_id, user.get("sub"))
+                    metrado, und, saltos, medios, hito_id, user.get("sub"), plazo, modo)
             except _ERRORES_DATO:
                 raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
             await _redistribuir(con, dict(row))
@@ -368,6 +555,10 @@ async def editar_actividad(act_id: int, data: dict):
         campos.append("dias_salto"); valores.append(_parse_saltos(data["dias_salto"]))
     if "dias_medio" in data:
         campos.append("dias_medio"); valores.append(_parse_saltos(data["dias_medio"]))
+    if "plazo_dias" in data:
+        campos.append("plazo_dias"); valores.append(_parse_plazo(data["plazo_dias"]))
+    if "modo_fecha" in data:
+        campos.append("modo_fecha"); valores.append(_parse_modo(data["modo_fecha"]))
     if "causa_nc_cat" in data:
         campos.append("causa_nc_cat"); valores.append(_validar_cnc(data["causa_nc_cat"]))
     if "causa_nc_planner_cat" in data:
@@ -384,28 +575,52 @@ async def editar_actividad(act_id: int, data: dict):
         valores.append(int(data["partida_id"]) if data["partida_id"] else None)
     if not campos:
         raise HTTPException(400, "Nada que actualizar")
-    sets = ", ".join(f"{c} = ${i + 2}" for i, c in enumerate(campos))
+    # Modo de programación (0034): según QUÉ tocó el planner se deriva el tercer
+    # dato. Enviar las dos fechas juntas siempre manda sobre el plazo (es el
+    # gesto de "este es el rango, punto").
+    campo = ("ambas" if {"fecha", "fecha_fin"} <= data.keys()
+             else "plazo" if "plazo_dias" in data
+             else "inicio" if "fecha" in data
+             else "fin" if "fecha_fin" in data
+             else "dias" if {"dias_salto", "dias_medio"} & data.keys()
+             else "modo" if "modo_fecha" in data else "")
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
+            actual = await con.fetchrow(
+                "SELECT * FROM prog_actividades WHERE id = $1 FOR UPDATE", act_id)
+            if not actual:
+                raise HTTPException(404, "Actividad no encontrada")
+            # Las fechas se resuelven ANTES de escribir, en un solo UPDATE: si
+            # se escribiera la F.Inicio primero, mover una actividad más allá de
+            # su antiguo fin violaría el CHECK (fecha_fin >= fecha) de 0019.
+            if campo:
+                fusion = {**dict(actual), **dict(zip(campos, valores))}
+                ini, fin, plz, med = await _resolver_act(con, fusion, campo)
+                for col, val in (("fecha", ini), ("fecha_fin", fin),
+                                 ("plazo_dias", plz), ("dias_medio", med)):
+                    if col in campos:
+                        valores[campos.index(col)] = val
+                    else:
+                        campos.append(col); valores.append(val)
+            sets = ", ".join(f"{c} = ${i + 2}" for i, c in enumerate(campos))
             try:
                 row = await con.fetchrow(
                     f"UPDATE prog_actividades SET {sets}, actualizado_en = now() "
                     f"WHERE id = $1 RETURNING *", act_id, *valores)
             except _ERRORES_DATO:
                 raise HTTPException(400, "OTM, partida, supervisor o rango de fechas inválido: revisa los datos")
-            if not row:
-                raise HTTPException(404, "Actividad no encontrada")
             if set(row["dias_salto"] or []) & set(row["dias_medio"] or []):
                 raise HTTPException(400, "Un día no puede ser salto y medio día a la vez")
             # Si cambió el rango, el metrado, los saltos o los medios días, la
             # distribución diaria se recalcula (las ediciones celda a celda van
             # por /actividades/{id}/metrado-dias y NO pasan por aquí).
             movidas: list = []
-            if {"fecha", "fecha_fin", "metrado_prog", "dias_salto", "dias_medio"} & data.keys():
+            if {"fecha", "fecha_fin", "metrado_prog", "dias_salto", "dias_medio",
+                    "plazo_dias", "modo_fecha"} & data.keys():
                 await _redistribuir(con, dict(row))
-            # Auto-cascada FS: mover el rango empuja a las sucesoras (F5b v2).
-            if {"fecha", "fecha_fin"} & data.keys():
+            # Auto-cascada: mover el rango empuja a las sucesoras (FS/SS/FF).
+            if {"fecha", "fecha_fin", "plazo_dias", "dias_salto", "dias_medio"} & data.keys():
                 movidas = await recalcular_cascada(con, act_id)
     return {**dict(row), "movidas": movidas}
 
@@ -722,16 +937,23 @@ async def crear_actividades_lote(data: dict, user: dict = Depends(require_role("
                 titulo = (p["descripcion"] or f"Partida {pid}")[:170]
                 if hid and hinfo.get(hid):
                     titulo = f"{titulo} — {hinfo[hid]['descripcion'] or 'Etapa'}"[:200]
+                # El plazo del alta por lotes sale del rango recibido (0034):
+                # así las actividades nacen con duración y la cascada puede
+                # empujarlas sin deformarlas.
+                _i, _f, plazo, _m = await _resolver_act(
+                    con, {"proyecto_id": proyecto_id, "fecha": fecha, "fecha_fin": fecha_fin,
+                          "plazo_dias": None, "modo_fecha": "INICIO_PLAZO",
+                          "dias_salto": [], "dias_medio": []}, "dias")
                 try:
                     row = await con.fetchrow(
                         """INSERT INTO prog_actividades
                            (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo,
                             descripcion, responsable, supervisor_id, metrado_prog, hito_id,
-                            creado_por)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *""",
+                            creado_por, plazo_dias)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *""",
                         proyecto_id, fecha, fecha_fin, otm_id, pid, titulo,
                         descripcion, responsable, supervisor_id, metrado, hid,
-                        user.get("sub"))
+                        user.get("sub"), plazo)
                 except _ERRORES_DATO:
                     raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
                 await _redistribuir(con, dict(row))
@@ -746,7 +968,10 @@ async def crear_actividades_lote(data: dict, user: dict = Depends(require_role("
     return {"creadas": len(creadas), "actividades": creadas}
 
 
-# ── Dependencias (F5 v2): antecesoras Fin→Inicio con auto-cascada ──
+# ── Dependencias (F5 v2 · tipos FS/SS/FF en 0034) con auto-cascada ──
+_TIPOS_DEP = ("FS", "SS", "FF")
+
+
 async def _hay_ciclo(con, predecesora_id: int, actividad_id: int) -> bool:
     """¿Agregar 'predecesora_id precede a actividad_id' crearía un ciclo?
     Sí, cuando predecesora_id es alcanzable desde actividad_id siguiendo
@@ -772,13 +997,36 @@ def _siguiente_habil(d: date, dias_semana: set, feriados: set) -> date:
     return x
 
 
+def _restriccion_dep(tipo: str, lag: int, pred_ini: date, pred_fin: date,
+                     dias_semana: set, feriados: set) -> tuple:
+    """Traduce un vínculo a la restricción que impone sobre la sucesora:
+    ('inicio'|'fin', fecha mínima). El lag se cuenta en DÍAS HÁBILES; con
+    lag 0 el resultado es el de siempre.
+
+      FS  la sucesora no puede EMPEZAR antes del día hábil siguiente al fin
+          de la antecesora (+lag)                    → el clásico
+      SS  no puede EMPEZAR antes de que empiece la antecesora (+lag)
+          → traslapes: "el encofrado arranca 1 día después del habilitado"
+      FF  no puede TERMINAR antes de que termine la antecesora (+lag)
+          → "el curado no cierra antes que el vaciado"
+    """
+    if tipo == "SS":
+        return "inicio", _habil_desplazado(pred_ini, lag, dias_semana, feriados)
+    if tipo == "FF":
+        return "fin", _habil_desplazado(pred_fin, lag, dias_semana, feriados)
+    return "inicio", _habil_desplazado(pred_fin, lag + 1, dias_semana, feriados)
+
+
 async def recalcular_cascada(con, actividad_id_movida: int) -> list:
-    """Auto-cascada FS (F5b v2): al mover una antecesora, cada sucesora se
-    desplaza SOLO HACIA ADELANTE — nueva F.Inicio = max(F.Inicio actual,
-    siguiente día hábil tras F.Fin de la antecesora + lag). La F.Fin se
-    desplaza preservando la duración en días hábiles del calendario, los
-    saltos/medios que queden fuera del nuevo rango se descartan y el metrado
-    se re-prorratea. BFS en orden; los ciclos ya están vetados al crear."""
+    """Auto-cascada de la red (FS/SS/FF, 0034): al mover una actividad, cada
+    sucesora se desplaza SOLO HACIA ADELANTE hasta cumplir TODAS sus
+    antecesoras — se evalúa la restricción más exigente de todas, no una a
+    una, porque una sucesora puede colgar de varias con tipos distintos.
+
+    El rango nuevo conserva el PLAZO de la sucesora (esa es la invariante:
+    empujar una actividad no la estira ni la encoge); los saltos y medios que
+    caen fuera se descartan y el metrado se re-prorratea. BFS en orden; los
+    ciclos ya están vetados al crear el vínculo."""
     movidas: list = []
     cola, vistas = [actividad_id_movida], set()
     while cola:
@@ -786,46 +1034,68 @@ async def recalcular_cascada(con, actividad_id_movida: int) -> list:
         if actual in vistas:
             continue
         vistas.add(actual)
-        pred = await con.fetchrow("SELECT * FROM prog_actividades WHERE id = $1", actual)
-        if not pred:
-            continue
-        fin_pred = pred["fecha_fin"] or pred["fecha"]
-        deps = await con.fetch(
-            "SELECT actividad_id, lag_dias FROM prog_dependencias WHERE predecesora_id = $1",
-            actual)
-        for dep in deps:
-            suc = await con.fetchrow(
-                "SELECT * FROM prog_actividades WHERE id = $1", dep["actividad_id"])
+        sucesoras = [r["actividad_id"] for r in await con.fetch(
+            "SELECT actividad_id FROM prog_dependencias WHERE predecesora_id = $1", actual)]
+        for suc_id in sucesoras:
+            suc = await con.fetchrow("SELECT * FROM prog_actividades WHERE id = $1", suc_id)
             if not suc or suc["estado"] == "CANCELADO":
                 continue
+            deps = await con.fetch(
+                """SELECT d.tipo, d.lag_dias, p.fecha AS pred_ini,
+                          COALESCE(p.fecha_fin, p.fecha) AS pred_fin
+                     FROM prog_dependencias d
+                     JOIN prog_actividades p ON p.id = d.predecesora_id
+                    WHERE d.actividad_id = $1 AND p.estado <> 'CANCELADO'""", suc_id)
+            if not deps:
+                continue
+            ini_suc = suc["fecha"]
+            fin_suc = suc["fecha_fin"] or ini_suc
+            ancla = min(min(d["pred_ini"] for d in deps), ini_suc)
             dias_semana, feriados = await _calendario(
-                con, suc["proyecto_id"], fin_pred, fin_pred + timedelta(days=366))
-            inicio_min = _siguiente_habil(
-                fin_pred + timedelta(days=int(dep["lag_dias"] or 0)), dias_semana, feriados)
-            if inicio_min <= suc["fecha"]:
-                continue                      # nunca se adelanta ni se toca
-            fin_suc = suc["fecha_fin"] or suc["fecha"]
-            dur = len(_dias_habiles(suc["fecha"], fin_suc, dias_semana, feriados, set()))
-            if dur > 0:
-                nueva_fin, n = inicio_min, 1 if inicio_min.isoweekday() in dias_semana and inicio_min not in feriados else 0
-                while n < dur:
-                    nueva_fin = _siguiente_habil(nueva_fin, dias_semana, feriados)
-                    n += 1
-            else:
-                nueva_fin = inicio_min + (fin_suc - suc["fecha"])
-            rango = {inicio_min + timedelta(days=i)
-                     for i in range((nueva_fin - inicio_min).days + 1)}
+                con, suc["proyecto_id"], ancla - timedelta(days=30),
+                max(max(d["pred_fin"] for d in deps), fin_suc) + timedelta(days=400))
+            saltos = set(suc["dias_salto"] or [])
+            medios = set(suc["dias_medio"] or [])
+            plazo = (float(suc["plazo_dias"]) if suc["plazo_dias"] is not None
+                     else _plazo_de(ini_suc, fin_suc, dias_semana, feriados, saltos, medios))
+
+            # La restricción que manda es la más tardía de todas.
+            nuevo_ini, nuevo_fin = ini_suc, fin_suc
+            for d in deps:
+                borde, minimo = _restriccion_dep(
+                    d["tipo"] or "FS", int(d["lag_dias"] or 0),
+                    d["pred_ini"], d["pred_fin"], dias_semana, feriados)
+                if borde == "inicio":
+                    nuevo_ini = max(nuevo_ini, minimo)
+                else:
+                    nuevo_fin = max(nuevo_fin, minimo)
+            # Cada restricción incumplida propone un rango COMPLETO que conserva
+            # el plazo; gana la que arranque más tarde. Así la duración es
+            # invariante aunque concurran un FS y un FF sobre la misma actividad.
+            candidatos = []
+            if nuevo_ini > ini_suc:                       # empuja por el inicio
+                f, m = _fin_desde_plazo(nuevo_ini, plazo, dias_semana, feriados, saltos, medios)
+                candidatos.append((nuevo_ini, f, m))
+            if nuevo_fin > fin_suc:                       # empuja por el fin (FF)
+                i, m = _inicio_desde_plazo(nuevo_fin, plazo, dias_semana, feriados, saltos, medios)
+                candidatos.append((i, nuevo_fin, m))
+            if not candidatos:
+                continue                                  # ya cumple: no se toca
+            nuevo_ini, nuevo_fin, medios_n = max(candidatos, key=lambda c: c[0])
+
+            rango = {nuevo_ini + timedelta(days=i)
+                     for i in range((nuevo_fin - nuevo_ini).days + 1)}
             row = await con.fetchrow(
                 """UPDATE prog_actividades
-                   SET fecha = $2, fecha_fin = $3,
-                       dias_salto = $4, dias_medio = $5, actualizado_en = now()
+                   SET fecha = $2, fecha_fin = $3, dias_salto = $4, dias_medio = $5,
+                       plazo_dias = $6, actualizado_en = now()
                    WHERE id = $1 RETURNING *""",
-                suc["id"], inicio_min, nueva_fin,
-                sorted(d for d in (suc["dias_salto"] or []) if d in rango),
-                sorted(d for d in (suc["dias_medio"] or []) if d in rango))
+                suc_id, nuevo_ini, nuevo_fin,
+                sorted(d for d in saltos if d in rango),
+                sorted(d for d in set(medios_n) if d in rango), plazo)
             await _redistribuir(con, dict(row))
-            movidas.append(suc["id"])
-            cola.append(suc["id"])
+            movidas.append(suc_id)
+            cola.append(suc_id)
     return movidas
 
 
@@ -973,6 +1243,11 @@ async def crear_dependencia(act_id: int, data: dict):
         lag = int(data.get("lag_dias") or 0)
     except (TypeError, ValueError):
         raise HTTPException(400, "lag_dias debe ser un entero")
+    if abs(lag) > 365:
+        raise HTTPException(400, "lag_dias fuera de rango (±365 días)")
+    tipo = str(data.get("tipo") or "FS").strip().upper()
+    if tipo not in _TIPOS_DEP:
+        raise HTTPException(422, f"tipo de vínculo inválido (usa {'/'.join(_TIPOS_DEP)})")
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
@@ -981,15 +1256,67 @@ async def crear_dependencia(act_id: int, data: dict):
             try:
                 row = await con.fetchrow(
                     """INSERT INTO prog_dependencias (actividad_id, predecesora_id, tipo, lag_dias)
-                       VALUES ($1, $2, 'FS', $3)
+                       VALUES ($1, $2, $4, $3)
                        ON CONFLICT (actividad_id, predecesora_id)
-                       DO UPDATE SET lag_dias = $3 RETURNING *""",
-                    act_id, pred_id, lag)
+                       DO UPDATE SET lag_dias = $3, tipo = $4 RETURNING *""",
+                    act_id, pred_id, lag, tipo)
             except _ERRORES_DATO:
                 raise HTTPException(400, "Actividad o antecesora inexistente")
             # La nueva dependencia puede exigir empujar la sucesora ya mismo.
             movidas = await recalcular_cascada(con, pred_id)
     return {**dict(row), "movidas": movidas}
+
+
+@router.post("/dependencias/encadenar")
+async def encadenar_dependencias(data: dict):
+    """Encadena en secuencia una lista ORDENADA de actividades: 1→2→3→4.
+
+    Es el caso masivo del planner (las etapas de una partida: habilitado →
+    encofrado → vaciado → desencofrado) y hasta ahora costaba 4 gestos por
+    vínculo. Los pares que ya existen se actualizan (mismo upsert que el alta
+    de a una); los que crearían un ciclo se informan y NO abortan el resto."""
+    ids = data.get("ids") or []
+    if not isinstance(ids, list) or len(ids) < 2:
+        raise HTTPException(400, "ids: se necesitan al menos 2 actividades en orden")
+    if len(ids) > 100:
+        raise HTTPException(400, "ids: máximo 100 actividades por encadenado")
+    try:
+        ids = [int(i) for i in ids]
+    except (TypeError, ValueError):
+        raise HTTPException(400, "ids debe ser una lista de enteros")
+    if len(set(ids)) != len(ids):
+        raise HTTPException(400, "ids: hay actividades repetidas en la secuencia")
+    tipo = str(data.get("tipo") or "FS").strip().upper()
+    if tipo not in _TIPOS_DEP:
+        raise HTTPException(422, f"tipo de vínculo inválido (usa {'/'.join(_TIPOS_DEP)})")
+    try:
+        lag = int(data.get("lag_dias") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "lag_dias debe ser un entero")
+    if abs(lag) > 365:
+        raise HTTPException(400, "lag_dias fuera de rango (±365 días)")
+
+    creados, omitidos = 0, []
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            for pred_id, act_id in zip(ids, ids[1:]):
+                if await _hay_ciclo(con, pred_id, act_id):
+                    omitidos.append({"predecesora_id": pred_id, "actividad_id": act_id,
+                                     "motivo": "crearía un ciclo"})
+                    continue
+                try:
+                    await con.execute(
+                        """INSERT INTO prog_dependencias (actividad_id, predecesora_id, tipo, lag_dias)
+                           VALUES ($1, $2, $3, $4)
+                           ON CONFLICT (actividad_id, predecesora_id)
+                           DO UPDATE SET tipo = $3, lag_dias = $4""",
+                        act_id, pred_id, tipo, lag)
+                except _ERRORES_DATO:
+                    raise HTTPException(400, f"Actividad inexistente en la secuencia (#{act_id} o #{pred_id})")
+                creados += 1
+            movidas = await recalcular_cascada(con, ids[0]) if creados else []
+    return {"vinculos": creados, "omitidos": omitidos, "movidas": movidas}
 
 
 @router.delete("/dependencias/{dep_id}")
@@ -1046,7 +1373,7 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             pids)] if pids else []
         dias_semana, feriados = await _calendario(con, proyecto_id, base, fin)
         deps = await con.fetch(
-            """SELECT d.id AS dep_id, d.actividad_id, d.predecesora_id, d.lag_dias,
+            """SELECT d.id AS dep_id, d.actividad_id, d.predecesora_id, d.lag_dias, d.tipo,
                       p.titulo AS pred_titulo, COALESCE(p.fecha_fin, p.fecha) AS pred_fin
                FROM prog_dependencias d
                JOIN prog_actividades p ON p.id = d.predecesora_id
@@ -1058,7 +1385,8 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
     for r in deps:
         preds_map.setdefault(r["actividad_id"], []).append({
             "id": r["predecesora_id"], "dep_id": r["dep_id"], "titulo": r["pred_titulo"],
-            "fecha_fin": str(r["pred_fin"]), "lag_dias": r["lag_dias"]})
+            "fecha_fin": str(r["pred_fin"]), "lag_dias": r["lag_dias"],
+            "tipo": r["tipo"] or "FS"})
         sucs_map.setdefault(r["predecesora_id"], []).append(r["actividad_id"])
 
     prog_map: dict = {}
@@ -1104,6 +1432,8 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "rest_pend": a["rest_pend"], "rest_total": a["rest_total"],
             "dias_salto": [str(d) for d in (a["dias_salto"] or [])],
             "dias_medio": [str(d) for d in (a["dias_medio"] or [])],
+            "plazo_dias": float(a["plazo_dias"]) if a["plazo_dias"] is not None else None,
+            "modo_fecha": a["modo_fecha"] or "INICIO_PLAZO",
             "predecesoras": preds_map.get(a["id"], []),
             "sucesoras": sucs_map.get(a["id"], []),
             "dep_total": a["dep_total"],
