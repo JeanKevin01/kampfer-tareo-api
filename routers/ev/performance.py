@@ -29,9 +29,12 @@ async def performance(hasta: int, otm: Optional[str] = None):
         partidas, hitos, avances, hh, tareo, _split = await _datos_base(hasta, otm)
         if not partidas:
             return {"hasta": hasta, "otm": otm, "serie": []}
-        hh_presup_total = sum(
-            float(_get(p, "hh_actualizado", None) or p["hh_presup"] or 0)
-            for p in partidas)
+        # Denominador = BAC único (mismo criterio del Resumen: hh_actualizado si
+        # oficina lo fijó, si no la reproyección de metrado). Antes esta serie
+        # usaba `hh_actualizado or hh_presup` y podía dar un % distinto al del
+        # tablero cuando había metrado reproyectado.
+        filas_bac = _calcular(partidas, hitos, avances, hh, tareo, hasta)
+        hh_presup_total = sum(f["hh_bac"] for f in filas_bac)
         semanas_set = sorted(
             {a["semana"] for a in avances} | {r["semana"] for r in hh}
             | {s for (_, s) in tareo.keys()} | {hasta}

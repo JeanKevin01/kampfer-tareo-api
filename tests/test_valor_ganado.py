@@ -468,3 +468,52 @@ def test_matriz_dos_areas_y_total():
     # incidencia proyectada de A1 = 120 / 360
     a1 = m["areas"][0]["disciplinas"][0]
     assert a1["inc_proyec"] == round(120 / 360, 4)
+
+
+# ════════════════════════════════════════════════════════════════
+# BAC ÚNICO (2026-07-25, «Opción A» de Jean): un solo presupuesto
+# manda. Antes el % avance colgaba de hh_actualizado y el desvío de
+# hh_proyec → al reproyectar un metrado se contradecían.
+# ════════════════════════════════════════════════════════════════
+from routers.ev._engine import _bac, _bac_fila
+
+
+def test_bac_manda_hh_actualizado_sobre_reproyeccion():
+    """Decisión de oficina (adicional aprobado) le gana al recálculo."""
+    p = {"hh_actualizado": 55.0}
+    assert _bac(p, hh_proyec=60.0) == 55.0
+
+
+def test_bac_cae_a_reproyeccion_sin_actualizado():
+    """Sin presupuesto aprobado manda el metrado reproyectado × estándar."""
+    assert _bac({"hh_actualizado": None}, hh_proyec=60.0) == 60.0
+    assert _bac({}, hh_proyec=60.0) == 60.0
+    # 0 = "no configurado" (misma convención que traía el campo)
+    assert _bac({"hh_actualizado": 0}, hh_proyec=60.0) == 60.0
+
+
+def test_avance_y_desvio_usan_el_MISMO_bac():
+    """El bug original: avance contra una base y desvío contra otra.
+    Escenario: contrato 50 HH, metrado reproyectado ⇒ hh_proyec 60,
+    sin presupuesto aprobado ⇒ BAC = 60 para AMBOS indicadores."""
+    hoja = {
+        "hh_proyec": 60.0, "hh_presup": 50.0, "hh_actualizado": 50.0,
+        "hh_bac": 60.0,
+        "hh_ganadas_acum": 10.0, "hh_gastadas_acum": 10.0,
+        "hh_gastadas_dir_acum": 10.0, "hh_gastadas_ind_acum": 0,
+        "hh_ganadas_sem": 0, "hh_gastadas_sem": 0, "eac_hh": 66.0,
+    }
+    t = _totales([hoja], improd_acum=0.0)
+    assert t["hh_bac"] == 60.0
+    assert t["pct_avance"] == round(10.0 / 60.0, 4)      # contra el BAC
+    assert t["desvio_hh"] == round(66.0 - 60.0, 2)       # MISMO BAC
+    assert t["vac_hh"] == round(60.0 - 66.0, 2)          # VAC = BAC - EAC
+    # TCPI = (BAC-EV)/(BAC-AC) — el ritmo necesario para todavía cumplir
+    assert t["tcpi"] == round((60.0 - 10.0) / (60.0 - 10.0), 3)
+
+
+def test_bac_fila_reconstruye_sin_la_clave():
+    """Filas construidas a mano (golden tests) siguen funcionando."""
+    assert _bac_fila({"hh_bac": 42.0}) == 42.0
+    assert _bac_fila({"hh_actualizado": 55.0, "hh_proyec": 60.0}) == 55.0
+    assert _bac_fila({"hh_proyec": 60.0}) == 60.0

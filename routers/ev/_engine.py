@@ -23,6 +23,42 @@ def _validar_pesos(hitos: list):
         raise HTTPException(400, "Números de hito repetidos")
 
 
+def _bac(partida, hh_proyec: float) -> float:
+    """BAC de la partida — el presupuesto ÚNICO contra el que se mide todo.
+
+    Antes convivían tres bases y cada indicador usaba una distinta (el %
+    avance contra `hh_actualizado`, el desvío contra `hh_proyec`): en cuanto
+    se reproyectaba un metrado, los números se contradecían entre sí.
+
+    Precedencia (decisión de Jean 2026-07-25, «Opción A» — mismo patrón que
+    `_hh_gastadas_unificada`):
+      1. hh_actualizado  → presupuesto aprobado por oficina (adicionales).
+         Es una decisión firmada: le gana a cualquier recálculo.
+      2. hh_proyec       → metrado_proyec × productividad presupuestada
+         (reproyección de alcance sin aprobación formal).
+      3. hh_presup       → contractual puro (es a lo que cae hh_proyec solo
+         cuando no hay metrado_proyec, así que queda cubierto por el nivel 2).
+
+    Equivale al «Current Budget» de Primavera P6: lo mueven los cambios
+    aprobados, no un cálculo automático. `0` se trata como "no configurado"
+    (misma convención que traía el campo).
+    """
+    hh_act = float(_get(partida, "hh_actualizado", None) or 0)
+    return hh_act if hh_act > 0 else hh_proyec
+
+
+def _bac_fila(f) -> float:
+    """BAC de una fila ya calculada. Usa `hh_bac` si viene; si no (filas
+    construidas a mano, p. ej. los golden tests del ISP del gerente), lo
+    reconstruye con la MISMA precedencia de `_bac`. Así `_totales`/`_agrupar`/
+    `_matriz_area_disciplina` siguen siendo puras y usables por separado."""
+    v = f.get("hh_bac") if hasattr(f, "get") else None
+    if v is not None:
+        return float(v)
+    hh_act = float(_get(f, "hh_actualizado", None) or 0)
+    return hh_act if hh_act > 0 else float(_get(f, "hh_proyec", 0.0) or 0.0)
+
+
 def _acum_a_semana(avances, semana: int) -> dict:
     acum = {}
     for a in avances:
@@ -101,7 +137,8 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int, split=None)
 
         prod_real = (gastadas_acum / cant_inst) if cant_inst > 0 else 0.0
         saldo_met = max(mp - cant_inst, 0.0)
-        eac_hh = (prod_real * saldo_met + gastadas_acum) if cant_inst > 0 else hh_proyec
+        bac = _bac(p, hh_proyec)
+        eac_hh = (prod_real * saldo_met + gastadas_acum) if cant_inst > 0 else bac
 
         filas.append({
             "partida_id": pid,
@@ -121,6 +158,8 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int, split=None)
             # Si la partida no lo trae, cae a hh_presup.
             "hh_actualizado": round(float(_get(p, "hh_actualizado", None) or hh_presup), 2),
             "hh_proyec": round(hh_proyec, 2),
+            # BAC único: el presupuesto contra el que se miden avance, VAC y TCPI
+            "hh_bac": round(bac, 2),
             "hh_ganadas_sem": round(ganadas_sem, 2),
             "hh_ganadas_acum": round(ganadas_acum, 2),
             "hh_gastadas_sem": round(gastadas_sem, 2),
@@ -135,19 +174,22 @@ def _calcular(partidas, hitos, avances, hh_rows, tareo, semana: int, split=None)
             "prod_presup": round(prod_presup, 4),
             "prod_real": round(prod_real, 4),
             "eac_hh": round(eac_hh, 2),
-            "desvio_hh": round(eac_hh - hh_proyec, 2),
+            # Desvío y VAC ya cuelgan del MISMO BAC que el % de avance
+            "desvio_hh": round(eac_hh - bac, 2),
+            "vac_hh": round(bac - eac_hh, 2),
         })
     return filas
 
 
 def _agrupar(filas, clave):
-    grupos = defaultdict(lambda: {"hh_presup": 0.0, "hh_proyec": 0.0,
+    grupos = defaultdict(lambda: {"hh_presup": 0.0, "hh_proyec": 0.0, "hh_bac": 0.0,
                                   "ganadas": 0.0, "gastadas": 0.0, "eac": 0.0})
     for f in filas:
         k = f[clave] or "SIN ASIGNAR"
         g = grupos[k]
         g["hh_presup"] += f.get("hh_presup", 0.0)
         g["hh_proyec"] += f["hh_proyec"]
+        g["hh_bac"] += _bac_fila(f)
         g["ganadas"] += f["hh_ganadas_acum"]
         g["gastadas"] += f["hh_gastadas_acum"]
         g["eac"] += f["eac_hh"]
@@ -157,9 +199,10 @@ def _agrupar(filas, clave):
             "grupo": k,
             "hh_presup": round(g["hh_presup"], 2),
             "hh_proyec": round(g["hh_proyec"], 2),
+            "hh_bac": round(g["hh_bac"], 2),
             "hh_ganadas": round(g["ganadas"], 2),
             "hh_gastadas": round(g["gastadas"], 2),
-            "pct_avance": round(g["ganadas"] / g["hh_proyec"], 4) if g["hh_proyec"] > 0 else 0,
+            "pct_avance": round(g["ganadas"] / g["hh_bac"], 4) if g["hh_bac"] > 0 else 0,
             "pf": round(g["ganadas"] / g["gastadas"], 3) if g["gastadas"] > 0 else 0,
             "eac_hh": round(g["eac"], 2),
         })
@@ -172,11 +215,13 @@ def _matriz_area_disciplina(hojas):
     (ganadas/proyec), PF (ganadas/gastadas) e incidencia (proyec/Σproyec).
     Subtotal por sistema y total general usan el mismo criterio (proyectada).
     """
-    tot_proyec_global = sum(f["hh_proyec"] for f in hojas) or 0.0
+    # Denominador de la incidencia = Σ BAC (mismo numerador que cada celda, así
+    # las incidencias siguen sumando 100%).
+    tot_proyec_global = sum(_bac_fila(f) for f in hojas) or 0.0
 
     def _celda():
-        return {"hh_contractual": 0.0, "hh_proyec": 0.0, "hh_ganadas": 0.0,
-                "hh_gastadas": 0.0, "eac": 0.0}
+        return {"hh_contractual": 0.0, "hh_proyec": 0.0, "hh_bac": 0.0,
+                "hh_ganadas": 0.0, "hh_gastadas": 0.0, "eac": 0.0}
 
     # areas[sistema][disciplina] = celda
     areas: dict = defaultdict(lambda: defaultdict(_celda))
@@ -186,6 +231,7 @@ def _matriz_area_disciplina(hojas):
         c = areas[area][disc]
         c["hh_contractual"] += f.get("hh_presup", 0.0)
         c["hh_proyec"] += f["hh_proyec"]
+        c["hh_bac"] += _bac_fila(f)
         c["hh_ganadas"] += f["hh_ganadas_acum"]
         c["hh_gastadas"] += f["hh_gastadas_acum"]
         c["eac"] += f["eac_hh"]
@@ -195,12 +241,14 @@ def _matriz_area_disciplina(hojas):
             **grupo,
             "hh_contractual": round(c["hh_contractual"], 2),
             "hh_proyec": round(c["hh_proyec"], 2),
+            "hh_bac": round(c["hh_bac"], 2),
             "hh_ganadas": round(c["hh_ganadas"], 2),
             "hh_gastadas": round(c["hh_gastadas"], 2),
             "eac_hh": round(c["eac"], 2),
-            "pct_avance": round(c["hh_ganadas"] / c["hh_proyec"], 4) if c["hh_proyec"] > 0 else 0,
+            # Avance e incidencia contra el BAC único (antes: hh_proyec)
+            "pct_avance": round(c["hh_ganadas"] / c["hh_bac"], 4) if c["hh_bac"] > 0 else 0,
             "pf": round(c["hh_ganadas"] / c["hh_gastadas"], 3) if c["hh_gastadas"] > 0 else 0,
-            "inc_proyec": round(c["hh_proyec"] / denom_inc, 4) if denom_inc > 0 else 0,
+            "inc_proyec": round(c["hh_bac"] / denom_inc, 4) if denom_inc > 0 else 0,
         }
 
     out_areas = []
@@ -249,10 +297,13 @@ def _calc_costo_mo(hh_por_cargo: dict, tarifas: dict, default=None):
 
 def _totales(hojas, improd_acum: float = 0.0):
     """Totales del proyecto (función pura, sobre las hojas del WBS).
-    #6: % avance del proyecto = ganadas / presupuesto ACTUALIZADO (no proyectada).
+    BAC ÚNICO (2026-07-25): % avance, desvío, VAC y TCPI cuelgan todos de
+    `hh_bac` (ver `_bac`). Antes el avance usaba `hh_actualizado` y el desvío
+    `hh_proyec`, y al reproyectar un metrado se contradecían.
     #5: las HH improductivas entran al consumo total y bajan el PF del proyecto.
     """
     tot_proyec = sum(f["hh_proyec"] for f in hojas)
+    tot_bac = sum(_bac_fila(f) for f in hojas)
     tot_actualizado = sum(f["hh_actualizado"] for f in hojas)
     tot_presup = sum(f.get("hh_presup", 0.0) for f in hojas)
     tot_ganadas = sum(f["hh_ganadas_acum"] for f in hojas)
@@ -268,6 +319,7 @@ def _totales(hojas, improd_acum: float = 0.0):
         "hh_proyec": round(tot_proyec, 2),
         "hh_presup": round(tot_presup, 2),
         "hh_actualizado": round(tot_actualizado, 2),
+        "hh_bac": round(tot_bac, 2),
         "hh_ganadas_acum": round(tot_ganadas, 2),
         "hh_gastadas_acum": round(tot_gastadas, 2),
         "hh_ganadas_sem": round(tot_gan_sem, 2),
@@ -278,8 +330,10 @@ def _totales(hojas, improd_acum: float = 0.0):
         "hh_improductivas_acum": round(improd_acum, 2),
         "hh_consumidas_acum": round(tot_consumidas, 2),
         "index_improductividad": round(improd_acum / tot_consumidas, 4) if tot_consumidas > 0 else 0,
-        # #6: % avance del proyecto = ganadas / presupuesto ACTUALIZADO (método del gerente)
-        "pct_avance": round(tot_ganadas / tot_actualizado, 4) if tot_actualizado > 0 else 0,
+        # % avance del proyecto = ganadas / BAC (presupuesto vigente único)
+        "pct_avance": round(tot_ganadas / tot_bac, 4) if tot_bac > 0 else 0,
+        # Referencia: el mismo avance medido contra la reproyección de metrado.
+        # Coincide con pct_avance salvo que oficina haya fijado hh_actualizado.
         "pct_avance_proyec": round(tot_ganadas / tot_proyec, 4) if tot_proyec > 0 else 0,
         # PF del proyecto: titular incluye improductivas + variante productiva (referencia)
         "pf_acum": round(tot_ganadas / tot_consumidas, 3) if tot_consumidas > 0 else 0,
@@ -287,5 +341,11 @@ def _totales(hojas, improd_acum: float = 0.0):
         "pf_dir_acum": round(tot_ganadas / tot_consumidas_dir, 3) if tot_consumidas_dir > 0 else 0,
         "pf_sem": round(tot_gan_sem / tot_gas_sem, 3) if tot_gas_sem > 0 else 0,
         "eac_hh": round(tot_eac, 2),
-        "desvio_hh": round(tot_eac - tot_proyec, 2),
+        "desvio_hh": round(tot_eac - tot_bac, 2),
+        # Indicadores EVM estándar, ya coherentes entre sí (mismo BAC):
+        #   VAC  = BAC − EAC        (cuánto se desviará al término)
+        #   TCPI = (BAC−EV)/(BAC−AC) (ritmo necesario para todavía cumplir)
+        "vac_hh": round(tot_bac - tot_eac, 2),
+        "tcpi": (round((tot_bac - tot_ganadas) / (tot_bac - tot_consumidas), 3)
+                 if tot_bac - tot_consumidas > 0 else None),
     }

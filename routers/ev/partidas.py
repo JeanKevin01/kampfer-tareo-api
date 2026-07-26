@@ -34,6 +34,45 @@ router = APIRouter()
 router_campo = APIRouter()
 
 
+# ---------------------- Catálogo de fases (disciplina) ----------------------
+# `ev_partidas.fase` es el eje DISCIPLINA de la matriz Área×Disciplina y la
+# clave con la que el RO cruza costo↔meta POR IGUALDAD DE STRING. Cuando era
+# texto libre, una variante ('est' vs 'EST') partía el cruce en dos y
+# descuadraba el Resultado Operativo sin avisar.
+#
+# Equivale a un Activity Code de Primavera P6 (código + nombre + color + orden):
+# el catálogo `fases` (migración 0018) ya tiene esa forma; aquí se CONECTA.
+def _norm_fase(v) -> Optional[str]:
+    """MAYÚSCULAS + espacios colapsados, máx 20 (mismo criterio que
+    routers/fases.py::_norm_codigo). None si viene vacío — un nodo PADRE del
+    WBS legítimamente no tiene fase."""
+    t = " ".join(str(v or "").split()).upper()
+    return t[:20] or None
+
+
+async def _asegurar_fases(con, codigos, proyecto_id: int = 1) -> list:
+    """Da de alta en el catálogo las fases usadas que aún no existan.
+
+    Auto-alta (no rechazo) a propósito: una importación de partidas nuevas no
+    debe bloquearse porque la disciplina todavía no esté en el catálogo. Se
+    devuelven las creadas para poder AVISAR en la respuesta, y oficina las
+    completa después (nombre/color/orden) desde la Guía de Fases.
+    """
+    nuevas = []
+    for c in sorted({c for c in codigos if c}):
+        creada = await con.fetchval(
+            """INSERT INTO fases (proyecto_id, codigo, nombre, orden)
+               VALUES ($1, $2, $3, 999)
+               ON CONFLICT (proyecto_id, codigo) DO NOTHING
+               RETURNING codigo""",
+            proyecto_id, c, f"Fase {c}")
+        if creada:
+            nuevas.append(creada)
+    if nuevas:
+        log.info("fases_autocreadas", extra={"fases": nuevas, "proyecto_id": proyecto_id})
+    return nuevas
+
+
 # ---------------------- CRUD Partidas ----------------------
 @router.get("/partidas")
 async def listar_partidas(otm: Optional[str] = None):
@@ -71,9 +110,12 @@ async def listar_otms_ev():
 @router.post("/partidas")
 async def crear_partida(body: PartidaIn):
     _validar_pesos(body.hitos)
+    body.fase = _norm_fase(body.fase)
+    body.sub_fase = _norm_fase(body.sub_fase)
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
+            await _asegurar_fases(con, [body.fase])
             try:
                 pid = await con.fetchval(
                     """INSERT INTO ev_partidas
@@ -100,9 +142,12 @@ async def crear_partida(body: PartidaIn):
 @router.put("/partidas/{partida_id}")
 async def actualizar_partida(partida_id: int, body: PartidaIn):
     _validar_pesos(body.hitos)
+    body.fase = _norm_fase(body.fase)
+    body.sub_fase = _norm_fase(body.sub_fase)
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
+            await _asegurar_fases(con, [body.fase])
             res = await con.execute(
                 """UPDATE ev_partidas SET codigo=$2, otm_id=$3, fase=$4, sub_fase=$5,
                    descripcion=$6, unidad=$7, sistema=$8, metrado_presup=$9,
@@ -173,6 +218,10 @@ async def importar(body: ImportarIn):
                     parent_codigo = sep.join(p.codigo.split(sep)[:-1])
                 tipo_costo = _norm_tipo_costo(p.tipo_costo)
                 naturaleza = _norm_naturaleza(p.naturaleza)
+                # Disciplina normalizada ANTES de decidir si el nodo es padre
+                # (fase None = nodo padre del WBS, sin hitos).
+                p.fase = _norm_fase(p.fase)
+                p.sub_fase = _norm_fase(p.sub_fase)
                 if not p.sistema and p.otm_id:
                     p.sistema = areas_proy.get(p.otm_id)
 
@@ -233,6 +282,12 @@ async def importar(body: ImportarIn):
 
             if errores:
                 raise HTTPException(400, {"errores": errores})
+
+            # Disciplinas nuevas → alta automática en el catálogo, para que la
+            # matriz Área×Disciplina y el cruce del RO nunca vean un string
+            # huérfano. Se informan para que oficina las complete.
+            fases_nuevas = await _asegurar_fases(
+                con, [p.fase for p in body.partidas])
 
             # mapa hito (partida, numero) -> id para el histórico
             hitos_db = await con.fetch("SELECT id, partida_id, numero FROM ev_hitos")
@@ -295,6 +350,9 @@ async def importar(body: ImportarIn):
         "partidas_actualizadas": actualizadas,
         "avances_importados": av_ins,
         "hh_importadas": hh_ins,
+        # Disciplinas dadas de alta solas: oficina debería ponerles nombre y
+        # color en la Guía de Fases (salen como "Fase XX" hasta entonces).
+        "fases_nuevas": fases_nuevas,
     }
 
 
