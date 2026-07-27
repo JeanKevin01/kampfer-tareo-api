@@ -117,14 +117,19 @@ async def crear_partida(body: PartidaIn):
         async with con.transaction():
             await _asegurar_fases(con, [body.fase])
             try:
+                # naturaleza / tipo_costo se persisten (antes se caían al
+                # default): así un ADICIONAL creado desde Programación queda
+                # marcado como tal y el ISP puede separarlo del contractual.
                 pid = await con.fetchval(
                     """INSERT INTO ev_partidas
                        (codigo, otm_id, fase, sub_fase, descripcion, unidad, sistema,
-                        metrado_presup, metrado_proyec, hh_presup, hh_actualizado)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id""",
+                        metrado_presup, metrado_proyec, hh_presup, hh_actualizado,
+                        naturaleza, tipo_costo)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id""",
                     body.codigo, body.otm_id, body.fase, body.sub_fase, body.descripcion,
                     body.unidad, body.sistema, body.metrado_presup,
                     body.metrado_proyec, body.hh_presup, body.hh_actualizado,
+                    _norm_naturaleza(body.naturaleza), _norm_tipo_costo(body.tipo_costo),
                 )
             except asyncpg.UniqueViolationError:
                 raise HTTPException(

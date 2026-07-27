@@ -106,6 +106,21 @@ def limpiar_y_sembrar(cur):
             "INSERT INTO ev_hitos (partida_id, numero, descripcion, peso, es_principal) "
             "VALUES (%s,1,'Ejecución',1.0,true) RETURNING id", (pid,))
         partidas[codigo] = {"id": pid, "hito_id": cur.fetchone()[0]}
+
+    # Partidas DESECHABLES para las pruebas de programación (calendario, plazos,
+    # vínculos): desde 0034 una actividad con metrado exige partida, y esas
+    # pruebas necesitan una limpia —sin avances registrados— para que el
+    # prorrateo salga predecible. Una por actividad, para que no se estorben.
+    for i in range(1, 13):
+        cur.execute(
+            "INSERT INTO ev_partidas (codigo, fase, descripcion, unidad, metrado_presup, "
+            "hh_presup, otm_id) VALUES (%s,'F-E2E',%s,'und',100000,100000,'OTM-E2E') RETURNING id",
+            (f"E2E-L{i:02d}", f"Partida de programación {i}"))
+        pid = cur.fetchone()[0]
+        cur.execute(
+            "INSERT INTO ev_hitos (partida_id, numero, descripcion, peso, es_principal) "
+            "VALUES (%s,1,'Ejecución',1.0,true)", (pid,))
+        partidas[f"L{i:02d}"] = {"id": pid}
     return partidas
 
 
@@ -431,7 +446,7 @@ def main():
     r = c.put(f"{API}/ev/programacion/config", json={"proyecto_id": 1, "dias_semana": [1, 2, 3, 4, 5, 6]})
     r2 = c.post(f"{API}/ev/programacion/actividades", json={
         "proyecto_id": 1, "fecha": "2026-06-05", "fecha_fin": "2026-06-08",
-        "otm_id": "OTM-E2E", "titulo": "E2E Con calendario y salto",
+        "otm_id": "OTM-E2E", "titulo": "E2E Con calendario y salto", "partida_id": partidas["L01"]["id"],
         "metrado_prog": 90, "dias_salto": ["2026-06-06"]})
     act5 = r2.json() if r2.status_code == 200 else {}
     r3 = c.get(f"{API}/ev/programacion/lookahead-grid",
@@ -543,7 +558,7 @@ def main():
     # P25 — F4 v2: medio día pesa 0.5 en el prorrateo (90 en L/M◐/X → 36/18/36)
     r = c.post(f"{API}/ev/programacion/actividades", json={
         "proyecto_id": 1, "fecha": "2026-06-08", "fecha_fin": "2026-06-10",
-        "otm_id": "OTM-E2E", "titulo": "E2E Medio dia", "metrado_prog": 90,
+        "otm_id": "OTM-E2E", "titulo": "E2E Medio dia", "partida_id": partidas["L02"]["id"], "metrado_prog": 90,
         "dias_medio": ["2026-06-09"]})
     act7 = r.json() if r.status_code == 200 else {}
     r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
@@ -562,7 +577,7 @@ def main():
     # act7 (08-10) será antecesora de act8 (11-12); el ciclo inverso da 409.
     r = c.post(f"{API}/ev/programacion/actividades", json={
         "proyecto_id": 1, "fecha": "2026-06-11", "fecha_fin": "2026-06-12",
-        "otm_id": "OTM-E2E", "titulo": "E2E Sucesora", "metrado_prog": 40})
+        "otm_id": "OTM-E2E", "titulo": "E2E Sucesora", "partida_id": partidas["L03"]["id"], "metrado_prog": 40})
     act8 = r.json() if r.status_code == 200 else {}
     r2 = c.post(f"{API}/ev/programacion/actividades/{act8.get('id')}/dependencias",
                 json={"predecesora_id": act7.get("id"), "lag_dias": 0})
@@ -619,7 +634,7 @@ def main():
     # así que el metrado se reparte 2:1 (lo que el planner pidió poder hacer).
     r = c.post(f"{API}/ev/programacion/actividades", json={
         "proyecto_id": 1, "fecha": "2026-06-15", "otm_id": "OTM-E2E",
-        "titulo": "E2E Plazo dia y medio", "metrado_prog": 90, "plazo_dias": 1.5})
+        "titulo": "E2E Plazo dia y medio", "partida_id": partidas["L04"]["id"], "metrado_prog": 90, "plazo_dias": 1.5})
     act54 = r.json() if r.status_code == 200 else {}
     r2 = c.get(f"{API}/ev/programacion/lookahead-grid",
                params={"proyecto_id": 1, "desde": "2026-06-15", "semanas": 2})
@@ -638,7 +653,7 @@ def main():
     # llegan al lunes 22 porque el domingo 21 no se trabaja.
     r = c.post(f"{API}/ev/programacion/actividades", json={
         "proyecto_id": 1, "fecha": "2026-06-19", "otm_id": "OTM-E2E",
-        "titulo": "E2E Plazo salta domingo", "metrado_prog": 30, "plazo_dias": 3})
+        "titulo": "E2E Plazo salta domingo", "partida_id": partidas["L05"]["id"], "metrado_prog": 30, "plazo_dias": 3})
     act55 = r.json() if r.status_code == 200 else {}
     check("P55 el plazo cuenta días hábiles: 3 días desde el vie 19 terminan el lun 22",
           r.status_code == 200 and str(act55.get("fecha_fin")) == "2026-06-22",
@@ -660,7 +675,7 @@ def main():
     # sino un día hábil después, conservando SU plazo (traslape típico de obra).
     r = c.post(f"{API}/ev/programacion/actividades", json={
         "proyecto_id": 1, "fecha": "2026-06-15", "otm_id": "OTM-E2E",
-        "titulo": "E2E SS sucesora", "metrado_prog": 40, "plazo_dias": 2})
+        "titulo": "E2E SS sucesora", "partida_id": partidas["L06"]["id"], "metrado_prog": 40, "plazo_dias": 2})
     act57 = r.json() if r.status_code == 200 else {}
     r2 = c.post(f"{API}/ev/programacion/actividades/{act57.get('id')}/dependencias",
                 json={"predecesora_id": act55.get("id"), "tipo": "SS", "lag_dias": 1})
@@ -681,7 +696,8 @@ def main():
     for i in range(3):
         r = c.post(f"{API}/ev/programacion/actividades", json={
             "proyecto_id": 1, "fecha": "2026-06-15", "otm_id": "OTM-E2E",
-            "titulo": f"E2E Cadena {i + 1}", "metrado_prog": 10, "plazo_dias": 1})
+            "titulo": f"E2E Cadena {i + 1}", "partida_id": partidas[f"L{i + 7:02d}"]["id"],
+            "metrado_prog": 10, "plazo_dias": 1})
         ids58.append(r.json().get("id") if r.status_code == 200 else None)
     r = c.post(f"{API}/ev/programacion/dependencias/encadenar",
                json={"ids": ids58, "tipo": "FS", "lag_dias": 0})
@@ -713,11 +729,11 @@ def main():
     c.put(f"{API}/ev/programacion/config", json={"proyecto_id": 1, "dias_semana": [1, 2, 3, 4, 5, 6, 7]})
     r = c.post(f"{API}/ev/programacion/actividades", json={
         "proyecto_id": 1, "fecha": "2026-09-07", "otm_id": "OTM-E2E",
-        "titulo": "E2E Vinculo A", "metrado_prog": 100, "plazo_dias": 3})
+        "titulo": "E2E Vinculo A", "partida_id": partidas["L10"]["id"], "metrado_prog": 100, "plazo_dias": 3})
     a60 = r.json() if r.status_code == 200 else {}
     r = c.post(f"{API}/ev/programacion/actividades", json={
         "proyecto_id": 1, "fecha": "2026-09-07", "otm_id": "OTM-E2E",
-        "titulo": "E2E Vinculo B", "metrado_prog": 100, "plazo_dias": 2})
+        "titulo": "E2E Vinculo B", "partida_id": partidas["L11"]["id"], "metrado_prog": 100, "plazo_dias": 2})
     b60 = r.json() if r.status_code == 200 else {}
     rangos = {}
     for tipo in ("FS", "SS", "FF"):
@@ -747,6 +763,55 @@ def main():
           r.status_code == 200 and b61.get("fecha") == "2026-09-08"
           and b61.get("fecha_fin") == "2026-09-09",
           f"status={r.status_code} rango={b61.get('fecha')}..{b61.get('fecha_fin')}")
+
+    # P62 — METRADO SIN PARTIDA: el error silencioso que castigaba el PPC.
+    # Con metrado exige partida (no hay dónde anotar el avance real y el PPC la
+    # cuenta como no cumplida); SIN metrado es una actividad de apoyo legítima.
+    r_mal = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-09-07", "otm_id": "OTM-E2E",
+        "titulo": "E2E Metrado huerfano", "metrado_prog": 90})
+    r_ok = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-09-07", "otm_id": "OTM-E2E",
+        "titulo": "E2E Charla de seguridad"})
+    check("P62 metrado sin partida da 400; la actividad de apoyo sin metrado se crea",
+          r_mal.status_code == 400 and "partida" in r_mal.json().get("detail", "").lower()
+          and r_ok.status_code == 200 and r_ok.json().get("partida_id") is None,
+          f"mal={r_mal.status_code} ok={r_ok.status_code} detalle={r_mal.text[:120]}")
+
+    # P63 — ADICIONAL no presupuestado: se crea su partida con HH 0 (el dato
+    # llega al aprobarlo) y el grid devuelve la señal para pintarla en rojo;
+    # al cargar las HH la señal desaparece.
+    r = c.post(f"{API}/ev/partidas", json={
+        "codigo": "E2E-ADIC", "otm_id": "OTM-E2E", "descripcion": "Adicional E2E",
+        "unidad": "m3", "fase": "F-E2E", "metrado_presup": 50, "hh_presup": 0,
+        "naturaleza": "ADICIONAL",
+        "hitos": [{"numero": 1, "descripcion": "Ejecución", "peso": 1, "es_principal": True}]})
+    pad = r.json().get("id") if r.status_code == 200 else None
+    r2 = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-09-07", "otm_id": "OTM-E2E",
+        "titulo": "E2E Trabajo adicional", "metrado_prog": 50,
+        "partida_id": pad, "plazo_dias": 2})
+    aad = r2.json() if r2.status_code == 200 else {}
+
+    def _fila_adic():
+        g = c.get(f"{API}/ev/programacion/lookahead-grid",
+                  params={"proyecto_id": 1, "desde": "2026-09-07", "semanas": 2})
+        return next((x for gr in g.json().get("grupos", []) for x in gr["actividades"]
+                     if x["id"] == aad.get("id")), {})
+    antes = _fila_adic()
+    c.put(f"{API}/ev/partidas/{pad}", json={
+        "codigo": "E2E-ADIC", "otm_id": "OTM-E2E", "descripcion": "Adicional E2E",
+        "unidad": "m3", "fase": "F-E2E", "metrado_presup": 50, "hh_presup": 320,
+        "naturaleza": "ADICIONAL",
+        "hitos": [{"numero": 1, "descripcion": "Ejecución", "peso": 1, "es_principal": True}]})
+    despues = _fila_adic()
+    check("P63 adicional: nace con HH 0 marcado en rojo y deja de estarlo al cargarlas",
+          r.status_code == 200 and r2.status_code == 200
+          and antes.get("partida_naturaleza") == "ADICIONAL"
+          and antes.get("partida_hh_presup") == 0
+          and despues.get("partida_hh_presup") == 320,
+          f"crear={r.status_code} act={r2.status_code} antes={antes.get('partida_hh_presup')} "
+          f"nat={antes.get('partida_naturaleza')} despues={despues.get('partida_hh_presup')}")
 
     c.put(f"{API}/ev/programacion/config",           # se restaura el calendario
           json={"proyecto_id": 1, "dias_semana": [1, 2, 3, 4, 5, 6, 7]})

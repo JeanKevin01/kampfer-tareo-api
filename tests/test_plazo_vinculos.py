@@ -267,3 +267,37 @@ def test_encadenar_supervisor_403():
     r = _client().post("/ev/programacion/dependencias/encadenar",
                        json={"ids": [1, 2]}, headers=_hdr("supervisor", "S1"))
     assert r.status_code == 403
+
+
+# ── Metrado sin partida: el error silencioso que castigaba el PPC ──
+def test_exigir_partida_deja_pasar_lo_legitimo():
+    from routers.programacion import _exigir_partida
+    _exigir_partida(None, None)      # actividad de apoyo (reunión, traslado)
+    _exigir_partida(0, None)         # metrado vacío
+    _exigir_partida(90, 5)           # producción con su partida
+    _exigir_partida(None, 5)
+
+
+def test_exigir_partida_bloquea_metrado_huerfano():
+    from routers.programacion import _exigir_partida
+    with pytest.raises(HTTPException) as e:
+        _exigir_partida(90, None)
+    assert e.value.status_code == 400
+    assert "partida" in e.value.detail.lower()
+
+
+def test_crear_actividad_con_metrado_sin_partida_400():
+    r = _client().post("/ev/programacion/actividades",
+                       json={"fecha": "2026-07-13", "titulo": "Relleno", "metrado_prog": 90},
+                       headers=_hdr("oficina"))
+    assert r.status_code == 400
+    assert "partida" in r.json()["detail"].lower()
+
+
+def test_crear_actividad_de_apoyo_sin_metrado_pasa_la_validacion():
+    """Sin metrado NO es un error: es una actividad de apoyo. Llega hasta la
+    BD (que no hay en este test), o sea que la validación la dejó pasar."""
+    r = _client().post("/ev/programacion/actividades",
+                       json={"fecha": "2026-07-13", "titulo": "Charla de seguridad"},
+                       headers=_hdr("oficina"))
+    assert r.status_code != 400

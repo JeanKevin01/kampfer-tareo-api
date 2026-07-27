@@ -361,6 +361,7 @@ def _parse_saltos(v) -> list:
 _ACT_SQL = """
     SELECT a.*, o.descripcion AS otm_desc, s.nombre AS supervisor_nombre,
            ev.codigo AS partida_codigo, ev.descripcion AS partida_desc,
+           ev.hh_presup AS partida_hh_presup, ev.naturaleza AS partida_naturaleza,
            (SELECT count(*) FROM prog_restricciones pr
              WHERE pr.actividad_id = a.id) AS rest_total,
            (SELECT count(*) FROM prog_restricciones pr
@@ -433,6 +434,25 @@ async def semana(proyecto_id: int = 1, lunes: str = ""):
             "actividades": acts, "reportes": reps}
 
 
+def _exigir_partida(metrado: Optional[float], partida_id: Optional[int]) -> None:
+    """Una actividad CON metrado tiene que colgar de una partida de control.
+
+    Sin partida el metrado programado es un espejismo: el avance real se guarda
+    en `ev_avances_diarios` POR PARTIDA, así que no hay dónde anotarlo; la
+    actividad no suma al valor ganado ni a la curva S; y —lo peor, porque es
+    silencioso— el PPC la toma como comprometida con alcanzado 0 y la cuenta
+    como NO CUMPLIDA al cerrar la semana, aunque el trabajo se haya hecho.
+
+    Sin metrado sí es legítima: es una actividad de apoyo (reunión, traslado,
+    capacitación) y el PPC la evalúa por estado."""
+    if metrado and not partida_id:
+        raise HTTPException(400,
+            "Una actividad con metrado tiene que colgar de una partida de control: "
+            "sin ella no se puede registrar el avance real, no suma al valor ganado "
+            "y el PPC la contará como no cumplida. Elige la partida, o deja el "
+            "metrado vacío si es una actividad de apoyo (reunión, traslado…).")
+
+
 _MODOS_FECHA = ("INICIO_PLAZO", "FIN_PLAZO", "INICIO_FIN")
 
 
@@ -487,6 +507,7 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
         raise HTTPException(400, "Un día no puede ser salto y medio día a la vez")
     partida_id = int(data["partida_id"]) if data.get("partida_id") else None
     hito_id = int(data["hito_id"]) if data.get("hito_id") else None
+    _exigir_partida(metrado, partida_id)
     proyecto_id = int(data.get("proyecto_id") or 1)
     modo = _parse_modo(data.get("modo_fecha"))
     plazo = _parse_plazo(data.get("plazo_dias"))
@@ -591,6 +612,13 @@ async def editar_actividad(act_id: int, data: dict):
                 "SELECT * FROM prog_actividades WHERE id = $1 FOR UPDATE", act_id)
             if not actual:
                 raise HTTPException(404, "Actividad no encontrada")
+            # Solo se valida cuando el patch toca alguno de los dos campos: así
+            # una edición inocua (el título) sobre una actividad que YA venía
+            # mal no queda bloqueada, pero cualquier cambio de metrado o de
+            # partida obliga a dejarla coherente.
+            if {"metrado_prog", "partida_id"} & data.keys():
+                fus = {**dict(actual), **dict(zip(campos, valores))}
+                _exigir_partida(fus.get("metrado_prog"), fus.get("partida_id"))
             # Las fechas se resuelven ANTES de escribir, en un solo UPDATE: si
             # se escribiera la F.Inicio primero, mover una actividad más allá de
             # su antiguo fin violaría el CHECK (fecha_fin >= fecha) de 0019.
@@ -1447,6 +1475,12 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "fecha": str(a["fecha"]), "fecha_fin": str(a["fecha_fin"] or a["fecha"]),
             "otm_id": a["otm_id"], "partida_id": a["partida_id"],
             "partida_codigo": a["partida_codigo"], "partida_desc": a["partida_desc"],
+            # Adicional al que todavía no le llegó el presupuesto de HH: el
+            # panel lo pinta en rojo para que sea fácil de completar después
+            # (el dato del adicional se sabe al aprobarlo o al terminarlo).
+            "partida_hh_presup": (float(a["partida_hh_presup"])
+                                  if a["partida_hh_presup"] is not None else None),
+            "partida_naturaleza": a["partida_naturaleza"],
             "responsable": a["responsable"], "supervisor_id": a["supervisor_id"],
             "supervisor_nombre": a["supervisor_nombre"],
             "causa_nc": a["causa_nc"], "causa_nc_cat": a["causa_nc_cat"],

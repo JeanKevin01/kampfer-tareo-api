@@ -26,6 +26,8 @@ class PartidaIn(BaseModel):
     metrado_proyec: Optional[float] = None
     hh_presup: float = 0
     hh_actualizado: Optional[float] = None   # #6: presupuesto actualizado (default = hh_presup)
+    tipo_costo: Optional[str] = None         # 'DIRECTO' (def) | 'INDIRECTO'
+    naturaleza: Optional[str] = None         # 'CONTRACTUAL' (def) | 'ADICIONAL'
     hitos: list[HitoIn]
 
 
