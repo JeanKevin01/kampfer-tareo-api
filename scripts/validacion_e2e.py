@@ -1323,6 +1323,69 @@ def main():
           and vacio.get("partida", {}).get("codigo") == "E2E-001",
           f"status={r.status_code} reportes={len(vacio.get('reportes', []))}")
 
+    # P64 — DOS TRAMOS de la misma partida: el avance de uno no puede
+    # atribuirse al otro (0035). Antes las dos filas mostraban el mismo real,
+    # el segundo tramo se quedaba sin plan al re-prorratearse y en el PPC las
+    # dos se daban por cumplidas con el trabajo de una sola.
+    r = c.post(f"{API}/ev/partidas", json={
+        "codigo": "E2E-TRAMOS", "otm_id": "OTM-E2E", "descripcion": "Partida en dos tramos",
+        "unidad": "m2", "fase": "F-E2E", "metrado_presup": 100, "hh_presup": 200,
+        "hitos": [{"numero": 1, "descripcion": "Ejecución", "peso": 1, "es_principal": True}]})
+    ptr = r.json().get("id") if r.status_code == 200 else None
+    tr = []
+    for tit, ini, fin in (("E2E Tramo A", "2026-09-14", "2026-09-16"),
+                          ("E2E Tramo B", "2026-09-17", "2026-09-19")):
+        rr = c.post(f"{API}/ev/programacion/actividades", json={
+            "proyecto_id": 1, "fecha": ini, "fecha_fin": fin, "otm_id": "OTM-E2E",
+            "titulo": tit, "partida_id": ptr, "metrado_prog": 50})
+        tr.append(rr.json().get("id") if rr.status_code == 200 else None)
+    c.post(f"{API}/ev/programacion/actividades/{tr[0]}/avance-dia",
+           json={"fecha": "2026-09-15", "cantidad": 50})
+
+    def _tramos():
+        g = c.get(f"{API}/ev/programacion/lookahead-grid",
+                  params={"proyecto_id": 1, "desde": "2026-09-14", "semanas": 1})
+        f = {x["id"]: x for gr in g.json().get("grupos", []) for x in gr["actividades"]}
+        return f.get(tr[0], {}), f.get(tr[1], {})
+    ta, tb = _tramos()
+    # Tocar B fuerza su re-prorrateo: es donde antes perdía todo su plan.
+    c.put(f"{API}/ev/programacion/actividades/{tr[1]}",
+          json={"fecha": "2026-09-17", "fecha_fin": "2026-09-19"})
+    _ta2, tb2 = _tramos()
+    check("P64 dos tramos de una partida: el real es de su tramo y el otro conserva su plan",
+          "2026-09-15" in ta.get("real", {}) and "2026-09-15" not in tb.get("real", {})
+          and ta.get("tramos") == 2
+          and abs(sum(v for v in tb2.get("prog", {}).values()) - 50) < 0.01,
+          f"A.real={ta.get('real')} B.real={tb.get('real')} B.prog={tb2.get('prog')}")
+
+    # P65 — WBS de las partidas creadas fuera del importador (bandeja «por
+    # ubicar»): nacen colgadas de su padre y una sin OTM se puede ubicar
+    # después, con 409 explicado si el código ya existe en la OTM destino.
+    r = c.post(f"{API}/ev/partidas", json={
+        "codigo": "E2E-001.09", "otm_id": "OTM-E2E", "descripcion": "Hija de E2E-001",
+        "unidad": "m", "fase": "F-E2E", "metrado_presup": 5, "hh_presup": 5,
+        "hitos": [{"numero": 1, "descripcion": "Ejecución", "peso": 1, "es_principal": True}]})
+    hija = next((x for x in c.get(f"{API}/ev/partidas?otm=OTM-E2E").json()
+                 if x["codigo"] == "E2E-001.09"), {})
+    r2 = c.post(f"{API}/ev/partidas", json={
+        "codigo": "E2E-SINOTM", "descripcion": "Sin OTM todavia", "unidad": "glb",
+        "fase": "F-E2E", "metrado_presup": 3, "hh_presup": 0,
+        "hitos": [{"numero": 1, "descripcion": "Ejecución", "peso": 1, "es_principal": True}]})
+    suelta = r2.json().get("id") if r2.status_code == 200 else None
+    band = c.get(f"{API}/ev/partidas-por-ubicar").json()
+    en_bandeja = next((x for x in band if x["id"] == suelta), {})
+    r3 = c.put(f"{API}/ev/partidas/{suelta}/ubicar",
+               json={"otm_id": "OTM-E2E", "parent_codigo": "E2E-001"})
+    r4 = c.put(f"{API}/ev/partidas/{suelta}/ubicar",
+               json={"otm_id": "OTM-E2E", "codigo": "E2E-001"})
+    check("P65 partida nueva cuelga del WBS; la de la bandeja se ubica y el código repetido da 409",
+          r.status_code == 200 and hija.get("parent_codigo") == "E2E-001"
+          and hija.get("nivel") == 2
+          and "SIN_OTM" in en_bandeja.get("motivos", []) and r3.status_code == 200
+          and r3.json().get("parent_codigo") == "E2E-001" and r4.status_code == 409,
+          f"hija={hija.get('nivel')}/{hija.get('parent_codigo')} bandeja={en_bandeja.get('motivos')} "
+          f"ubicar={r3.status_code} choque={r4.status_code}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")

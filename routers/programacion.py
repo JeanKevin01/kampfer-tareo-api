@@ -269,6 +269,64 @@ def _resolver_fechas(modo: str, campo: str, inicio: date, fin: date, plazo: Opti
     return recalc_plazo()                    # …salvo que se escriba a propósito
 
 
+# ── Atribución del avance real cuando una partida se programa en varios tramos ──
+# El avance real vive en `ev_avances_diarios` por (partida, fecha, etapa): NO
+# sabe de qué actividad del LookAhead vino. Mientras una partida-etapa tenga una
+# sola actividad da igual, pero programarla en dos tramos (lo normal en un
+# lookahead rodante y en obras de misceláneos) hacía que las dos se repartieran
+# MAL el mismo real: las dos lo mostraban en la cuadrícula, las dos lo
+# descontaban de su saldo (la segunda se quedaba sin plan) y en el PPC las dos
+# se daban por cumplidas con el trabajo de una.
+#
+# Regla, en orden y pensada para ser explicable al planner:
+#   1. si el registro dice de qué actividad vino (`actividad_id`, migración
+#      0035 — lo pone el avance registrado DESDE una actividad), manda eso;
+#   2. si no, es de la actividad cuyo rango CUBRE ese día; si varias lo cubren
+#      (la partida se reprogramó encima), de la ÚLTIMA programada;
+#   3. si ninguna lo cubre (se trabajó fuera de lo planificado), de la última
+#      que terminó antes, y si no hay ninguna antes, de la primera de todas.
+# Así ningún real se pierde y con una sola actividad el resultado es el de
+# siempre.
+def _dueno_del_real(items, acts: list) -> dict:
+    """{fecha: actividad_id}. `items` es un iterable de fechas o de pares
+    (fecha, actividad_id) — con el par se respeta el dueño ya registrado."""
+    if not acts:
+        return {}
+    vivas = {a["id"] for a in acts}
+    orden = sorted(acts, key=lambda a: (a["fecha"], a["id"]))
+    out = {}
+    for it in items:
+        f, explicito = it if isinstance(it, tuple) else (it, None)
+        if explicito in vivas:
+            out[f] = explicito
+            continue
+        dentro = [a for a in orden if a["fecha"] <= f <= (a["fecha_fin"] or a["fecha"])]
+        if dentro:
+            out[f] = max(dentro, key=lambda a: a["id"])["id"]
+            continue
+        antes = sorted((a for a in orden if (a["fecha_fin"] or a["fecha"]) < f),
+                       key=lambda a: (a["fecha_fin"] or a["fecha"], a["id"]))
+        out[f] = antes[-1]["id"] if antes else orden[0]["id"]
+    return out
+
+
+_HITO_CLAVE = """
+    COALESCE(hito_id, (SELECT id FROM ev_hitos h WHERE h.partida_id = $1
+                        ORDER BY h.es_principal DESC, h.peso DESC, h.id LIMIT 1))
+      = COALESCE($2, (SELECT id FROM ev_hitos h WHERE h.partida_id = $1
+                        ORDER BY h.es_principal DESC, h.peso DESC, h.id LIMIT 1))
+"""
+
+
+async def _hermanas(con, partida_id: int, hito_id: Optional[int]) -> list:
+    """Actividades vivas de la MISMA partida y etapa (incluida la propia)."""
+    return [dict(r) for r in await con.fetch(
+        f"""SELECT id, fecha, COALESCE(fecha_fin, fecha) AS fecha_fin
+              FROM prog_actividades
+             WHERE partida_id = $1 AND estado <> 'CANCELADO' AND {_HITO_CLAVE}""",
+        partida_id, hito_id)]
+
+
 async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) -> None:
     """Recalcula la distribución diaria del metrado de la actividad. El metrado
     META es inmutable aquí (solo se cambia desde el formulario):
@@ -297,17 +355,19 @@ async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) 
         # rango viejo sigue descontando del saldo (si no, el metrado completo
         # reaparecería prorrateado como si nada se hubiera hecho). Una
         # actividad del hito principal equivale a una sin hito (NULL).
-        reales = {r["fecha"]: float(r["cantidad_dia"]) for r in await con.fetch(
-            """SELECT fecha, cantidad_dia FROM ev_avances_diarios ad
-               WHERE partida_id = $1
-                 AND cantidad_dia IS NOT NULL
-                 AND COALESCE(ad.hito_id, (SELECT id FROM ev_hitos h
-                       WHERE h.partida_id = $1
-                       ORDER BY h.es_principal DESC, h.peso DESC, h.id LIMIT 1))
-                     = COALESCE($2, (SELECT id FROM ev_hitos h
-                       WHERE h.partida_id = $1
-                       ORDER BY h.es_principal DESC, h.peso DESC, h.id LIMIT 1))""",
-            act["partida_id"], act.get("hito_id"))}
+        filas = await con.fetch(
+            f"""SELECT fecha, cantidad_dia, actividad_id FROM ev_avances_diarios ad
+               WHERE partida_id = $1 AND cantidad_dia IS NOT NULL AND {_HITO_CLAVE}""",
+            act["partida_id"], act.get("hito_id"))
+        reales = {r["fecha"]: float(r["cantidad_dia"]) for r in filas}
+        # Si la partida-etapa se programó en varios tramos, cada uno descuenta
+        # SOLO el real que le toca: si no, el avance de un tramo le vacía el
+        # plan al otro (§ _dueno_del_real).
+        hermanas = await _hermanas(con, act["partida_id"], act.get("hito_id"))
+        if len(hermanas) > 1:
+            dueno = _dueno_del_real(
+                [(r["fecha"], r["actividad_id"]) for r in filas], hermanas)
+            reales = {f: c for f, c in reales.items() if dueno.get(f) == act["id"]}
 
     # Celdas manuales del rango vigente: plan fino del planner, se protege.
     manuales = {r["fecha"]: float(r["cantidad"]) for r in await con.fetch(
@@ -404,8 +464,12 @@ async def semana(proyecto_id: int = 1, lunes: str = ""):
     fechas = [base + timedelta(days=i) for i in range(7)]
     pool = await db()
     async with pool.acquire() as con:
+        # Solapamiento, no fecha de inicio: una actividad que arrancó el viernes
+        # pasado y sigue hasta el martes TIENE que verse esta semana (antes
+        # desaparecía del calendario en cuanto pasaba su semana de arranque).
         acts = [dict(r) for r in await con.fetch(
-            _ACT_SQL + " WHERE a.proyecto_id = $1 AND a.fecha BETWEEN $2 AND $3"
+            _ACT_SQL + " WHERE a.proyecto_id = $1"
+                       " AND a.fecha <= $3 AND COALESCE(a.fecha_fin, a.fecha) >= $2"
                        " ORDER BY a.fecha, a.id", proyecto_id, fechas[0], fechas[6])]
         reps = [dict(r) for r in await con.fetch(
             """SELECT r.*, s.nombre AS supervisor_nombre
@@ -675,8 +739,13 @@ async def lookahead(proyecto_id: int = 1, desde: str = "", semanas: int = 4):
     semanas = max(1, min(int(semanas or 4), 8))
     base = _lunes_de(parse_fecha(desde) or fecha_lima())
     pool = await db()
+    # Solapamiento (igual que lookahead-grid): el Lookahead responde "¿qué se
+    # puede hacer en las próximas N semanas?", así que una actividad de 3
+    # semanas tiene que aparecer en las 3 — antes solo salía en la de su
+    # F.Inicio y el conteo de restricciones de las otras dos daba 0.
     acts = [dict(r) for r in await pool.fetch(
-        _ACT_SQL + " WHERE a.proyecto_id = $1 AND a.fecha BETWEEN $2 AND $3"
+        _ACT_SQL + " WHERE a.proyecto_id = $1"
+                   " AND a.fecha <= $3 AND COALESCE(a.fecha_fin, a.fecha) >= $2"
                    " ORDER BY a.fecha, a.id",
         proyecto_id, base, base + timedelta(days=semanas * 7 - 1))]
     out = []
@@ -685,7 +754,8 @@ async def lookahead(proyecto_id: int = 1, desde: str = "", semanas: int = 4):
         dom = lun + timedelta(days=6)
         out.append({"lunes": str(lun), "domingo": str(dom),
                     "actividades": [a for a in acts
-                                    if lun <= a["fecha"] <= dom]})
+                                    if a["fecha"] <= dom
+                                    and (a["fecha_fin"] or a["fecha"]) >= lun]})
     return {"desde": str(base), "semanas": out, "cnc": CNC,
             "tipos_restriccion": list(_TIPOS_RESTRICCION)}
 
@@ -830,7 +900,8 @@ async def _rollup_ev_avances(con, partida_id: int) -> None:
 
 async def registrar_avance_partida(con, partida_id: int, fecha: date, cantidad,
                                    notas=None, actualizar_notas: bool = False,
-                                   hito_id: Optional[int] = None) -> None:
+                                   hito_id: Optional[int] = None,
+                                   actividad_id: Optional[int] = None) -> None:
     """Escritura ÚNICA del avance real diario (F1 LookAhead v2 / auditoría F-2):
     upsert (o DELETE si cantidad es None) en ev_avances_diarios y re-prorrateo
     de TODA actividad del LookAhead vinculada a la partida cuyo rango cubre la
@@ -838,7 +909,9 @@ async def registrar_avance_partida(con, partida_id: int, fecha: date, cantidad,
     y sus consecuencias son los mismos. La semana usa core.tiempo.semana_de.
     hito_id = etapa de la partida a la que pertenece el registro (NULL = hito
     principal). Tras escribir, _rollup_ev_avances deriva ev_avances (la entrada
-    del motor EV): un solo dato alimenta LookAhead, VG diario y % de avance."""
+    del motor EV): un solo dato alimenta LookAhead, VG diario y % de avance.
+    actividad_id = de qué actividad del LookAhead vino (0035); NULL cuando el
+    avance se carga desde Valor Ganado y entonces se atribuye por fechas."""
     from routers.ev._datos import _fecha_base
     # Convención dura: el hito principal SIEMPRE se guarda como NULL (las
     # vistas por partida — semana-grid, matriz — leen NULL = cant. instalada).
@@ -853,32 +926,42 @@ async def registrar_avance_partida(con, partida_id: int, fecha: date, cantidad,
     else:
         base = await _fecha_base(con)
         semana = max(1, semana_de(fecha, base)) if base else 1
+        # El dueño solo se PISA cuando el avance viene de una actividad; si se
+        # carga desde Valor Ganado (actividad_id NULL) se conserva el que ya
+        # tenía, para no borrar una atribución explícita al corregir la cifra.
         if actualizar_notas:
             await con.execute(
                 """INSERT INTO ev_avances_diarios
-                     (partida_id, fecha, semana, cantidad_dia, notas, hito_id, registrado_en)
-                   VALUES ($1, $2, $3, $4, $5, $6, NOW())
+                     (partida_id, fecha, semana, cantidad_dia, notas, hito_id,
+                      actividad_id, registrado_en)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
                    ON CONFLICT (partida_id, fecha, COALESCE(hito_id, 0))
-                   DO UPDATE SET cantidad_dia = $4, notas = $5, registrado_en = NOW()""",
-                partida_id, fecha, semana, cantidad, notas, hito_id)
+                   DO UPDATE SET cantidad_dia = $4, notas = $5, registrado_en = NOW(),
+                     actividad_id = COALESCE($7, ev_avances_diarios.actividad_id)""",
+                partida_id, fecha, semana, cantidad, notas, hito_id, actividad_id)
         else:
             await con.execute(
                 """INSERT INTO ev_avances_diarios
-                     (partida_id, fecha, semana, cantidad_dia, hito_id, registrado_en)
-                   VALUES ($1, $2, $3, $4, $5, NOW())
+                     (partida_id, fecha, semana, cantidad_dia, hito_id,
+                      actividad_id, registrado_en)
+                   VALUES ($1, $2, $3, $4, $5, $6, NOW())
                    ON CONFLICT (partida_id, fecha, COALESCE(hito_id, 0))
-                   DO UPDATE SET cantidad_dia = $4, registrado_en = NOW()""",
-                partida_id, fecha, semana, cantidad, hito_id)
+                   DO UPDATE SET cantidad_dia = $4, registrado_en = NOW(),
+                     actividad_id = COALESCE($6, ev_avances_diarios.actividad_id)""",
+                partida_id, fecha, semana, cantidad, hito_id, actividad_id)
     await _rollup_ev_avances(con, partida_id)
     # Los días anteriores al registrado no se tocan; el saldo para cumplir el
     # metrado meta se re-prorratea en los días siguientes de cada actividad
     # de la MISMA etapa (hito) de la partida — una actividad apuntando al
     # hito principal equivale a una sin hito ($4 = id del principal).
+    # Se re-prorratean TODAS las actividades vivas de la partida-etapa, no solo
+    # la que cubre la fecha: el día registrado puede cambiar de dueño (§
+    # _dueno_del_real) y el tramo que lo pierde tiene que recuperar su saldo.
     acts = await con.fetch(
         """SELECT * FROM prog_actividades
-           WHERE partida_id = $1 AND $2 BETWEEN fecha AND COALESCE(fecha_fin, fecha)
-             AND COALESCE(hito_id, $4) = COALESCE($3, $4)""",
-        partida_id, fecha, hito_id, principal)
+           WHERE partida_id = $1 AND estado <> 'CANCELADO'
+             AND COALESCE(hito_id, $3) = COALESCE($2, $3)""",
+        partida_id, hito_id, principal)
     for a in acts:
         await _redistribuir(con, dict(a), solo_despues_de=fecha)
 
@@ -902,8 +985,10 @@ async def avance_dia_actividad(act_id: int, data: dict):
         if not act["partida_id"]:
             raise HTTPException(400, "La actividad no tiene partida de control: asígnala para registrar avance")
         async with con.transaction():
+            # El avance queda ligado a ESTA actividad (0035): si la partida se
+            # programó en varios tramos, el real no se le atribuye a otro.
             await registrar_avance_partida(con, act["partida_id"], f, cantidad,
-                                           hito_id=act["hito_id"])
+                                           hito_id=act["hito_id"], actividad_id=act_id)
     return {"ok": True, "cantidad": cantidad}
 
 
@@ -1404,7 +1489,8 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
                WHERE actividad_id = ANY($1) AND fecha BETWEEN $2 AND $3""",
             ids, base, fin) if ids else []
         real_rows = await con.fetch(
-            """SELECT partida_id, hito_id, fecha::text AS f, cantidad_dia
+            """SELECT partida_id, hito_id, fecha, fecha::text AS f, cantidad_dia,
+                      actividad_id
                FROM ev_avances_diarios
                WHERE partida_id = ANY($1) AND fecha BETWEEN $2 AND $3""",
             pids, base, fin) if pids else []
@@ -1421,6 +1507,13 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             """SELECT id, partida_id, descripcion, peso, es_principal FROM ev_hitos
                WHERE partida_id = ANY($1)
                ORDER BY partida_id, es_principal DESC, peso DESC, id""",
+            pids)] if pids else []
+        # TODAS las actividades de esas partidas (también las de fuera de la
+        # ventana): hacen falta para repartir bien el real entre los tramos.
+        todas_acts = [dict(r) for r in await con.fetch(
+            """SELECT id, partida_id, hito_id, fecha, COALESCE(fecha_fin, fecha) AS fecha_fin
+                 FROM prog_actividades
+                WHERE partida_id = ANY($1) AND estado <> 'CANCELADO'""",
             pids)] if pids else []
         dias_semana, feriados = await _calendario(con, proyecto_id, base, fin)
         deps = await con.fetch(
@@ -1448,16 +1541,35 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             manual_map.setdefault(r["actividad_id"], []).append(r["f"])
     # Reales por (partida, etapa): NULL = hito principal (convención 0025).
     real_map: dict = {}
+    dueno_reg: dict = {}
     for r in real_rows:
         if r["cantidad_dia"] is not None:
             real_map.setdefault((r["partida_id"], r["hito_id"]), {})[r["f"]] = \
                 float(r["cantidad_dia"])
+            dueno_reg[(r["partida_id"], r["hito_id"], r["fecha"])] = r["actividad_id"]
     principal_de: dict = {}
     hitos_de: dict = {}
     for h in hitos_rows:
         hitos_de.setdefault(h["partida_id"], []).append(h)
         principal_de.setdefault(h["partida_id"], h["id"])   # 1º = principal (ORDER BY)
     hito_info = {h["id"]: h for h in hitos_rows}
+
+    # Dueño de cada día con real, por (partida, etapa) — solo hace falta cuando
+    # la partida-etapa tiene más de un tramo programado.
+    def _hk(pid, hid):
+        return None if hid is not None and hid == principal_de.get(pid) else hid
+
+    tramos: dict = {}
+    for x in todas_acts:
+        tramos.setdefault((x["partida_id"], _hk(x["partida_id"], x["hito_id"])), []).append(x)
+    dueno_de: dict = {}
+    for clave, acts_clave in tramos.items():
+        if len(acts_clave) < 2:
+            continue
+        items = [(d, dueno_reg.get((clave[0], clave[1], d)))
+                 for d in (date.fromisoformat(f) for f in real_map.get(clave, {}))]
+        dueno_de[clave] = {str(f): aid
+                           for f, aid in _dueno_del_real(items, acts_clave).items()}
 
     grupos: list = []
     idx: dict = {}
@@ -1469,6 +1581,12 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
         if hkey is not None and hkey == principal_de.get(a["partida_id"]):
             hkey = None
         acum_real = acum.get((a["partida_id"], hkey)) if a["partida_id"] else None
+        # Real de ESTA actividad (no el de toda la partida): si la partida se
+        # programó en varios tramos, cada fila muestra lo suyo.
+        real_act = real_map.get((a["partida_id"], hkey), {}) if a["partida_id"] else {}
+        dueno = dueno_de.get((a["partida_id"], hkey))
+        if dueno:
+            real_act = {f: v for f, v in real_act.items() if dueno.get(f) == a["id"]}
         act_out = {
             "id": a["id"], "titulo": a["titulo"], "estado": a["estado"],
             "descripcion": a["descripcion"],
@@ -1504,7 +1622,10 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "hito_peso": float(hito_info[a["hito_id"]]["peso"]) if a["hito_id"] in hito_info else None,
             "prog": prog_map.get(a["id"], {}),
             "prog_manual": sorted(manual_map.get(a["id"], [])),
-            "real": real_map.get((a["partida_id"], hkey), {}) if a["partida_id"] else {},
+            "real": real_act,
+            # Cuántos tramos comparten la partida-etapa (1 = el caso normal).
+            # El panel lo usa para avisar de que el real está repartido.
+            "tramos": len(tramos.get((a["partida_id"], hkey), [])) if a["partida_id"] else 0,
         }
         clave = a["otm_id"] or ""
         if clave not in idx:
@@ -1830,13 +1951,21 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
     pool = await db()
     async with pool.acquire() as con:
         acts = [dict(r) for r in await con.fetch(
-            """SELECT id, partida_id, hito_id, estado, fecha, supervisor_id
+            """SELECT id, partida_id, hito_id, estado, fecha,
+                      COALESCE(fecha_fin, fecha) AS fecha_fin, supervisor_id
                FROM prog_actividades
                WHERE proyecto_id = $1
                  AND fecha <= $3 AND COALESCE(fecha_fin, fecha) >= $2""",
             proyecto_id, desde, hasta)]
         ids = [a["id"] for a in acts]
         pids = sorted({a["partida_id"] for a in acts if a["partida_id"]})
+        # Tramos de cada partida-etapa (también fuera de la ventana) para poder
+        # atribuir el real a la actividad correcta.
+        todas_acts = [dict(r) for r in await con.fetch(
+            """SELECT id, partida_id, hito_id, fecha, COALESCE(fecha_fin, fecha) AS fecha_fin
+                 FROM prog_actividades
+                WHERE partida_id = ANY($1) AND estado <> 'CANCELADO'""",
+            pids)] if pids else []
         prog_rows = await con.fetch(
             """SELECT actividad_id,
                       (fecha - ((EXTRACT(ISODOW FROM fecha)::int) - 1)) AS lunes,
@@ -1844,14 +1973,14 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
                FROM prog_metrado_dia
                WHERE actividad_id = ANY($1) AND fecha BETWEEN $2 AND $3
                GROUP BY 1, 2""", ids, desde, hasta) if ids else []
+        # Por FECHA (no agregado por semana): el real se atribuye primero a su
+        # actividad y recién después se suma por semana.
         real_rows = await con.fetch(
-            """SELECT partida_id, hito_id,
-                      (fecha - ((EXTRACT(ISODOW FROM fecha)::int) - 1)) AS lunes,
-                      SUM(cantidad_dia) AS c
+            """SELECT partida_id, hito_id, fecha, actividad_id, SUM(cantidad_dia) AS c
                FROM ev_avances_diarios
                WHERE partida_id = ANY($1) AND fecha BETWEEN $2 AND $3
                  AND cantidad_dia IS NOT NULL
-               GROUP BY 1, 2, 3""", pids, desde, hasta) if pids else []
+               GROUP BY 1, 2, 3, 4""", pids, desde, hasta) if pids else []
         principal = {r["partida_id"]: r["id"] for r in await con.fetch(
             """SELECT DISTINCT ON (partida_id) partida_id, id FROM ev_hitos
                WHERE partida_id = ANY($1)
@@ -1877,13 +2006,51 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
     prog_de: dict = {}
     for r in prog_rows:
         prog_de.setdefault(r["actividad_id"], {})[r["lunes"]] = float(r["c"] or 0)
-    reales = {(r["partida_id"], r["hito_id"], r["lunes"]): float(r["c"] or 0)
-              for r in real_rows}
+
+    def _etapa_de(pid, hid):
+        """Etapa normalizada: el hito principal se guarda como NULL en el diario."""
+        return None if hid is not None and hid == principal.get(pid) else hid
 
     def _etapa(a: dict):
-        """Etapa normalizada: el hito principal se guarda como NULL en el diario."""
-        h = a["hito_id"]
-        return None if h is not None and h == principal.get(a["partida_id"]) else h
+        return _etapa_de(a["partida_id"], a["hito_id"])
+
+    # Real por (actividad, semana). Cuando la partida-etapa tiene varios tramos,
+    # cada día se le asigna al tramo que le corresponde (§ _dueno_del_real):
+    # antes las dos actividades veían el mismo real y las dos se daban por
+    # cumplidas con el trabajo de una sola.
+    tramos: dict = {}
+    for x in todas_acts:
+        tramos.setdefault((x["partida_id"], _etapa_de(x["partida_id"], x["hito_id"])),
+                          []).append(x)
+    reales: dict = {}
+    por_clave: dict = {}
+    dueno_reg: dict = {}
+    for r in real_rows:
+        clave = (r["partida_id"], _etapa_de(r["partida_id"], r["hito_id"]))
+        por_clave.setdefault(clave, {})[r["fecha"]] = \
+            por_clave.get(clave, {}).get(r["fecha"], 0.0) + float(r["c"] or 0)
+        if r["actividad_id"]:
+            dueno_reg[(clave, r["fecha"])] = r["actividad_id"]
+    for clave, dias in por_clave.items():
+        hermanas = tramos.get(clave, [])
+        dueno = (_dueno_del_real([(f, dueno_reg.get((clave, f))) for f in dias], hermanas)
+                 if len(hermanas) > 1 else {})
+        for f, c in dias.items():
+            aid = dueno.get(f) if dueno else None
+            lun = _lunes_de(f)
+            if aid is None:                       # un solo tramo: como siempre
+                reales[(clave[0], clave[1], lun)] = \
+                    reales.get((clave[0], clave[1], lun), 0.0) + c
+            else:
+                reales[("act", aid, lun)] = reales.get(("act", aid, lun), 0.0) + c
+
+    def _alcanzado(a: dict, lun) -> float:
+        if not a["partida_id"]:
+            return 0.0
+        clave = (a["partida_id"], _etapa(a))
+        if len(tramos.get(clave, [])) > 1:
+            return reales.get(("act", a["id"], lun), 0.0)
+        return reales.get((clave[0], clave[1], lun), 0.0)
 
     sem: dict = {}
     sup: dict = {}
@@ -1903,8 +2070,7 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
             for lun, comprom in por_semana.items():
                 if comprom <= 0:
                     continue
-                alcanz = (reales.get((a["partida_id"], _etapa(a), lun), 0.0)
-                          if a["partida_id"] else 0.0)
+                alcanz = _alcanzado(a, lun)
                 cerrada = lun + timedelta(days=6) < hoy
                 if a["estado"] == "NO_CUMPLIDA":
                     cump, noc = 0, 1
@@ -1916,12 +2082,24 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
                     cump, noc = 0, 0                    # en curso: sin veredicto
                 _suma(lun, a["supervisor_id"], 1, cump, noc)
         else:
+            # Sin celdas programadas (actividad de apoyo, o una con metrado a la
+            # que el re-prorrateo no le dejó saldo): se evalúa por estado en la
+            # semana de su F.Inicio, con la MISMA regla de cierre que la rama de
+            # arriba. Antes se quedaba comprometida sin veredicto para siempre:
+            # bajaba el PPC (contaba en el denominador y nunca en el numerador)
+            # y no aparecía en `no_cumplidas`, así que las cifras no cuadraban y
+            # el planner no tenía de dónde agarrarse.
             lun = _lunes_de(a["fecha"])
             if not (desde <= lun <= hasta):
                 continue
-            _suma(lun, a["supervisor_id"], 1,
-                  1 if a["estado"] == "EJECUTADO" else 0,
-                  1 if a["estado"] == "NO_CUMPLIDA" else 0)
+            cerrada = lun + timedelta(days=6) < hoy
+            if a["estado"] == "EJECUTADO":
+                cump, noc = 1, 0
+            elif a["estado"] == "NO_CUMPLIDA" or cerrada:
+                cump, noc = 0, 1
+            else:
+                cump, noc = 0, 0                        # en curso: sin veredicto
+            _suma(lun, a["supervisor_id"], 1, cump, noc)
 
     def _ppc(c, e):
         return round(e / c, 4) if c else None
