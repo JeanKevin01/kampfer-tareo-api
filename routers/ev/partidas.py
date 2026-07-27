@@ -99,6 +99,95 @@ def _wbs_de(codigo: str, nivel=None, parent_codigo=None) -> tuple:
     return max(1, len(partes)), padre
 
 
+_PREFIJO_ADICIONAL = "ADIC"
+
+
+def _siguiente_codigo(codigos, parent_codigo=None, naturaleza=None) -> str:
+    """Propone el código que le toca a una partida nueva.
+
+    · CONTRACTUAL con padre '03.02' → el correlativo que sigue entre SUS hijos
+      directos ('03.02.07' si el último es '03.02.06'), respetando el ancho de
+      los ceros que ya usa el presupuesto.
+    · CONTRACTUAL sin padre → el correlativo de las raíces ('04' tras '03').
+    · ADICIONAL → su propia serie 'ADIC-01', 'ADIC-02'… porque un adicional no
+      pertenece a la numeración del contrato (y así se reconoce de un vistazo).
+
+    Los tramos no numéricos se ignoran al buscar el máximo: un 'ADIC-01' suelto
+    dentro de la jerarquía no rompe el correlativo del contrato."""
+    if str(naturaleza or "").strip().upper() == "ADICIONAL":
+        usados = []
+        for c in codigos:
+            t = str(c or "").strip().upper()
+            if t.startswith(_PREFIJO_ADICIONAL + "-"):
+                suf = t[len(_PREFIJO_ADICIONAL) + 1:]
+                if suf.isdigit():
+                    usados.append((int(suf), len(suf)))
+        if not usados:
+            return f"{_PREFIJO_ADICIONAL}-01"
+        top = max(usados)
+        return f"{_PREFIJO_ADICIONAL}-{top[0] + 1:0{max(top[1], 2)}d}"
+
+    padre = str(parent_codigo or "").strip()
+    if padre:
+        # El separador se deduce del padre; si el padre es de un solo tramo
+        # ('01') no dice nada, así que se mira el presupuesto ya cargado y, en
+        # último caso, se usa el punto (lo habitual).
+        if "." in padre:
+            sep = "."
+        elif "," in padre:
+            sep = ","
+        else:
+            hay = [str(c or "") for c in codigos]
+            sep = "," if (any("," in c for c in hay)
+                          and not any("." in c for c in hay)) else "."
+        pref = padre + sep
+        n_padre = len([x for x in padre.split(sep) if x])
+        hijos = []
+        for c in codigos:
+            t = str(c or "").strip()
+            if not t.startswith(pref):
+                continue
+            tramos = [x for x in t.split(sep) if x]
+            if len(tramos) == n_padre + 1 and tramos[-1].isdigit():
+                hijos.append((int(tramos[-1]), len(tramos[-1])))
+        if not hijos:
+            return f"{padre}{sep}01"
+        top = max(hijos)
+        return f"{padre}{sep}{top[0] + 1:0{max(top[1], 2)}d}"
+
+    # Raíces: los códigos de UN solo tramo (el separador se toma del que exista).
+    raices = []
+    for c in codigos:
+        t = str(c or "").strip()
+        if t.isdigit():
+            raices.append((int(t), len(t)))
+    if not raices:
+        return "01"
+    top = max(raices)
+    return f"{top[0] + 1:0{max(top[1], 2)}d}"
+
+
+@router.get("/partidas/siguiente-codigo")
+async def siguiente_codigo(otm: Optional[str] = None, parent_codigo: Optional[str] = None,
+                           naturaleza: Optional[str] = None):
+    """Correlativo sugerido para una partida nueva, dentro de su OTM.
+
+    Es una SUGERENCIA: el planner puede sobrescribirla. Se calcula sobre las
+    partidas de la misma OTM (o del cajón «(SIN)» si aún no tiene), que es el
+    ámbito donde el código debe ser único."""
+    pool = await db()
+    async with pool.acquire() as con:
+        if otm:
+            rows = await con.fetch(
+                "SELECT codigo FROM ev_partidas WHERE activo AND otm_id=$1", otm)
+        else:
+            rows = await con.fetch(
+                "SELECT codigo FROM ev_partidas WHERE activo AND otm_id IS NULL")
+    codigo = _siguiente_codigo([r["codigo"] for r in rows], parent_codigo, naturaleza)
+    return {"codigo": codigo, "otm_id": otm, "parent_codigo": parent_codigo or None,
+            "naturaleza": (naturaleza or "CONTRACTUAL").upper()}
+
+
 # ---------------------- CRUD Partidas ----------------------
 @router.get("/partidas")
 async def listar_partidas(otm: Optional[str] = None, sin_otm: bool = False):

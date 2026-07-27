@@ -1386,6 +1386,18 @@ def main():
           f"hija={hija.get('nivel')}/{hija.get('parent_codigo')} bandeja={en_bandeja.get('motivos')} "
           f"ubicar={r3.status_code} choque={r4.status_code}")
 
+    # P66 — correlativo sugerido: el que sigue entre los hijos del padre y la
+    # serie propia de los adicionales (el planner ya no inventa códigos).
+    def _sig(**kw):
+        return c.get(f"{API}/ev/partidas/siguiente-codigo",
+                     params={"otm": "OTM-E2E", **kw}).json().get("codigo")
+    # E2E-001.09 la creó P65 -> el siguiente hijo es el .10
+    sig_hijo = _sig(parent_codigo="E2E-001")
+    sig_adic = _sig(naturaleza="ADICIONAL")
+    check("P66 correlativo sugerido: hijo que sigue del padre y serie propia del adicional",
+          sig_hijo == "E2E-001.10" and str(sig_adic or "").startswith("ADIC-"),
+          f"hijo={sig_hijo} adicional={sig_adic}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
