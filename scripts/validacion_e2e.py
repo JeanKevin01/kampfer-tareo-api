@@ -1398,6 +1398,38 @@ def main():
           sig_hijo == "E2E-001.10" and str(sig_adic or "").startswith("ADIC-"),
           f"hijo={sig_hijo} adicional={sig_adic}")
 
+    # P67 — datos maestros: desactivar una partida CON trabajo colgado avisa qué
+    # tiene (409) en vez de hacerlo callado; confirmando sí se desactiva.
+    r = c.delete(f"{API}/ev/partidas/{p1['id']}")
+    uso = c.get(f"{API}/ev/partidas/{p1['id']}/uso").json()
+    check("P67 desactivar una partida con trabajo registrado avisa antes (409) y detalla el uso",
+          r.status_code == 409 and "registrado" in r.text.lower()
+          and (uso.get("actividades", 0) or uso.get("dias_avance", 0)) > 0,
+          f"status={r.status_code} uso={uso} detalle={r.text[:120]}")
+
+    # P68 — un documento de costo ya cargado se puede CORREGIR (antes solo
+    # borrar y rehacer el Excel entero).
+    r = c.post(f"{API}/ev/ro/documentos", json={
+        "proyecto_id": 1, "tipo_doc": "FACTURA", "proveedor": "E2E PROVEEDOR",
+        "numero_doc": "E2E-DOC-1", "fecha": "2026-06-10", "tipo_recurso": "MAT",
+        "directo": True, "fase": "F-E2E", "moneda": "PEN", "monto": 1000})
+    did = r.json().get("id") if r.status_code == 200 else None
+    r2 = c.put(f"{API}/ev/ro/documentos/{did}", json={
+        "proyecto_id": 1, "tipo_doc": "FACTURA", "proveedor": "E2E CORREGIDO",
+        "numero_doc": "E2E-DOC-1", "fecha": "2026-06-10", "tipo_recurso": "EQP",
+        "directo": False, "fase": "F-E2E", "moneda": "PEN", "monto": 2500})
+    doc = next((d for d in c.get(f"{API}/ev/ro/costos?proyecto_id=1").json().get("documentos", [])
+                if d["id"] == did), {})
+    r3 = c.put(f"{API}/ev/ro/documentos/{did}", json={
+        "proyecto_id": 1, "tipo_doc": "FACTURA", "numero_doc": "E2E-DOC-1",
+        "fecha": "2026-06-10", "tipo_recurso": "MO", "directo": True,
+        "moneda": "PEN", "monto": 10})
+    check("P68 editar un documento de costo cargado; la MO sigue vetada como factura",
+          r2.status_code == 200 and doc.get("proveedor") == "E2E CORREGIDO"
+          and float(doc.get("monto") or 0) == 2500 and doc.get("tipo_recurso") == "EQP"
+          and r3.status_code == 400,
+          f"put={r2.status_code} doc={ {k: doc.get(k) for k in ('proveedor', 'monto', 'tipo_recurso')} } mo={r3.status_code}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")

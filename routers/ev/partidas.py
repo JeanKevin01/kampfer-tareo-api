@@ -416,12 +416,64 @@ async def ubicar_partida(partida_id: int, body: dict):
             "nivel": nivel, "parent_codigo": parent_codigo}
 
 
-@router.delete("/partidas/{partida_id}")
-async def eliminar_partida(partida_id: int):
+async def _uso_de_partida(con, partida_id: int) -> dict:
+    """Qué hay colgado de la partida. Es lo que decide si se puede quitar de en
+    medio sin perder rastro de trabajo real."""
+    r = await con.fetchrow(
+        """SELECT
+             (SELECT count(*) FROM prog_actividades WHERE partida_id = $1) AS actividades,
+             (SELECT count(*) FROM ev_avances_diarios
+               WHERE partida_id = $1 AND cantidad_dia IS NOT NULL) AS dias_avance,
+             (SELECT COALESCE(SUM(hh), 0) FROM tareo_partida WHERE partida_id = $1) AS hh_tareo,
+             (SELECT count(*) FROM ev_avances a JOIN ev_hitos h ON h.id = a.hito_id
+               WHERE h.partida_id = $1) AS avances_semanales,
+             (SELECT count(*) FROM costo_documentos WHERE partida_id = $1) AS documentos_costo""",
+        partida_id)
+    return {"actividades": r["actividades"], "dias_avance": r["dias_avance"],
+            "hh_tareo": float(r["hh_tareo"] or 0),
+            "avances_semanales": r["avances_semanales"],
+            "documentos_costo": r["documentos_costo"]}
+
+
+@router.get("/partidas/{partida_id}/uso")
+async def uso_partida(partida_id: int):
+    """Qué se perdería de vista al quitar la partida — el panel lo muestra antes
+    de dejar desactivarla."""
     pool = await db()
     async with pool.acquire() as con:
+        if not await con.fetchval("SELECT 1 FROM ev_partidas WHERE id=$1", partida_id):
+            raise HTTPException(404, "Partida no encontrada")
+        return await _uso_de_partida(con, partida_id)
+
+
+@router.delete("/partidas/{partida_id}")
+async def eliminar_partida(partida_id: int, desactivar: bool = False):
+    """Quita la partida de las listas (`activo = false`; nunca se borra la fila:
+    el avance y las HH ya registradas son historia real).
+
+    Si tiene trabajo colgado se responde **409 explicando qué**, en vez de
+    hacerlo callado: desactivar una partida con actividades programadas o con
+    avance registrado deja huecos difíciles de rastrear después. Para hacerlo de
+    todos modos, `?desactivar=true` — es una decisión, no un descuido."""
+    pool = await db()
+    async with pool.acquire() as con:
+        if not await con.fetchval("SELECT 1 FROM ev_partidas WHERE id=$1", partida_id):
+            raise HTTPException(404, "Partida no encontrada")
+        uso = await _uso_de_partida(con, partida_id)
+        if not desactivar and any(v for v in uso.values()):
+            detalle = ", ".join(t for t in (
+                f"{uso['actividades']} actividad(es) programadas" if uso["actividades"] else "",
+                f"{uso['dias_avance']} día(s) con avance" if uso["dias_avance"] else "",
+                f"{uso['hh_tareo']:g} HH de tareo" if uso["hh_tareo"] else "",
+                f"{uso['avances_semanales']} avance(s) semanales" if uso["avances_semanales"] else "",
+                f"{uso['documentos_costo']} documento(s) de costo" if uso["documentos_costo"] else "",
+            ) if t)
+            raise HTTPException(
+                409, f"Esta partida tiene trabajo registrado ({detalle}). "
+                     f"Si aun así quieres sacarla de las listas, confirma para desactivarla: "
+                     f"sus datos se conservan pero dejará de aparecer.")
         await con.execute("UPDATE ev_partidas SET activo=FALSE WHERE id=$1", partida_id)
-    return {"ok": True}
+    return {"ok": True, "desactivada": True, "uso": uso}
 
 
 # ---------------------- Importador masivo ----------------------

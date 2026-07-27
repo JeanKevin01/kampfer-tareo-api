@@ -260,6 +260,43 @@ async def crear_documento(body: DocIn):
     return {"ok": True, "id": did, "periodo_id": per}
 
 
+@router.put("/documentos/{did}")
+async def editar_documento(did: int, body: DocIn):
+    """Corrige un documento de costo ya cargado (también los que entraron por
+    import): antes solo se podía borrar y volver a subir el Excel entero.
+
+    El periodo se recalcula desde la fecha nueva y se exige ABIERTO tanto el
+    periodo de origen como el de destino — mover un costo a un mes cerrado, o
+    sacarlo de uno cerrado, cambiaría un Resultado Operativo ya emitido."""
+    if body.tipo_recurso.upper() not in _TIPOS_REC:
+        raise HTTPException(400, f"tipo_recurso inválido (válidos: {_TIPOS_REC})")
+    if body.tipo_doc.upper() not in _TIPOS_DOC:
+        raise HTTPException(400, f"tipo_doc inválido (válidos: {_TIPOS_DOC})")
+    if body.tipo_recurso.upper() == "MO" and body.tipo_doc.upper() != "PLANILLA_AJUSTE":
+        raise HTTPException(400, "La MO solo entra como PLANILLA_AJUSTE (el resto sale del tareo × tarifa)")
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            actual = await con.fetchval(
+                "SELECT periodo_id FROM costo_documentos WHERE id=$1", did)
+            if actual is None:
+                raise HTTPException(404, "Documento no encontrado")
+            await exigir_abierto(con, actual)
+            per = await periodo_para_movimiento(con, body.proyecto_id, _d(body.fecha),
+                                                body.periodo_id)
+            if per != actual:
+                await exigir_abierto(con, per)
+            await con.execute(
+                """UPDATE costo_documentos SET periodo_id=$2, tipo_doc=$3, proveedor=$4,
+                   numero_doc=$5, fecha=$6, tipo_recurso=$7, directo=$8, fase=$9,
+                   partida_id=$10, moneda=$11, monto=$12, glosa=$13
+                   WHERE id=$1""",
+                did, per, body.tipo_doc.upper(), body.proveedor, body.numero_doc,
+                _d(body.fecha), body.tipo_recurso.upper(), body.directo, body.fase,
+                body.partida_id, body.moneda.upper(), body.monto, body.glosa)
+    return {"ok": True, "id": did, "periodo_id": per}
+
+
 @router.delete("/documentos/{did}")
 async def borrar_documento(did: int):
     pool = await db()
