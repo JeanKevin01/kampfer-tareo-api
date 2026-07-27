@@ -246,3 +246,117 @@ async def dar_baja_supervisor(sup_id: str, _u: dict = Depends(require_role("ofic
     pool = await core_db()
     await pool.execute("UPDATE supervisores SET activo = false WHERE id = $1", sup_id)
     return {"status": "ok"}
+
+
+# ── Histograma de personal (encargo Jean 2026-07-26) ─────────
+# El histograma de MO del Anexo 01 solo existía por DÍA y en ventanas de
+# semanas. Para mirar la curva de personal de toda la obra hace falta poder
+# agrupar por semana y por MES, que es como se conversa con la gerencia
+# («en agosto tuvimos 40 personas»).
+_AGRUPACIONES = ("dia", "semana", "mes")
+
+
+def _clave_periodo(agrupar: str) -> str:
+    """Expresión SQL que reduce la fecha al inicio de su periodo."""
+    if agrupar == "mes":
+        return "date_trunc('month', tp.fecha)::date"
+    if agrupar == "semana":                      # lunes ISO
+        return "(tp.fecha - ((EXTRACT(ISODOW FROM tp.fecha)::int) - 1))"
+    return "tp.fecha"
+
+
+@router.get("/api/histograma-personal")
+async def histograma_personal(desde: str = "", hasta: str = "", agrupar: str = "dia",
+                              otm: str = "", _u: dict = Depends(require_role("oficina"))):
+    """Cuánta gente trabajó y cuántas HH, por día / semana / mes.
+
+    Fuente: `tareo_partida` (el tareo QR real). Por periodo devuelve:
+      · `trabajadores`  personas DISTINTAS que aparecieron (no la suma de días:
+        el mismo obrero en 20 días de agosto cuenta una vez en el mes);
+      · `pico` y `promedio_dia`  máximo y promedio de personal por día dentro
+        del periodo — lo que de verdad describe la curva de MO de un mes;
+      · `hh` y el desglose `por_cargo` (personas distintas por cargo).
+
+    Sin fechas toma los últimos 12 meses de datos que existan."""
+    from datetime import date, timedelta
+    agrupar = str(agrupar or "dia").strip().lower()
+    if agrupar not in _AGRUPACIONES:
+        raise HTTPException(422, f"agrupar inválido (usa {'/'.join(_AGRUPACIONES)})")
+    pool = await core_db()
+    async with pool.acquire() as con:
+        lim = await con.fetchrow(
+            "SELECT MIN(fecha) AS ini, MAX(fecha) AS fin FROM tareo_partida WHERE hh > 0")
+        if not lim or lim["fin"] is None:
+            return {"desde": None, "hasta": None, "agrupar": agrupar, "periodos": [],
+                    "totales": {"trabajadores": 0, "hh": 0.0, "dias": 0}}
+        try:
+            f_hasta = date.fromisoformat(hasta) if hasta else lim["fin"]
+            f_desde = date.fromisoformat(desde) if desde else max(
+                lim["ini"], f_hasta - timedelta(days=365))
+        except ValueError:
+            raise HTTPException(400, "Fechas inválidas: usa AAAA-MM-DD")
+        if f_desde > f_hasta:
+            raise HTTPException(400, "«desde» no puede ser posterior a «hasta»")
+        otm_f = otm.strip() or None
+        clave = _clave_periodo(agrupar)
+
+        filas = await con.fetch(
+            f"""SELECT {clave} AS periodo,
+                       COUNT(DISTINCT tp.trabajador_id) AS trabajadores,
+                       COUNT(DISTINCT tp.fecha) AS dias,
+                       SUM(tp.hh) AS hh
+                  FROM tareo_partida tp
+                 WHERE tp.fecha BETWEEN $1 AND $2 AND tp.hh IS NOT NULL AND tp.hh > 0
+                   AND ($3::text IS NULL OR tp.otm_id = $3)
+                 GROUP BY 1 ORDER BY 1""", f_desde, f_hasta, otm_f)
+        # Personal por DÍA dentro de cada periodo: de aquí salen el pico y el
+        # promedio (con agrupar=dia coincide con `trabajadores`).
+        por_dia = await con.fetch(
+            f"""SELECT {clave} AS periodo, tp.fecha,
+                       COUNT(DISTINCT tp.trabajador_id) AS n
+                  FROM tareo_partida tp
+                 WHERE tp.fecha BETWEEN $1 AND $2 AND tp.hh IS NOT NULL AND tp.hh > 0
+                   AND ($3::text IS NULL OR tp.otm_id = $3)
+                 GROUP BY 1, 2""", f_desde, f_hasta, otm_f)
+        cargos = await con.fetch(
+            f"""SELECT {clave} AS periodo,
+                       COALESCE(NULLIF(TRIM(t.cargo), ''), 'SIN CARGO') AS cargo,
+                       COUNT(DISTINCT tp.trabajador_id) AS n
+                  FROM tareo_partida tp
+                  LEFT JOIN trabajadores t ON t.id = tp.trabajador_id
+                 WHERE tp.fecha BETWEEN $1 AND $2 AND tp.hh IS NOT NULL AND tp.hh > 0
+                   AND ($3::text IS NULL OR tp.otm_id = $3)
+                 GROUP BY 1, 2""", f_desde, f_hasta, otm_f)
+        total = await con.fetchrow(
+            """SELECT COUNT(DISTINCT trabajador_id) AS trabajadores,
+                      COUNT(DISTINCT fecha) AS dias, COALESCE(SUM(hh), 0) AS hh
+                 FROM tareo_partida
+                WHERE fecha BETWEEN $1 AND $2 AND hh IS NOT NULL AND hh > 0
+                  AND ($3::text IS NULL OR otm_id = $3)""", f_desde, f_hasta, otm_f)
+
+    dias_de: dict = {}
+    for r in por_dia:
+        dias_de.setdefault(r["periodo"], []).append(r["n"])
+    cargos_de: dict = {}
+    for r in cargos:
+        cargos_de.setdefault(r["periodo"], {})[r["cargo"]] = r["n"]
+
+    periodos = []
+    for r in filas:
+        ns = dias_de.get(r["periodo"], [])
+        periodos.append({
+            "periodo": str(r["periodo"]),
+            "trabajadores": r["trabajadores"],
+            "dias": r["dias"],
+            "hh": round(float(r["hh"] or 0), 2),
+            "pico": max(ns) if ns else 0,
+            "promedio_dia": round(sum(ns) / len(ns), 1) if ns else 0.0,
+            "por_cargo": dict(sorted(cargos_de.get(r["periodo"], {}).items(),
+                                     key=lambda kv: -kv[1])),
+        })
+    return {
+        "desde": str(f_desde), "hasta": str(f_hasta), "agrupar": agrupar,
+        "otm": otm_f, "periodos": periodos,
+        "totales": {"trabajadores": total["trabajadores"], "dias": total["dias"],
+                    "hh": round(float(total["hh"] or 0), 2)},
+    }

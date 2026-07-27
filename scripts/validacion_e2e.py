@@ -1430,6 +1430,25 @@ def main():
           and r3.status_code == 400,
           f"put={r2.status_code} doc={ {k: doc.get(k) for k in ('proveedor', 'monto', 'tipo_recurso')} } mo={r3.status_code}")
 
+    # P69 — histograma de personal por día / semana / mes. La agrupación por
+    # mes es la que faltaba: el histograma de MO del Anexo 01 solo veía días.
+    def _hist(agrupar):
+        return c.get(f"{API}/api/histograma-personal",
+                     params={"agrupar": agrupar, "desde": FECHA_TAREO, "hasta": FECHA_TAREO})
+    hd, hm = _hist("dia"), _hist("mes")
+    pd_ = (hd.json().get("periodos") or [{}])[0]
+    pm_ = (hm.json().get("periodos") or [{}])[0]
+    hmal = c.get(f"{API}/api/histograma-personal", params={"agrupar": "trimestre"})
+    check("P69 histograma de personal: agrupa por día y por mes, y valida la agrupación",
+          hd.status_code == 200 and hm.status_code == 200
+          and pd_.get("periodo") == FECHA_TAREO
+          and pm_.get("periodo") == FECHA_TAREO[:8] + "01"      # 1º del mes
+          and pd_.get("trabajadores", 0) > 0
+          and pd_.get("pico") == pd_.get("trabajadores")        # en un día coinciden
+          and bool(pd_.get("por_cargo"))
+          and hmal.status_code == 422,
+          f"dia={pd_} mes={pm_} invalida={hmal.status_code}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
