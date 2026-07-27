@@ -422,6 +422,9 @@ _ACT_SQL = """
     SELECT a.*, o.descripcion AS otm_desc, s.nombre AS supervisor_nombre,
            ev.codigo AS partida_codigo, ev.descripcion AS partida_desc,
            ev.hh_presup AS partida_hh_presup, ev.naturaleza AS partida_naturaleza,
+           -- PU de venta: sin él la partida entra al RO como costo sin venta,
+           -- y el LookAhead es donde el planner puede darse cuenta a tiempo.
+           ev.precio_unitario AS partida_pu, ev.otm_id AS partida_otm_id,
            (SELECT count(*) FROM prog_restricciones pr
              WHERE pr.actividad_id = a.id) AS rest_total,
            (SELECT count(*) FROM prog_restricciones pr
@@ -1599,6 +1602,10 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "partida_hh_presup": (float(a["partida_hh_presup"])
                                   if a["partida_hh_presup"] is not None else None),
             "partida_naturaleza": a["partida_naturaleza"],
+            # PU de venta y OTM de la PARTIDA (no de la actividad): sin PU la
+            # partida no vende en el RO; sin OTM no se puede tarear en campo.
+            "partida_pu": (float(a["partida_pu"]) if a["partida_pu"] is not None else None),
+            "partida_otm_id": a["partida_otm_id"],
             "responsable": a["responsable"], "supervisor_id": a["supervisor_id"],
             "supervisor_nombre": a["supervisor_nombre"],
             "causa_nc": a["causa_nc"], "causa_nc_cat": a["causa_nc_cat"],

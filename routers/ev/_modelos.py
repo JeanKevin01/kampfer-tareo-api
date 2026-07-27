@@ -26,6 +26,11 @@ class PartidaIn(BaseModel):
     metrado_proyec: Optional[float] = None
     hh_presup: float = 0
     hh_actualizado: Optional[float] = None   # #6: presupuesto actualizado (default = hh_presup)
+    # PU de VENTA del contrato (lo que se le cobra al cliente por unidad). Es el
+    # único insumo de la venta del RO: venta = Σ(cantidad_valorizada × PU). Una
+    # partida creada en obra sin PU entra al RO como costo puro sin venta, y el
+    # margen de su fase se hunde por captura, no por obra. None = no tocar.
+    precio_unitario: Optional[float] = None
     tipo_costo: Optional[str] = None         # 'DIRECTO' (def) | 'INDIRECTO'
     naturaleza: Optional[str] = None         # 'CONTRACTUAL' (def) | 'ADICIONAL'
     # Lugar en el WBS. Si no vienen se deducen del código (misma regla del
@@ -64,6 +69,10 @@ class ImpPartida(BaseModel):
     metrado_proyec: Optional[float] = None
     hh_presup: float = 0
     hh_actualizado: Optional[float] = None  # #6: presupuesto actualizado (default = hh_presup)
+    # PU de venta (ver PartidaIn). None = NO tocar el que ya tenga la partida:
+    # la plantilla de importación no lo trae y un re-import no puede borrar la
+    # venta que dejó el congelado del presupuesto contractual.
+    precio_unitario: Optional[float] = None
     tipo_costo: Optional[str] = None      # 'DIRECTO' (def) | 'INDIRECTO'
     naturaleza: Optional[str] = None      # 'CONTRACTUAL' (def) | 'ADICIONAL'
     tipo_actividad: Optional[str] = None

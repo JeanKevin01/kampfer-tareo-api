@@ -239,6 +239,13 @@ async def crear_partida(body: PartidaIn):
         async with con.transaction():
             await _asegurar_fases(con, [body.fase])
             nivel, parent_codigo = _wbs_de(body.codigo, body.nivel, body.parent_codigo)
+            # Herencia del ÁREA del proyecto, igual que en /ev/importar: el alta
+            # de una partida en pleno LookAhead no pregunta el área, y sin ella
+            # la partida se cae de la matriz Área × Disciplina.
+            sistema = body.sistema
+            if not sistema and body.otm_id:
+                sistema = await con.fetchval(
+                    "SELECT NULLIF(area, '') FROM otms WHERE id=$1", body.otm_id)
             try:
                 # naturaleza / tipo_costo se persisten (antes se caían al
                 # default): así un ADICIONAL creado desde Programación queda
@@ -247,13 +254,14 @@ async def crear_partida(body: PartidaIn):
                     """INSERT INTO ev_partidas
                        (codigo, otm_id, fase, sub_fase, descripcion, unidad, sistema,
                         metrado_presup, metrado_proyec, hh_presup, hh_actualizado,
-                        naturaleza, tipo_costo, nivel, parent_codigo)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id""",
+                        naturaleza, tipo_costo, nivel, parent_codigo, precio_unitario)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                               COALESCE($16, 0)) RETURNING id""",
                     body.codigo, body.otm_id, body.fase, body.sub_fase, body.descripcion,
-                    body.unidad, body.sistema, body.metrado_presup,
+                    body.unidad, sistema, body.metrado_presup,
                     body.metrado_proyec, body.hh_presup, body.hh_actualizado,
                     _norm_naturaleza(body.naturaleza), _norm_tipo_costo(body.tipo_costo),
-                    nivel, parent_codigo,
+                    nivel, parent_codigo, body.precio_unitario,
                 )
             except asyncpg.UniqueViolationError:
                 raise HTTPException(
@@ -291,15 +299,19 @@ async def actualizar_partida(partida_id: int, body: PartidaIn):
             else:
                 nivel, parent_codigo = prev["nivel"], prev["parent_codigo"]
             try:
+                # PU con COALESCE: quien no lo manda (todo cliente anterior a
+                # esta versión) no puede borrar la venta que dejó el congelado
+                # del presupuesto contractual.
                 res = await con.execute(
                     """UPDATE ev_partidas SET codigo=$2, otm_id=$3, fase=$4, sub_fase=$5,
                        descripcion=$6, unidad=$7, sistema=$8, metrado_presup=$9,
                        metrado_proyec=$10, hh_presup=$11, hh_actualizado=$12,
-                       nivel=$13, parent_codigo=$14 WHERE id=$1""",
+                       nivel=$13, parent_codigo=$14,
+                       precio_unitario=COALESCE($15, precio_unitario) WHERE id=$1""",
                     partida_id, body.codigo, body.otm_id, body.fase, body.sub_fase,
                     body.descripcion, body.unidad, body.sistema,
                     body.metrado_presup, body.metrado_proyec, body.hh_presup,
-                    body.hh_actualizado, nivel, parent_codigo,
+                    body.hh_actualizado, nivel, parent_codigo, body.precio_unitario,
                 )
             except asyncpg.UniqueViolationError:
                 # El código es único POR OTM (índice uq_partida_otm_codigo, 0008):
@@ -342,12 +354,19 @@ async def partidas_por_ubicar():
     metrado y HH contractual, donde al programar la actividad todavía no se
     sabe bajo qué OTM cae. Mientras la partida está sin OTM NO aparece en el
     selector de partidas de una actividad con OTM, así que esta lista es lo que
-    evita que se queden olvidadas."""
+    evita que se queden olvidadas.
+
+    SIN_PU (2026-07-27): la venta del RO es Σ(cantidad_valorizada × PU), así que
+    una partida sin PU entra al resultado como COSTO PURO SIN VENTA. Solo se
+    reclama en las que YA tienen actividad programada: esas van a consumir HH
+    esta semana. Una partida sin PU que nadie trabaja todavía no es un problema
+    y llenaría la bandeja de ruido (el PU llega al congelar el contractual)."""
     pool = await db()
     async with pool.acquire() as con:
         rows = await con.fetch(
             """SELECT p.id, p.codigo, p.descripcion, p.unidad, p.fase, p.otm_id,
                       p.metrado_presup, p.hh_presup, p.naturaleza, p.nivel, p.parent_codigo,
+                      p.precio_unitario,
                       (SELECT count(*) FROM prog_actividades a WHERE a.partida_id = p.id) AS actividades
                FROM ev_partidas p
                WHERE p.activo
@@ -359,7 +378,10 @@ async def partidas_por_ubicar():
                           AND (p.codigo LIKE '%.%' OR p.codigo LIKE '%,%'))
                       -- sin HH solo cuenta en las HOJAS (fase NOT NULL): un nodo
                       -- padre del WBS no tiene presupuesto propio.
-                      OR (p.fase IS NOT NULL AND COALESCE(p.hh_presup, 0) <= 0))
+                      OR (p.fase IS NOT NULL AND COALESCE(p.hh_presup, 0) <= 0)
+                      OR (p.fase IS NOT NULL AND COALESCE(p.precio_unitario, 0) <= 0
+                          AND EXISTS (SELECT 1 FROM prog_actividades a
+                                      WHERE a.partida_id = p.id)))
                ORDER BY p.otm_id NULLS FIRST, p.codigo""")
     out = []
     for r in rows:
@@ -370,9 +392,57 @@ async def partidas_por_ubicar():
             motivos.append("SIN_PADRE")
         if r["fase"] is not None and not float(r["hh_presup"] or 0):
             motivos.append("SIN_HH")
+        if (r["fase"] is not None and not float(r["precio_unitario"] or 0)
+                and int(r["actividades"] or 0) > 0):
+            motivos.append("SIN_PU")
         out.append({**dict(r), "metrado_presup": float(r["metrado_presup"] or 0),
-                    "hh_presup": float(r["hh_presup"] or 0), "motivos": motivos})
+                    "hh_presup": float(r["hh_presup"] or 0),
+                    "precio_unitario": float(r["precio_unitario"] or 0),
+                    "motivos": motivos})
     return out
+
+
+_COMPLETABLES = ("hh_presup", "precio_unitario", "metrado_presup")
+
+
+def _campos_completar(body: dict) -> dict:
+    """Los campos que la bandeja manda a rellenar, validados. PURA (testeable).
+
+    Un campo ausente o None NO se toca: la bandeja edita una celda a la vez y
+    no puede borrar de rebote las otras dos."""
+    campos = {}
+    for k in _COMPLETABLES:
+        if body.get(k) is None:
+            continue
+        try:
+            v = float(body[k])
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{k} debe ser un número")
+        if v < 0:
+            raise HTTPException(400, f"{k} no puede ser negativo")
+        campos[k] = v
+    if not campos:
+        raise HTTPException(
+            400, "Nada que completar: manda hh_presup, precio_unitario o metrado_presup")
+    return campos
+
+
+@router.put("/partidas/{partida_id}/completar")
+async def completar_partida(partida_id: int, body: dict):
+    """Rellena desde la bandeja los datos que le faltan a una partida creada en
+    obra: `hh_presup`, `precio_unitario`, `metrado_presup`. Un campo ausente NO
+    se toca (a diferencia del PUT completo, que además exige mandar los hitos y
+    los reescribe): esto es edición en línea de una celda, no una edición de la
+    partida."""
+    campos = _campos_completar(body)
+    sets = ", ".join(f"{k}=${i}" for i, k in enumerate(campos, start=2))
+    pool = await db()
+    async with pool.acquire() as con:
+        res = await con.execute(
+            f"UPDATE ev_partidas SET {sets} WHERE id=$1 AND activo", partida_id, *campos.values())
+    if res == "UPDATE 0":
+        raise HTTPException(404, "Partida no encontrada")
+    return {"ok": True, "actualizado": list(campos)}
 
 
 @router.put("/partidas/{partida_id}/ubicar")
@@ -535,14 +605,20 @@ async def importar(body: ImportarIn):
                     p.codigo, p.otm_id,
                 )
                 if existente:
+                    # precio_unitario con COALESCE: la plantilla de importación
+                    # no trae PU, así que un re-import no puede borrar la venta
+                    # que dejó el congelado del presupuesto contractual.
                     await con.execute(
                         """UPDATE ev_partidas SET otm_id=$2, fase=$3, sub_fase=$4, descripcion=$5,
                            unidad=$6, sistema=$7, metrado_presup=$8, metrado_proyec=$9,
                            hh_presup=$10, nivel=$11, parent_codigo=$12, tipo_costo=$13,
-                           naturaleza=$14, hh_actualizado=$15, activo=TRUE WHERE id=$1""",
+                           naturaleza=$14, hh_actualizado=$15,
+                           precio_unitario=COALESCE($16, precio_unitario),
+                           activo=TRUE WHERE id=$1""",
                         existente, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
                         p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
                         nivel, parent_codigo, tipo_costo, naturaleza, p.hh_actualizado,
+                        p.precio_unitario,
                     )
                     await con.execute("DELETE FROM ev_hitos WHERE partida_id=$1", existente)
                     pid = existente; actualizadas += 1
@@ -551,11 +627,13 @@ async def importar(body: ImportarIn):
                         """INSERT INTO ev_partidas
                            (codigo, otm_id, fase, sub_fase, descripcion, unidad, sistema,
                             metrado_presup, metrado_proyec, hh_presup, nivel, parent_codigo,
-                            tipo_costo, naturaleza, hh_actualizado)
-                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id""",
+                            tipo_costo, naturaleza, hh_actualizado, precio_unitario)
+                           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,
+                                   COALESCE($16, 0)) RETURNING id""",
                         p.codigo, p.otm_id, p.fase, p.sub_fase, p.descripcion, p.unidad,
                         p.sistema, p.metrado_presup, p.metrado_proyec, p.hh_presup,
                         nivel, parent_codigo, tipo_costo, naturaleza, p.hh_actualizado,
+                        p.precio_unitario,
                     )
                     creadas += 1
                 codigo_a_id[p.codigo] = pid
