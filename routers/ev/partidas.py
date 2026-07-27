@@ -73,12 +73,45 @@ async def _asegurar_fases(con, codigos, proyecto_id: int = 1) -> list:
     return nuevas
 
 
+def _wbs_de(codigo: str, nivel=None, parent_codigo=None) -> tuple:
+    """Lugar de la partida en el WBS: (nivel, parent_codigo).
+
+    Misma regla que el importador de Excel: el separador del código define la
+    jerarquía ('03.02.15' cuelga de '03.02'). Se calcula también en el alta de
+    a una (antes solo lo hacía /ev/importar): sin nivel/parent la partida nace
+    huérfana y `buildWbsTree` del panel la trata como RAÍZ, así que el planner
+    la ve suelta al final del árbol en vez de dentro de su fase.
+
+    Un parent_codigo explícito (selector «cuelga de») manda sobre el código."""
+    cod = str(codigo or "").strip()
+    sep = "." if "." in cod else ","
+    partes = [p for p in cod.split(sep) if p]
+    padre = str(parent_codigo or "").strip() or None
+    if padre is None and len(partes) > 1:
+        padre = sep.join(partes[:-1])
+    if nivel:
+        return int(nivel), padre
+    # Con padre explícito el nivel se cuenta sobre ÉL (el código puede no
+    # seguir la numeración del padre: un adicional 'ADIC-01' bajo '03.02').
+    if padre:
+        psep = "." if "." in padre else ","
+        return len([p for p in padre.split(psep) if p]) + 1, padre
+    return max(1, len(partes)), padre
+
+
 # ---------------------- CRUD Partidas ----------------------
 @router.get("/partidas")
-async def listar_partidas(otm: Optional[str] = None):
+async def listar_partidas(otm: Optional[str] = None, sin_otm: bool = False):
+    """Partidas activas. `otm=` acota a una OTM; `sin_otm=true` devuelve las
+    que están en el cajón «(SIN)» — creadas sin saber todavía a qué obra van
+    (misceláneos: muchos proyectitos, cada uno con su metrado y HH). Son las
+    que la bandeja «por ubicar» del panel resuelve después."""
     pool = await db()
     async with pool.acquire() as con:
-        if otm:
+        if sin_otm:
+            partidas = await con.fetch(
+                "SELECT * FROM ev_partidas WHERE activo AND otm_id IS NULL ORDER BY codigo")
+        elif otm:
             partidas = await con.fetch(
                 "SELECT * FROM ev_partidas WHERE activo AND otm_id=$1 ORDER BY codigo", otm
             )
@@ -116,6 +149,7 @@ async def crear_partida(body: PartidaIn):
     async with pool.acquire() as con:
         async with con.transaction():
             await _asegurar_fases(con, [body.fase])
+            nivel, parent_codigo = _wbs_de(body.codigo, body.nivel, body.parent_codigo)
             try:
                 # naturaleza / tipo_costo se persisten (antes se caían al
                 # default): así un ADICIONAL creado desde Programación queda
@@ -124,12 +158,13 @@ async def crear_partida(body: PartidaIn):
                     """INSERT INTO ev_partidas
                        (codigo, otm_id, fase, sub_fase, descripcion, unidad, sistema,
                         metrado_presup, metrado_proyec, hh_presup, hh_actualizado,
-                        naturaleza, tipo_costo)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id""",
+                        naturaleza, tipo_costo, nivel, parent_codigo)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id""",
                     body.codigo, body.otm_id, body.fase, body.sub_fase, body.descripcion,
                     body.unidad, body.sistema, body.metrado_presup,
                     body.metrado_proyec, body.hh_presup, body.hh_actualizado,
                     _norm_naturaleza(body.naturaleza), _norm_tipo_costo(body.tipo_costo),
+                    nivel, parent_codigo,
                 )
             except asyncpg.UniqueViolationError:
                 raise HTTPException(
@@ -153,15 +188,36 @@ async def actualizar_partida(partida_id: int, body: PartidaIn):
     async with pool.acquire() as con:
         async with con.transaction():
             await _asegurar_fases(con, [body.fase])
-            res = await con.execute(
-                """UPDATE ev_partidas SET codigo=$2, otm_id=$3, fase=$4, sub_fase=$5,
-                   descripcion=$6, unidad=$7, sistema=$8, metrado_presup=$9,
-                   metrado_proyec=$10, hh_presup=$11, hh_actualizado=$12 WHERE id=$1""",
-                partida_id, body.codigo, body.otm_id, body.fase, body.sub_fase,
-                body.descripcion, body.unidad, body.sistema,
-                body.metrado_presup, body.metrado_proyec, body.hh_presup,
-                body.hh_actualizado,
-            )
+            prev = await con.fetchrow(
+                "SELECT nivel, parent_codigo FROM ev_partidas WHERE id=$1", partida_id)
+            if prev is None:
+                raise HTTPException(404, "Partida no encontrada")
+            # El WBS solo se toca si el cliente lo manda explícitamente o si la
+            # partida venía huérfana (nivel/parent NULL): así una edición normal
+            # nunca reubica sola una partida que el importador ya colgó bien.
+            if body.nivel or body.parent_codigo:
+                nivel, parent_codigo = _wbs_de(body.codigo, body.nivel, body.parent_codigo)
+            elif prev["nivel"] is None and prev["parent_codigo"] is None:
+                nivel, parent_codigo = _wbs_de(body.codigo)
+            else:
+                nivel, parent_codigo = prev["nivel"], prev["parent_codigo"]
+            try:
+                res = await con.execute(
+                    """UPDATE ev_partidas SET codigo=$2, otm_id=$3, fase=$4, sub_fase=$5,
+                       descripcion=$6, unidad=$7, sistema=$8, metrado_presup=$9,
+                       metrado_proyec=$10, hh_presup=$11, hh_actualizado=$12,
+                       nivel=$13, parent_codigo=$14 WHERE id=$1""",
+                    partida_id, body.codigo, body.otm_id, body.fase, body.sub_fase,
+                    body.descripcion, body.unidad, body.sistema,
+                    body.metrado_presup, body.metrado_proyec, body.hh_presup,
+                    body.hh_actualizado, nivel, parent_codigo,
+                )
+            except asyncpg.UniqueViolationError:
+                # El código es único POR OTM (índice uq_partida_otm_codigo, 0008):
+                # mover la partida a una OTM que ya lo usa choca aquí.
+                raise HTTPException(
+                    409, f"La OTM {body.otm_id or '(sin OTM)'} ya tiene una partida "
+                         f"con código {body.codigo}: cámbiale el código antes de moverla")
             if res == "UPDATE 0":
                 raise HTTPException(404, "Partida no encontrada")
             existentes = await con.fetch(
@@ -185,6 +241,81 @@ async def actualizar_partida(partida_id: int, body: PartidaIn):
                         partida_id, h.numero, h.descripcion, h.peso, h.es_principal,
                     )
     return {"ok": True}
+
+
+@router.get("/partidas-por-ubicar")
+async def partidas_por_ubicar():
+    """Bandeja de partidas creadas sin saber todavía a qué OTM van (cajón
+    «(SIN)» del índice uq_partida_otm_codigo) más las que sí tienen OTM pero
+    quedaron huérfanas del WBS. Las dos se arreglan con /partidas/{id}/ubicar.
+
+    El caso que la motiva (Jean, misceláneos): muchos proyectitos con su propio
+    metrado y HH contractual, donde al programar la actividad todavía no se
+    sabe bajo qué OTM cae. Mientras la partida está sin OTM NO aparece en el
+    selector de partidas de una actividad con OTM, así que esta lista es lo que
+    evita que se queden olvidadas."""
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            """SELECT p.id, p.codigo, p.descripcion, p.unidad, p.fase, p.otm_id,
+                      p.metrado_presup, p.hh_presup, p.naturaleza, p.nivel, p.parent_codigo,
+                      (SELECT count(*) FROM prog_actividades a WHERE a.partida_id = p.id) AS actividades
+               FROM ev_partidas p
+               WHERE p.activo AND (p.otm_id IS NULL OR p.parent_codigo IS NULL)
+               ORDER BY p.otm_id NULLS FIRST, p.codigo""")
+    out = []
+    for r in rows:
+        motivos = []
+        if r["otm_id"] is None:
+            motivos.append("SIN_OTM")
+        if r["parent_codigo"] is None:
+            motivos.append("SIN_PADRE")
+        if not float(r["hh_presup"] or 0):
+            motivos.append("SIN_HH")
+        out.append({**dict(r), "metrado_presup": float(r["metrado_presup"] or 0),
+                    "hh_presup": float(r["hh_presup"] or 0), "motivos": motivos})
+    return out
+
+
+@router.put("/partidas/{partida_id}/ubicar")
+async def ubicar_partida(partida_id: int, body: dict):
+    """Le da OTM y lugar en el WBS a una partida de la bandeja, en un gesto.
+
+    body: {otm_id, parent_codigo?, codigo?}. `codigo` permite renombrarla en el
+    mismo movimiento cuando la OTM destino ya usa ese código (el índice es
+    único por OTM) — de otro modo el planner tendría que ir a editarla aparte.
+    No toca hitos, avances ni HH: solo la ubica."""
+    otm_id = str(body.get("otm_id") or "").strip() or None
+    if not otm_id:
+        raise HTTPException(400, "otm_id requerido: elige la OTM a la que pertenece")
+    parent = str(body.get("parent_codigo") or "").strip() or None
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            p = await con.fetchrow(
+                "SELECT codigo, otm_id FROM ev_partidas WHERE id=$1 AND activo", partida_id)
+            if not p:
+                raise HTTPException(404, "Partida no encontrada")
+            if not await con.fetchval("SELECT 1 FROM otms WHERE id=$1", otm_id):
+                raise HTTPException(400, f"La OTM {otm_id} no existe")
+            codigo = str(body.get("codigo") or "").strip() or p["codigo"]
+            if parent and not await con.fetchval(
+                    "SELECT 1 FROM ev_partidas WHERE codigo=$1 AND otm_id=$2 AND activo",
+                    parent, otm_id):
+                raise HTTPException(
+                    400, f"La OTM {otm_id} no tiene ninguna partida con código {parent} "
+                         f"de la cual colgar esta")
+            nivel, parent_codigo = _wbs_de(codigo, None, parent)
+            try:
+                await con.execute(
+                    """UPDATE ev_partidas SET otm_id=$2, codigo=$3, nivel=$4, parent_codigo=$5
+                       WHERE id=$1""", partida_id, otm_id, codigo, nivel, parent_codigo)
+            except asyncpg.UniqueViolationError:
+                raise HTTPException(
+                    409, f"La OTM {otm_id} ya tiene una partida con código {codigo}: "
+                         f"dale otro código a esta para poder ubicarla")
+    return {"ok": True, "id": partida_id, "otm_id": otm_id, "codigo": codigo,
+            "nivel": nivel, "parent_codigo": parent_codigo}
 
 
 @router.delete("/partidas/{partida_id}")

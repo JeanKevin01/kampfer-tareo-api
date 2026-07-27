@@ -28,6 +28,11 @@ class PartidaIn(BaseModel):
     hh_actualizado: Optional[float] = None   # #6: presupuesto actualizado (default = hh_presup)
     tipo_costo: Optional[str] = None         # 'DIRECTO' (def) | 'INDIRECTO'
     naturaleza: Optional[str] = None         # 'CONTRACTUAL' (def) | 'ADICIONAL'
+    # Lugar en el WBS. Si no vienen se deducen del código (misma regla del
+    # importador): sin esto la partida nace huérfana y el árbol del ISP /
+    # Valor Ganado la muestra suelta al final en vez de dentro de su fase.
+    nivel: Optional[int] = None
+    parent_codigo: Optional[str] = None
     hitos: list[HitoIn]
 
 
