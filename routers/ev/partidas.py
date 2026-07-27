@@ -261,16 +261,25 @@ async def partidas_por_ubicar():
                       p.metrado_presup, p.hh_presup, p.naturaleza, p.nivel, p.parent_codigo,
                       (SELECT count(*) FROM prog_actividades a WHERE a.partida_id = p.id) AS actividades
                FROM ev_partidas p
-               WHERE p.activo AND (p.otm_id IS NULL OR p.parent_codigo IS NULL)
+               WHERE p.activo
+                 AND (p.otm_id IS NULL
+                      -- «suelta del WBS» solo si el CÓDIGO anuncia jerarquía: una
+                      -- partida plana ('E2E-001') o un nodo raíz ('01') tienen
+                      -- parent NULL con toda razón y no son un problema.
+                      OR (p.parent_codigo IS NULL
+                          AND (p.codigo LIKE '%.%' OR p.codigo LIKE '%,%'))
+                      -- sin HH solo cuenta en las HOJAS (fase NOT NULL): un nodo
+                      -- padre del WBS no tiene presupuesto propio.
+                      OR (p.fase IS NOT NULL AND COALESCE(p.hh_presup, 0) <= 0))
                ORDER BY p.otm_id NULLS FIRST, p.codigo""")
     out = []
     for r in rows:
         motivos = []
         if r["otm_id"] is None:
             motivos.append("SIN_OTM")
-        if r["parent_codigo"] is None:
+        if r["parent_codigo"] is None and ("." in r["codigo"] or "," in r["codigo"]):
             motivos.append("SIN_PADRE")
-        if not float(r["hh_presup"] or 0):
+        if r["fase"] is not None and not float(r["hh_presup"] or 0):
             motivos.append("SIN_HH")
         out.append({**dict(r), "metrado_presup": float(r["metrado_presup"] or 0),
                     "hh_presup": float(r["hh_presup"] or 0), "motivos": motivos})
