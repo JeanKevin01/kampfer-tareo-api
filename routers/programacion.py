@@ -1950,14 +1950,21 @@ async def _detalle_semana(con, proyecto_id: int, lunes: date, hasta: date) -> li
     # escribió en la evaluación semanal: la misma precedencia del Pareto
     # (planner > campo). Sin esto habría que teclear la causa dos veces, y
     # dos textos distintos para el mismo hecho es peor que ninguno.
+    # La causa de CAMPO viaja además cruda y aparte: es lo que el supervisor
+    # escribió el día que no salió el trabajo, y es la materia prima con la que
+    # el planner redacta la explicación del cliente. Sin tenerla a la vista al
+    # cerrar habría que ir a buscarla a otra pantalla.
     acts = [dict(r) for r in await con.fetch(
-        """SELECT id, titulo, partida_id, hito_id, estado, supervisor_id, creado_en,
-                  fecha, COALESCE(fecha_fin, fecha) AS fecha_fin,
-                  COALESCE(causa_nc_planner_cat, causa_nc_cat) AS causa_cat,
-                  COALESCE(causa_nc_planner, causa_nc) AS causa
-             FROM prog_actividades
-            WHERE proyecto_id = $1 AND estado <> 'CANCELADO'
-              AND fecha <= $3 AND COALESCE(fecha_fin, fecha) >= $2""",
+        """SELECT a.id, a.titulo, a.partida_id, a.hito_id, a.estado, a.supervisor_id,
+                  a.creado_en, a.fecha, COALESCE(a.fecha_fin, a.fecha) AS fecha_fin,
+                  COALESCE(a.causa_nc_planner_cat, a.causa_nc_cat) AS causa_cat,
+                  COALESCE(a.causa_nc_planner, a.causa_nc) AS causa,
+                  a.causa_nc_cat AS causa_campo_cat, a.causa_nc AS causa_campo,
+                  p.unidad
+             FROM prog_actividades a
+             LEFT JOIN ev_partidas p ON p.id = a.partida_id
+            WHERE a.proyecto_id = $1 AND a.estado <> 'CANCELADO'
+              AND a.fecha <= $3 AND COALESCE(a.fecha_fin, a.fecha) >= $2""",
         proyecto_id, lunes, hasta)]
     if not acts:
         return []
@@ -2022,10 +2029,40 @@ async def _detalle_semana(con, proyecto_id: int, lunes: date, hasta: date) -> li
             "actividad_id": a["id"], "titulo": a["titulo"],
             "partida_id": a["partida_id"], "supervisor_id": a["supervisor_id"],
             "estado": a["estado"], "creado_en": a["creado_en"],
+            "fecha": a["fecha"], "unidad": a["unidad"],
             "comprometido": round(comp.get(a["id"], 0.0), 3),
             "alcanzado": round(alcanzado, 3),
             "causa_cat": a["causa_cat"], "causa": a["causa"],
+            "causa_campo_cat": a["causa_campo_cat"], "causa_campo": a["causa_campo"],
         })
+    return out
+
+
+async def restricciones_semana(con, proyecto_id: int, lunes: date, hasta: date) -> dict:
+    """Restricciones que los supervisores reportaron en la semana, por actividad.
+
+    La actividad SÍ se hizo pero algo le bajó el rendimiento (0032). No afectan
+    el PPC, pero son lo que el planner necesita leer para escribir la causa: si
+    campo reportó tres días seguidos que no llegó el concreto, la explicación
+    del cliente se redacta sola.
+    """
+    out: dict = {}
+    for r in await con.fetch(
+            """SELECT actividad_id, fecha, restricciones FROM campo_reportes
+                WHERE proyecto_id = $1 AND fecha BETWEEN $2 AND $3
+                  AND actividad_id IS NOT NULL AND restricciones IS NOT NULL
+                ORDER BY fecha""", proyecto_id, lunes, hasta):
+        try:
+            items = json.loads(r["restricciones"]) or []
+        except (ValueError, TypeError):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            out.setdefault(r["actividad_id"], []).append({
+                "cat": str(it.get("cat") or "OTROS").upper(),
+                "detalle": str(it.get("detalle") or "").strip(),
+                "fecha": str(r["fecha"])})
     return out
 
 

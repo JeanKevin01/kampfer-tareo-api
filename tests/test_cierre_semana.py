@@ -14,8 +14,8 @@ from datetime import date, datetime, timezone
 import pytest
 from fastapi import HTTPException
 
-from routers.prog_cierre import (es_no_planificada, fecha_corte, ventana_corte,
-                                 veredicto)
+from routers.prog_cierre import (entra_al_cierre, es_no_planificada, fecha_corte,
+                                 ventana_corte, veredicto)
 
 LUNES = date(2026, 7, 27)          # lunes ISO
 DOMINGO = date(2026, 8, 2)
@@ -79,6 +79,34 @@ def test_tolerancia_de_redondeo():
 def test_estados_manuales_mandan():
     assert veredicto(200, 500, "NO_CUMPLIDA") is False
     assert veredicto(200, 0, "EJECUTADO") is True
+
+
+# ── Actividades sin metrado programado ───────────────────────
+# `/ppc` las juzga por estado en la semana de su F.Inicio; el cierre las
+# descartaba. Cerrar movía el PPC que el planner acababa de ver.
+def test_sin_metrado_no_se_da_por_cumplida_sola():
+    """Con la regla del metrado, 0 ≥ 0 daría cumplidas todas las actividades de
+    apoyo y el PPC subiría solo por tenerlas en el plan."""
+    assert veredicto(0, 0, "PROGRAMADO") is False
+
+
+def test_sin_metrado_cumple_si_alguien_la_marco_ejecutada():
+    assert veredicto(0, 0, "EJECUTADO") is True
+
+
+def test_con_metrado_siempre_entra():
+    assert entra_al_cierre(150, date(2026, 7, 20), LUNES) is True
+
+
+def test_sin_metrado_entra_en_la_semana_de_su_inicio():
+    assert entra_al_cierre(0, date(2026, 7, 29), LUNES) is True
+
+
+def test_sin_metrado_no_entra_en_una_semana_que_solo_atraviesa():
+    """Una actividad larga sin metrado se juzga UNA vez, en su semana de inicio;
+    si no, la misma actividad bajaría el PPC de cada semana que atraviesa."""
+    assert entra_al_cierre(0, date(2026, 7, 20), LUNES) is False
+    assert entra_al_cierre(0, None, LUNES) is False
 
 
 # ── Trabajo que entró después del compromiso ─────────────────

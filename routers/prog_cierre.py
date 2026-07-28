@@ -30,7 +30,8 @@ from core.log import get_logger
 from core.tiempo import fecha_lima, parse_fecha
 # Import unidireccional (prog_cierre → programacion) para que el compromiso que
 # se congela sea EXACTAMENTE el que el planner vio en el PPC.
-from routers.programacion import CNC, _detalle_semana, _lunes_de as lunes_de
+from routers.programacion import (
+    CNC, _detalle_semana, _lunes_de as lunes_de, restricciones_semana)
 
 log = get_logger("programacion")
 
@@ -76,12 +77,33 @@ def veredicto(comprometido: float, alcanzado: float, estado: str) -> bool:
     Se compara el TOTAL de la semana, no día por día: si el plan decía 100 el
     jueves y 100 el viernes y se hicieron 50 y 150, cumplió. Los estados
     manuales mandan sobre el metrado, como en /ppc.
+
+    Sin metrado programado no hay nada que comparar, así que manda el estado: al
+    cerrar la semana ya terminó y «en curso» dejó de existir — lo que nadie
+    marcó como ejecutado, no se hizo. (Con la regla del metrado, 0 ≥ 0 las daría
+    todas por cumplidas y el PPC subiría con las actividades de apoyo.)
     """
     if estado == "NO_CUMPLIDA":
         return False
     if estado == "EJECUTADO":
         return True
+    if float(comprometido or 0) <= 0:
+        return False
     return float(alcanzado or 0) >= float(comprometido or 0) - 5e-4
+
+
+def entra_al_cierre(comprometido: float, fecha_inicio, lunes: date) -> bool:
+    """¿Esta actividad se juzga al cerrar esta semana?
+
+    Con metrado programado en la ventana, sí. Sin metrado —actividad de apoyo, o
+    una a la que el re-prorrateo no le dejó saldo— se juzga en la semana de su
+    F.Inicio, que es exactamente lo que hace `/ppc`. El cierre las descartaba, y
+    por eso cerrar movía el PPC que el planner acababa de mirar: el congelado
+    salía calculado sobre menos actividades que el propuesto.
+    """
+    if float(comprometido or 0) > 0:
+        return True
+    return fecha_inicio is not None and lunes_de(fecha_inicio) == lunes
 
 
 def es_no_planificada(creado_en, referencia) -> bool:
@@ -191,6 +213,31 @@ async def _leer_cierre(con, proyecto_id: int, lun: date) -> dict:
     }
 
 
+async def _referencia_campo(con, proyecto_id: int, lun: date, hasta: date,
+                            act_ids: list) -> dict:
+    """Lo que campo dejó escrito esa semana, actividad por actividad.
+
+    Es REFERENCIA, no dato del indicador: la causa que reportó el supervisor el
+    día que no salió y las restricciones que anotó aunque el trabajo sí se
+    hiciera. El planner las lee para redactar la explicación del cliente en vez
+    de escribir «no se pudo» de memoria.
+    """
+    rest = await restricciones_semana(con, proyecto_id, lun, hasta)
+    causas: dict = {}
+    if act_ids:
+        for r in await con.fetch(
+                """SELECT id, causa_nc_cat, causa_nc FROM prog_actividades
+                    WHERE id = ANY($1) AND (causa_nc_cat IS NOT NULL OR causa_nc IS NOT NULL)""",
+                list(act_ids)):
+            causas[r["id"]] = {"cat": r["causa_nc_cat"], "detalle": r["causa_nc"]}
+    out: dict = {}
+    for aid in act_ids:
+        c, rs = causas.get(aid), rest.get(aid) or []
+        if c or rs:
+            out[str(aid)] = {"causa": c, "restricciones": rs}
+    return out
+
+
 @router.get("/cierre-semana")
 async def ver_cierre_semana(lunes: str = "", proyecto_id: int = 1):
     """La semana lista para cerrar, o el cierre ya congelado si existe.
@@ -203,7 +250,12 @@ async def ver_cierre_semana(lunes: str = "", proyecto_id: int = 1):
     async with pool.acquire() as con:
         ya = await _leer_cierre(con, proyecto_id, lun)
         if ya:
-            return {**ya, "cnc_catalogo": CNC}
+            # La referencia de campo sigue viva aunque el veredicto esté
+            # congelado: el número no cambia, pero el sustento se puede releer.
+            campo = await _referencia_campo(
+                con, proyecto_id, lun, parse_fecha(ya["hasta"]) or lun,
+                [a["actividad_id"] for a in ya["actividades"] if a["actividad_id"]])
+            return {**ya, "cnc_catalogo": CNC, "campo": campo}
         cfg = await leer_config_cierre(con, proyecto_id)
         corte, hasta, parcial = ventana_corte(lun, **_kw(cfg))
         filas = await _detalle_semana(con, proyecto_id, lun, hasta)
@@ -215,12 +267,13 @@ async def ver_cierre_semana(lunes: str = "", proyecto_id: int = 1):
         referencia = prev or lun
         nombres = {r["id"]: r["nombre"] for r in await con.fetch(
             "SELECT id, nombre FROM supervisores")}
+        juzgadas = [f for f in filas if entra_al_cierre(f["comprometido"], f["fecha"], lun)]
+        campo = await _referencia_campo(
+            con, proyecto_id, lun, hasta, [f["actividad_id"] for f in juzgadas])
     props = []
-    for f in filas:
-        if f["comprometido"] <= 0:
-            continue
+    for f in juzgadas:
         props.append({
-            **{k: v for k, v in f.items() if k != "creado_en"},
+            **{k: v for k, v in f.items() if k not in ("creado_en", "fecha")},
             "supervisor_nombre": nombres.get(f["supervisor_id"]),
             "cumplida": veredicto(f["comprometido"], f["alcanzado"], f["estado"]),
             "no_planificada": es_no_planificada(f["creado_en"], referencia),
@@ -236,7 +289,7 @@ async def ver_cierre_semana(lunes: str = "", proyecto_id: int = 1):
         "no_cumplidas": len(comprometidas) - len(cumplidas),
         "no_planificadas": sum(1 for p in props if p["no_planificada"]),
         "ppc": (round(len(cumplidas) / len(comprometidas), 4) if comprometidas else None),
-        "actividades": props, "cnc_catalogo": CNC, **cfg,
+        "actividades": props, "cnc_catalogo": CNC, "campo": campo, **cfg,
     }
 
 
@@ -274,7 +327,7 @@ async def cerrar_semana(data: dict):
         referencia = prev or lun
         det = []
         for f in filas:
-            if f["comprometido"] <= 0:
+            if not entra_al_cierre(f["comprometido"], f["fecha"], lun):
                 continue
             aj = ajustes.get(f["actividad_id"], {})
             cumplida = bool(aj["cumplida"]) if "cumplida" in aj else veredicto(
