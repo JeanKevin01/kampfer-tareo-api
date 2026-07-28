@@ -1937,6 +1937,91 @@ async def borrar_restriccion(rest_id: int):
     return {"ok": True}
 
 
+async def _detalle_semana(con, proyecto_id: int, lunes: date, hasta: date) -> list:
+    """Compromiso y avance de UNA semana, actividad por actividad, contando solo
+    hasta `hasta` (el corte, que puede caer antes del domingo).
+
+    Es la misma regla que usa `/ppc` —incluida la atribución del real entre
+    tramos hermanos de la misma partida-etapa— y por eso vive aquí y no en el
+    módulo de cierre: si el cierre congelara números calculados de otra manera,
+    el PPC congelado no coincidiría con el que el planner acababa de ver.
+    """
+    acts = [dict(r) for r in await con.fetch(
+        """SELECT id, titulo, partida_id, hito_id, estado, supervisor_id, creado_en,
+                  fecha, COALESCE(fecha_fin, fecha) AS fecha_fin
+             FROM prog_actividades
+            WHERE proyecto_id = $1 AND estado <> 'CANCELADO'
+              AND fecha <= $3 AND COALESCE(fecha_fin, fecha) >= $2""",
+        proyecto_id, lunes, hasta)]
+    if not acts:
+        return []
+    ids = [a["id"] for a in acts]
+    pids = sorted({a["partida_id"] for a in acts if a["partida_id"]})
+    comp = {r["actividad_id"]: float(r["c"] or 0) for r in await con.fetch(
+        """SELECT actividad_id, SUM(cantidad) AS c FROM prog_metrado_dia
+            WHERE actividad_id = ANY($1) AND fecha BETWEEN $2 AND $3
+            GROUP BY 1""", ids, lunes, hasta)}
+    principal = {r["partida_id"]: r["id"] for r in await con.fetch(
+        """SELECT DISTINCT ON (partida_id) partida_id, id FROM ev_hitos
+            WHERE partida_id = ANY($1)
+            ORDER BY partida_id, es_principal DESC, peso DESC, id""",
+        pids)} if pids else {}
+    # Tramos de la misma partida-etapa, también fuera de la semana: sin esto el
+    # avance de un tramo daría por cumplido al otro.
+    todas = [dict(r) for r in await con.fetch(
+        """SELECT id, partida_id, hito_id, fecha, COALESCE(fecha_fin, fecha) AS fecha_fin
+             FROM prog_actividades
+            WHERE partida_id = ANY($1) AND estado <> 'CANCELADO'""",
+        pids)] if pids else []
+    filas = await con.fetch(
+        """SELECT partida_id, hito_id, fecha, actividad_id, SUM(cantidad_dia) AS c
+             FROM ev_avances_diarios
+            WHERE partida_id = ANY($1) AND fecha BETWEEN $2 AND $3
+              AND cantidad_dia IS NOT NULL
+            GROUP BY 1,2,3,4""", pids, lunes, hasta) if pids else []
+
+    def _etapa(pid, hid):
+        return None if hid is not None and hid == principal.get(pid) else hid
+
+    tramos: dict = {}
+    for x in todas:
+        tramos.setdefault((x["partida_id"], _etapa(x["partida_id"], x["hito_id"])), []).append(x)
+    por_clave: dict = {}
+    dueno_reg: dict = {}
+    for r in filas:
+        clave = (r["partida_id"], _etapa(r["partida_id"], r["hito_id"]))
+        por_clave.setdefault(clave, {})
+        por_clave[clave][r["fecha"]] = por_clave[clave].get(r["fecha"], 0.0) + float(r["c"] or 0)
+        if r["actividad_id"]:
+            dueno_reg[(clave, r["fecha"])] = r["actividad_id"]
+    real_clave: dict = {}
+    real_act: dict = {}
+    for clave, dias in por_clave.items():
+        hermanas = tramos.get(clave, [])
+        dueno = (_dueno_del_real([(f, dueno_reg.get((clave, f))) for f in dias], hermanas)
+                 if len(hermanas) > 1 else {})
+        for f, c in dias.items():
+            aid = dueno.get(f) if dueno else None
+            if aid is None:
+                real_clave[clave] = real_clave.get(clave, 0.0) + c
+            else:
+                real_act[aid] = real_act.get(aid, 0.0) + c
+
+    out = []
+    for a in acts:
+        clave = (a["partida_id"], _etapa(a["partida_id"], a["hito_id"]))
+        alcanzado = (real_act.get(a["id"], 0.0) if len(tramos.get(clave, [])) > 1
+                     else real_clave.get(clave, 0.0)) if a["partida_id"] else 0.0
+        out.append({
+            "actividad_id": a["id"], "titulo": a["titulo"],
+            "partida_id": a["partida_id"], "supervisor_id": a["supervisor_id"],
+            "estado": a["estado"], "creado_en": a["creado_en"],
+            "comprometido": round(comp.get(a["id"], 0.0), 3),
+            "alcanzado": round(alcanzado, 3),
+        })
+    return out
+
+
 @router.get("/ppc")
 async def ppc(proyecto_id: int = 1, semanas: int = 8):
     """PPC (Porcentaje de Plan Cumplido) semanal + Pareto de causas + detalle
@@ -1996,11 +2081,15 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
         supervisores = {r["id"]: r["nombre"] for r in await con.fetch(
             "SELECT id, nombre FROM supervisores")}
         # Pareto (F3 v2): manda la causa del PLANNER; si no existe, la de campo.
+        # Con el lunes, para poder descartar las semanas ya CERRADAS: ahí la
+        # causa que vale es la que quedó congelada en el cierre.
         cnc_rows = await con.fetch(
-            """SELECT COALESCE(causa_nc_planner_cat, causa_nc_cat, 'OTROS') AS causa, count(*) AS n
+            """SELECT (fecha - ((EXTRACT(ISODOW FROM fecha)::int) - 1)) AS lunes,
+                      COALESCE(causa_nc_planner_cat, causa_nc_cat, 'OTROS') AS causa,
+                      count(*) AS n
                FROM prog_actividades
                WHERE proyecto_id = $1 AND estado = 'NO_CUMPLIDA' AND fecha BETWEEN $2 AND $3
-               GROUP BY 1 ORDER BY n DESC""", proyecto_id, desde, hasta)
+               GROUP BY 1, 2""", proyecto_id, desde, hasta)
         # Restricciones reportadas por el supervisor (0032): la actividad SÍ se
         # hizo pero algo le bajó el rendimiento. Van aparte de las causas de
         # no cumplimiento — son cosas distintas y mezclarlas ensucia el PPC.
@@ -2060,13 +2149,15 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
         return reales.get((clave[0], clave[1], lun), 0.0)
 
     sem: dict = {}
-    sup: dict = {}
+    # Por (supervisor, semana), no por supervisor a secas: una semana CERRADA
+    # manda con sus números congelados y hay que poder sustituir solo esa.
+    sup_sem: dict = {}
 
     def _suma(lunes, sup_id, comp, cump, noc):
         s = sem.setdefault(lunes, {"comprometidas": 0, "cumplidas": 0, "no_cumplidas": 0})
         s["comprometidas"] += comp; s["cumplidas"] += cump; s["no_cumplidas"] += noc
         if sup_id:
-            v = sup.setdefault(sup_id, {"comprometidas": 0, "cumplidas": 0})
+            v = sup_sem.setdefault((sup_id, lunes), {"comprometidas": 0, "cumplidas": 0})
             v["comprometidas"] += comp; v["cumplidas"] += cump
 
     for a in acts:
@@ -2108,6 +2199,62 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
                 cump, noc = 0, 0                        # en curso: sin veredicto
             _suma(lun, a["supervisor_id"], 1, cump, noc)
 
+    # ── Semanas CERRADAS: manda lo congelado ──────────────────
+    # Una vez cerrada la semana, su PPC no se recalcula: reprogramar o agregar
+    # trabajo después ya no puede cambiar lo que pasó (§ prog_cierre.py). Las
+    # semanas sin cierre siguen calculándose sobre el plan vigente y se rotulan
+    # como tales, para no dar por firme algo que todavía se mueve.
+    cerradas: dict = {}
+    det_cerrado: dict = {}
+    async with pool.acquire() as con:
+        for r in await con.fetch(
+                """SELECT * FROM prog_semana_cierre
+                    WHERE proyecto_id = $1 AND lunes BETWEEN $2 AND $3""",
+                proyecto_id, desde, hasta):
+            cerradas[r["lunes"]] = dict(r)
+        if cerradas:
+            for r in await con.fetch(
+                    """SELECT c.lunes, d.supervisor_id, d.cumplida, d.no_planificada,
+                              d.causa_cat
+                         FROM prog_semana_cierre_det d
+                         JOIN prog_semana_cierre c ON c.id = d.cierre_id
+                        WHERE c.proyecto_id = $1 AND c.lunes BETWEEN $2 AND $3""",
+                    proyecto_id, desde, hasta):
+                det_cerrado.setdefault(r["lunes"], []).append(dict(r))
+
+    for lun, c in cerradas.items():
+        sem[lun] = {"comprometidas": c["comprometidas"], "cumplidas": c["cumplidas"],
+                    "no_cumplidas": c["no_cumplidas"]}
+        for k in [k for k in sup_sem if k[1] == lun]:
+            sup_sem.pop(k)
+        for d in det_cerrado.get(lun, []):
+            if d["no_planificada"] or not d["supervisor_id"]:
+                continue
+            v = sup_sem.setdefault((d["supervisor_id"], lun),
+                                   {"comprometidas": 0, "cumplidas": 0})
+            v["comprometidas"] += 1
+            v["cumplidas"] += 1 if d["cumplida"] else 0
+
+    sup: dict = {}
+    for (sid, _lun), v in sup_sem.items():
+        acc = sup.setdefault(sid, {"comprometidas": 0, "cumplidas": 0})
+        acc["comprometidas"] += v["comprometidas"]
+        acc["cumplidas"] += v["cumplidas"]
+
+    # Pareto: la causa congelada manda en las semanas cerradas; en las abiertas,
+    # la que tenga hoy la actividad. Nunca las dos, que duplicaría el conteo.
+    cnc_cont: dict = {}
+    for r in cnc_rows:
+        if r["lunes"] in cerradas:
+            continue
+        cnc_cont[r["causa"]] = cnc_cont.get(r["causa"], 0) + int(r["n"])
+    for lun, filas_det in det_cerrado.items():
+        for d in filas_det:
+            if d["cumplida"] or d["no_planificada"]:
+                continue
+            c = d["causa_cat"] or "OTROS"
+            cnc_cont[c] = cnc_cont.get(c, 0) + 1
+
     def _ppc(c, e):
         return round(e / c, 4) if c else None
 
@@ -2138,10 +2285,17 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
             for c, n in sorted(rest_cont.items(), key=lambda kv: -kv[1])],
         "semanal": [{"lunes": str(lun), "comprometidas": v["comprometidas"],
                      "cumplidas": v["cumplidas"], "no_cumplidas": v["no_cumplidas"],
-                     "ppc": _ppc(v["comprometidas"], v["cumplidas"])}
+                     "ppc": _ppc(v["comprometidas"], v["cumplidas"]),
+                     # Congelada = el número ya no se mueve. Sin cerrar, el PPC
+                     # es sobre el plan VIGENTE y puede cambiar: hay que decirlo.
+                     "congelada": lun in cerradas,
+                     "parcial": bool(cerradas.get(lun, {}).get("parcial")),
+                     "hasta": (str(cerradas[lun]["hasta"]) if lun in cerradas
+                               else str(min(lun + timedelta(days=6), hoy))),
+                     "no_planificadas": cerradas.get(lun, {}).get("no_planificadas", 0)}
                     for lun, v in sorted(sem.items())],
-        "cnc": [{"causa": r["causa"], "etiqueta": CNC.get(r["causa"], r["causa"]),
-                 "n": r["n"]} for r in cnc_rows],
+        "cnc": [{"causa": c, "etiqueta": CNC.get(c, c), "n": n}
+                for c, n in sorted(cnc_cont.items(), key=lambda kv: -kv[1])],
         "por_supervisor": [{"supervisor_id": sid, "nombre": supervisores.get(sid),
                             "comprometidas": v["comprometidas"], "cumplidas": v["cumplidas"],
                             "ppc": _ppc(v["comprometidas"], v["cumplidas"])}
