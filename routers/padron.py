@@ -2,13 +2,16 @@
 # routers/padron.py — padrón de trabajadores y supervisores
 # (CRUD, búsqueda, duplicados y fusión)
 # ============================================================
+from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.auth import require_role
 from core.db import db as core_db
-from core.personal import alta_persona
+from core.personal import (alta_persona, asegurar_supervisor,
+                           crear_usuario_supervisor)
+from core.tiempo import fecha_lima, parse_fecha
 
 router = APIRouter(tags=["padron"])
 
@@ -226,6 +229,39 @@ async def crear_supervisor(data: dict, _u: dict = Depends(require_role("oficina"
             "trabajador_id": r["id"], "usuario": r["usuario"], "password": r["password"]}
 
 
+@router.post("/admin/supervisor/desde-trabajador")
+async def nombrar_supervisor(data: dict, _u: dict = Depends(require_role("oficina"))):
+    """Da el rol de supervisor a alguien que YA está en el padrón.
+
+    El camino natural: el supervisor es personal del proyecto, así que primero
+    existe como trabajador y después se le nombra. Escribir el nombre a mano
+    crea una segunda ficha de la misma persona con otro id — y a partir de ahí
+    sus HH y sus partes viven en dos sitios.
+    """
+    trab_id = str(data.get("trabajador_id") or "").strip()
+    if not trab_id:
+        raise HTTPException(400, "trabajador_id es requerido")
+    pool = await core_db()
+    async with pool.acquire() as con:
+        t = await con.fetchrow(
+            "SELECT id, nombre, tipo FROM trabajadores WHERE id = $1", trab_id)
+        if not t:
+            raise HTTPException(404, "Ese trabajador no está en el padrón")
+        async with con.transaction():
+            sup = await asegurar_supervisor(con, t["id"], t["nombre"],
+                                            str(data.get("email") or "").strip())
+            acceso = await crear_usuario_supervisor(con, sup["id"], t["nombre"])
+            # Quien reporta es staff: si estaba como DIRECTO fue un default del
+            # alta, no una decisión.
+            if (t["tipo"] or "DIRECTO") != "INDIRECTO":
+                await con.execute(
+                    "UPDATE trabajadores SET tipo = 'INDIRECTO' WHERE id = $1", t["id"])
+    return {"status": "ok", "id": sup["id"], "nombre": t["nombre"],
+            "trabajador_id": t["id"], "nuevo": sup["nuevo"],
+            "usuario": acceso["username"] if acceso else None,
+            "password": acceso["password"] if acceso else None}
+
+
 @router.put("/admin/supervisor/{sup_id}")
 async def editar_supervisor(sup_id: str, data: dict, _u: dict = Depends(require_role("oficina"))):
     pool = await core_db()
@@ -246,6 +282,148 @@ async def dar_baja_supervisor(sup_id: str, _u: dict = Depends(require_role("ofic
     pool = await core_db()
     await pool.execute("UPDATE supervisores SET activo = false WHERE id = $1", sup_id)
     return {"status": "ok"}
+
+
+# ── Matriz de cumplimiento del reporte (encargo Jean 2026-07-28) ──
+# «Quiero ver por semanas qué fechas reportaron los supervisores y si solo
+#  reportaron HH, si subieron imágenes, si describieron sus actividades, si
+#  pusieron restricciones o si marcaron que no se hizo tal actividad.»
+#
+# El estado diario ya decía si reportó o no. Esto dice QUÉ reportó: un parte con
+# HH y nada más no es lo mismo que uno con fotos, descripción y las trabas del
+# día. Sin verlo por semanas no se distingue al que reporta completo del que
+# manda las horas y se olvida del resto.
+def _dias(desde: date, hasta: date) -> list:
+    return [desde + timedelta(days=i) for i in range((hasta - desde).days + 1)]
+
+
+def _semanas_de(fechas: list) -> list:
+    """Bloques de semana ISO para la cabecera doble de la matriz."""
+    out: list = []
+    for f in fechas:
+        lun = f - timedelta(days=f.isoweekday() - 1)
+        if out and out[-1]["lunes"] == str(lun):
+            out[-1]["n"] += 1
+        else:
+            out.append({"lunes": str(lun), "n": 1})
+    return out
+
+
+CELDA_VACIA = {"hh": 0.0, "trab": 0, "partes": 0, "fotos": 0,
+               "desc": False, "rest": 0, "nc": 0}
+
+
+def pivotar_reportes(fechas: list, supervisores: list, hh: list, partes: list,
+                     fotos: list, nc: list) -> list:
+    """Arma las filas (supervisor × fecha) de la matriz.
+
+    Cada entrada llega como (supervisor_id, fecha, …). Función pura: el SQL de
+    arriba solo agrega, y aquí se decide qué significa cada señal.
+    """
+    idx = {str(f): f for f in fechas}
+    filas = {}
+    for s in supervisores:
+        filas[s["id"]] = {"supervisor_id": s["id"], "nombre": s["nombre"],
+                          "celdas": {}, "tot": dict(CELDA_VACIA, dias=0)}
+
+    def celda(sid, fecha):
+        fila = filas.get(sid)
+        if fila is None or str(fecha) not in idx:
+            return None
+        return fila["celdas"].setdefault(str(fecha), dict(CELDA_VACIA))
+
+    for sid, fecha, horas, ntrab in hh:
+        c = celda(sid, fecha)
+        if c is not None:
+            c["hh"] += float(horas or 0)
+            c["trab"] += int(ntrab or 0)
+    for sid, fecha, n, con_desc, n_rest in partes:
+        c = celda(sid, fecha)
+        if c is not None:
+            c["partes"] += int(n or 0)
+            c["desc"] = c["desc"] or bool(con_desc)
+            c["rest"] += int(n_rest or 0)
+    for sid, fecha, n in fotos:
+        c = celda(sid, fecha)
+        if c is not None:
+            c["fotos"] += int(n or 0)
+    for sid, fecha, n in nc:
+        c = celda(sid, fecha)
+        if c is not None:
+            c["nc"] += int(n or 0)
+
+    for fila in filas.values():
+        tot = fila["tot"]
+        for c in fila["celdas"].values():
+            tot["hh"] += c["hh"]; tot["trab"] += c["trab"]
+            tot["partes"] += c["partes"]; tot["fotos"] += c["fotos"]
+            tot["rest"] += c["rest"]; tot["nc"] += c["nc"]
+            tot["desc"] = tot["desc"] or c["desc"]
+            # Un día cuenta como reportado si hubo CUALQUIER señal, no solo HH:
+            # el parte con fotos y descripción pero sin tareo también es reporte.
+            if c["hh"] or c["partes"] or c["fotos"] or c["nc"]:
+                tot["dias"] += 1
+        tot["hh"] = round(tot["hh"], 2)
+        for c in fila["celdas"].values():
+            c["hh"] = round(c["hh"], 2)
+    return sorted(filas.values(), key=lambda f: f["nombre"])
+
+
+@router.get("/admin/supervisores/matriz")
+async def matriz_supervisores(desde: str = "", hasta: str = "", proyecto_id: int = 1,
+                              _u: dict = Depends(require_role("oficina"))):
+    """Qué reportó cada supervisor, día por día, en el rango pedido."""
+    f_hasta = parse_fecha(hasta) or fecha_lima()
+    f_desde = parse_fecha(desde) or (f_hasta - timedelta(days=27))
+    if f_desde > f_hasta:
+        f_desde, f_hasta = f_hasta, f_desde
+    # Tope de 16 semanas: más no cabe en pantalla ni se lee.
+    if (f_hasta - f_desde).days > 16 * 7:
+        f_desde = f_hasta - timedelta(days=16 * 7 - 1)
+    # La cuadrícula arranca en lunes y termina en domingo: es una vista semanal.
+    f_desde -= timedelta(days=f_desde.isoweekday() - 1)
+    f_hasta += timedelta(days=7 - f_hasta.isoweekday())
+    fechas = _dias(f_desde, f_hasta)
+
+    pool = await core_db()
+    async with pool.acquire() as con:
+        sups = [dict(r) for r in await con.fetch(
+            "SELECT id, nombre FROM supervisores WHERE activo = true ORDER BY nombre")]
+        hh = [(r["supervisor_id"], r["fecha"], r["h"], r["n"]) for r in await con.fetch(
+            """SELECT supervisor_id, fecha, SUM(hh) AS h,
+                      COUNT(DISTINCT trabajador_id) AS n
+                 FROM tareo_partida
+                WHERE fecha BETWEEN $1 AND $2 AND supervisor_id IS NOT NULL
+                GROUP BY 1,2""", f_desde, f_hasta)]
+        partes = [(r["supervisor_id"], r["fecha"], r["n"], r["desc"], r["rest"])
+                  for r in await con.fetch(
+            """SELECT supervisor_id, fecha, count(*) AS n,
+                      bool_or(COALESCE(descripcion,'') <> ''
+                              OR jsonb_array_length(COALESCE(anotaciones,'[]'::jsonb)) > 0) AS desc,
+                      COALESCE(SUM(jsonb_array_length(COALESCE(restricciones,'[]'::jsonb))),0) AS rest
+                 FROM campo_reportes
+                WHERE proyecto_id = $3 AND fecha BETWEEN $1 AND $2
+                  AND supervisor_id IS NOT NULL
+                GROUP BY 1,2""", f_desde, f_hasta, proyecto_id)]
+        fotos = [(r["supervisor_id"], r["fecha"], r["n"]) for r in await con.fetch(
+            """SELECT r.supervisor_id, r.fecha, count(*) AS n
+                 FROM campo_fotos f JOIN campo_reportes r ON r.id = f.reporte_id
+                WHERE r.proyecto_id = $3 AND r.fecha BETWEEN $1 AND $2
+                  AND r.supervisor_id IS NOT NULL
+                GROUP BY 1,2""", f_desde, f_hasta, proyecto_id)]
+        # «No se hizo»: la actividad se cuenta en su F.INICIO, el día en que
+        # debía arrancar — el mismo criterio con el que /ppc juzga las
+        # actividades sin metrado.
+        nc = [(r["supervisor_id"], r["fecha"], r["n"]) for r in await con.fetch(
+            """SELECT supervisor_id, fecha, count(*) AS n
+                 FROM prog_actividades
+                WHERE proyecto_id = $3 AND estado = 'NO_CUMPLIDA'
+                  AND fecha BETWEEN $1 AND $2 AND supervisor_id IS NOT NULL
+                GROUP BY 1,2""", f_desde, f_hasta, proyecto_id)]
+
+    return {"desde": str(f_desde), "hasta": str(f_hasta),
+            "fechas": [str(f) for f in fechas], "semanas": _semanas_de(fechas),
+            "filas": pivotar_reportes(fechas, sups, hh, partes, fotos, nc)}
 
 
 # ── Histograma de personal (encargo Jean 2026-07-26) ─────────
