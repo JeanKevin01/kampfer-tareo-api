@@ -222,8 +222,13 @@ async def crear_supervisor(data: dict, _u: dict = Depends(require_role("oficina"
             # Un supervisor es personal del proyecto: entra al padrón de
             # trabajadores (reutilizando su ficha si ya estaba) y encima recibe
             # el rol y su acceso a la app con la clave inicial.
+            # INDIRECTO por defecto —el alta suelta suele ser staff—, pero se
+            # puede pedir DIRECTO: un capataz que reporta sigue trabajando en
+            # la partida y sus HH son costo directo.
+            tipo = str(data.get("tipo") or "").strip().upper()
             r = await alta_persona(con, nombre, data.get("cargo", "SUPERVISOR"),
-                                   data.get("dni", ""), "INDIRECTO",
+                                   data.get("dni", ""),
+                                   tipo if tipo in ("DIRECTO", "INDIRECTO") else "INDIRECTO",
                                    es_supervisor=True, email=email)
     return {"status": "ok", "id": r["supervisor_id"], "nombre": r["nombre"],
             "trabajador_id": r["id"], "usuario": r["usuario"], "password": r["password"]}
@@ -237,6 +242,8 @@ async def nombrar_supervisor(data: dict, _u: dict = Depends(require_role("oficin
     existe como trabajador y después se le nombra. Escribir el nombre a mano
     crea una segunda ficha de la misma persona con otro id — y a partir de ahí
     sus HH y sus partes viven en dos sitios.
+
+    Reportar es un ROL: no cambia si la persona es directa o indirecta.
     """
     trab_id = str(data.get("trabajador_id") or "").strip()
     if not trab_id:
@@ -251,13 +258,13 @@ async def nombrar_supervisor(data: dict, _u: dict = Depends(require_role("oficin
             sup = await asegurar_supervisor(con, t["id"], t["nombre"],
                                             str(data.get("email") or "").strip())
             acceso = await crear_usuario_supervisor(con, sup["id"], t["nombre"])
-            # Quien reporta es staff: si estaba como DIRECTO fue un default del
-            # alta, no una decisión.
-            if (t["tipo"] or "DIRECTO") != "INDIRECTO":
-                await con.execute(
-                    "UPDATE trabajadores SET tipo = 'INDIRECTO' WHERE id = $1", t["id"])
+            # El tipo NO se toca. Reportar es un rol; directo o indirecto lo
+            # decide de qué bolsa salen sus horas. Un capataz al que ascienden a
+            # tomar el tareo sigue trabajando en la partida y sigue siendo
+            # DIRECTO; pasarlo a indirecto le sacaría las HH del costo directo
+            # y le movería el ISP de su cuadrilla (corrección de Jean).
     return {"status": "ok", "id": sup["id"], "nombre": t["nombre"],
-            "trabajador_id": t["id"], "nuevo": sup["nuevo"],
+            "trabajador_id": t["id"], "nuevo": sup["nuevo"], "tipo": t["tipo"],
             "usuario": acceso["username"] if acceso else None,
             "password": acceso["password"] if acceso else None}
 
