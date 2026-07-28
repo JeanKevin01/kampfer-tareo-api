@@ -1946,9 +1946,15 @@ async def _detalle_semana(con, proyecto_id: int, lunes: date, hasta: date) -> li
     módulo de cierre: si el cierre congelara números calculados de otra manera,
     el PPC congelado no coincidiría con el que el planner acababa de ver.
     """
+    # Las causas viajan para que el cierre PREcargue lo que el planner ya
+    # escribió en la evaluación semanal: la misma precedencia del Pareto
+    # (planner > campo). Sin esto habría que teclear la causa dos veces, y
+    # dos textos distintos para el mismo hecho es peor que ninguno.
     acts = [dict(r) for r in await con.fetch(
         """SELECT id, titulo, partida_id, hito_id, estado, supervisor_id, creado_en,
-                  fecha, COALESCE(fecha_fin, fecha) AS fecha_fin
+                  fecha, COALESCE(fecha_fin, fecha) AS fecha_fin,
+                  COALESCE(causa_nc_planner_cat, causa_nc_cat) AS causa_cat,
+                  COALESCE(causa_nc_planner, causa_nc) AS causa
              FROM prog_actividades
             WHERE proyecto_id = $1 AND estado <> 'CANCELADO'
               AND fecha <= $3 AND COALESCE(fecha_fin, fecha) >= $2""",
@@ -2018,6 +2024,7 @@ async def _detalle_semana(con, proyecto_id: int, lunes: date, hasta: date) -> li
             "estado": a["estado"], "creado_en": a["creado_en"],
             "comprometido": round(comp.get(a["id"], 0.0), 3),
             "alcanzado": round(alcanzado, 3),
+            "causa_cat": a["causa_cat"], "causa": a["causa"],
         })
     return out
 

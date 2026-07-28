@@ -281,12 +281,16 @@ async def cerrar_semana(data: dict):
                 f["comprometido"], f["alcanzado"], f["estado"])
             no_plan = (bool(aj["no_planificada"]) if "no_planificada" in aj
                        else es_no_planificada(f["creado_en"], referencia))
-            cat = str(aj.get("causa_cat") or "").strip().upper() or None
+            # Lo que el planner escriba manda; si no toca nada, se conserva la
+            # causa que la actividad ya traía de la evaluación semanal.
+            cat = str(aj.get("causa_cat") if "causa_cat" in aj
+                      else (f.get("causa_cat") or "")).strip().upper() or None
             if cat and cat not in CNC:
                 raise HTTPException(400, f"Causa desconocida: {cat}")
+            texto = str(aj.get("causa") if "causa" in aj
+                        else (f.get("causa") or "")).strip() or None
             det.append({**f, "cumplida": cumplida, "no_planificada": no_plan,
-                        "causa_cat": cat,
-                        "causa": (str(aj.get("causa") or "").strip() or None)})
+                        "causa_cat": cat, "causa": texto})
         comprometidas = [d for d in det if not d["no_planificada"]]
         cumplidas = sum(1 for d in comprometidas if d["cumplida"])
         async with con.transaction():
