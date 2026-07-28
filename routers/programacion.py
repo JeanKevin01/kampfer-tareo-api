@@ -15,7 +15,8 @@ from datetime import date, timedelta
 from typing import List, Optional
 
 import asyncpg
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import (APIRouter, Depends, File, Form, HTTPException, Query,
+                     UploadFile)
 from fastapi.responses import Response
 
 from core.auth import exigir_identidad_supervisor, require_role
@@ -2066,8 +2067,34 @@ async def restricciones_semana(con, proyecto_id: int, lunes: date, hasta: date) 
     return out
 
 
+def ventana_ppc(hoy: date, semanas: int = 8, desde: str = "", hasta: str = "") -> tuple:
+    """Rango de semanas del PPC: (primer lunes, último domingo).
+
+    Con `desde`/`hasta` manda el rango pedido, alineado a semanas ISO; si no,
+    las últimas N semanas hasta la actual. Sin esto, un reporte del 13 al 26 de
+    julio salía con el histograma y la tendencia de las últimas 8 semanas —
+    incluida la semana en curso, que arrastraba la recta hacia abajo por estar
+    a medio correr.
+    """
+    f_desde, f_hasta = parse_fecha(desde), parse_fecha(hasta)
+    if f_desde:
+        ini = _lunes_de(f_desde)
+        fin = _lunes_de(f_hasta or f_desde)
+        if fin < ini:
+            ini, fin = fin, ini
+        # Mismo tope que `semanas`: 26 semanas de historia por consulta.
+        if (fin - ini).days > 25 * 7:
+            ini = fin - timedelta(days=25 * 7)
+        return ini, fin + timedelta(days=6)
+    n = max(1, min(int(semanas or 8), 26))
+    lun = _lunes_de(hoy)
+    return lun - timedelta(days=(n - 1) * 7), lun + timedelta(days=6)
+
+
 @router.get("/ppc")
-async def ppc(proyecto_id: int = 1, semanas: int = 8):
+async def ppc(proyecto_id: int = 1, semanas: int = 8,
+              p_desde: str = Query("", alias="desde"),
+              p_hasta: str = Query("", alias="hasta")):
     """PPC (Porcentaje de Plan Cumplido) semanal + Pareto de causas + detalle
     por supervisor — el nivel de APRENDIZAJE del LPS.
 
@@ -2080,10 +2107,8 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
     NO_CUMPLIDA → no cumplida (su causa alimenta el Pareto) · EJECUTADO →
     cumplida · CANCELADO se excluye. Las actividades sin celdas programadas
     (sin metrado) se evalúan por estado en la semana de su F.Inicio."""
-    semanas = max(1, min(int(semanas or 8), 26))
     hoy = fecha_lima()
-    hasta = _lunes_de(hoy) + timedelta(days=6)
-    desde = _lunes_de(hoy) - timedelta(days=(semanas - 1) * 7)
+    desde, hasta = ventana_ppc(hoy, semanas, p_desde, p_hasta)
     pool = await db()
     async with pool.acquire() as con:
         acts = [dict(r) for r in await con.fetch(
@@ -2225,19 +2250,25 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8):
                 _suma(lun, a["supervisor_id"], 1, cump, noc)
         else:
             # Sin celdas programadas (actividad de apoyo, o una con metrado a la
-            # que el re-prorrateo no le dejó saldo): se evalúa por estado en la
-            # semana de su F.Inicio, con la MISMA regla de cierre que la rama de
-            # arriba. Antes se quedaba comprometida sin veredicto para siempre:
-            # bajaba el PPC (contaba en el denominador y nunca en el numerador)
-            # y no aparecía en `no_cumplidas`, así que las cifras no cuadraban y
-            # el planner no tenía de dónde agarrarse.
+            # que el re-prorrateo no le dejó saldo): se evalúa en la semana de su
+            # F.Inicio, con la MISMA regla de cierre que la rama de arriba. Antes
+            # se quedaba comprometida sin veredicto para siempre: bajaba el PPC
+            # (contaba en el denominador y nunca en el numerador) y no aparecía
+            # en `no_cumplidas`, así que las cifras no cuadraban.
+            # Sin nada contra qué comparar, el proxy es si hubo ejecución: un
+            # avance registrado vale tanto como la marca de EJECUTADO. Juzgar
+            # solo por estado declaraba NO CUMPLIDA a la actividad que termina
+            # su metrado antes de tiempo — el re-prorrateo le vacía el
+            # compromiso justo por haber cumplido.
             lun = _lunes_de(a["fecha"])
             if not (desde <= lun <= hasta):
                 continue
             cerrada = lun + timedelta(days=6) < hoy
-            if a["estado"] == "EJECUTADO":
+            if a["estado"] == "NO_CUMPLIDA":       # la marca manual manda
+                cump, noc = 0, 1
+            elif a["estado"] == "EJECUTADO" or _alcanzado(a, lun) > 0:
                 cump, noc = 1, 0
-            elif a["estado"] == "NO_CUMPLIDA" or cerrada:
+            elif cerrada:
                 cump, noc = 0, 1
             else:
                 cump, noc = 0, 0                        # en curso: sin veredicto

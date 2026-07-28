@@ -78,18 +78,34 @@ def veredicto(comprometido: float, alcanzado: float, estado: str) -> bool:
     jueves y 100 el viernes y se hicieron 50 y 150, cumplió. Los estados
     manuales mandan sobre el metrado, como en /ppc.
 
-    Sin metrado programado no hay nada que comparar, así que manda el estado: al
-    cerrar la semana ya terminó y «en curso» dejó de existir — lo que nadie
-    marcó como ejecutado, no se hizo. (Con la regla del metrado, 0 ≥ 0 las daría
-    todas por cumplidas y el PPC subiría con las actividades de apoyo.)
+    Sin metrado programado no hay nada contra qué comparar, así que el proxy es
+    si hubo ejecución: avance registrado o marca de EJECUTADO. Los dos extremos
+    importan — con la regla del metrado, 0 ≥ 0 daría por cumplidas todas las
+    actividades de apoyo y el PPC subiría solo por tenerlas en el plan; pero
+    juzgarlas solo por estado declara NO CUMPLIDA a la que termina su metrado
+    antes de tiempo, porque el re-prorrateo le deja el compromiso en cero.
     """
     if estado == "NO_CUMPLIDA":
         return False
     if estado == "EJECUTADO":
         return True
     if float(comprometido or 0) <= 0:
-        return False
+        return float(alcanzado or 0) > 0
     return float(alcanzado or 0) >= float(comprometido or 0) - 5e-4
+
+
+def marcar_no_planificadas(creados: list, referencia) -> list:
+    """Cuáles de las actividades de la semana entraron después del compromiso.
+
+    Con una excepción: si TODAS son posteriores, ninguna se marca. Una marca que
+    le cae al 100% de las filas no distingue nada — y casi siempre significa que
+    el plan se cargó al sistema después de la semana (arranque, carga histórica,
+    datos de prueba), no que la obra improvisara siete días seguidos. Marcarlas
+    todas dejaría la semana con cero comprometidas y sin PPC, que es peor que no
+    avisar: el planner ve un «—» y no sabe por qué.
+    """
+    v = [es_no_planificada(c, referencia) for c in creados]
+    return [False] * len(v) if v and all(v) else v
 
 
 def entra_al_cierre(comprometido: float, fecha_inicio, lunes: date) -> bool:
@@ -270,13 +286,14 @@ async def ver_cierre_semana(lunes: str = "", proyecto_id: int = 1):
         juzgadas = [f for f in filas if entra_al_cierre(f["comprometido"], f["fecha"], lun)]
         campo = await _referencia_campo(
             con, proyecto_id, lun, hasta, [f["actividad_id"] for f in juzgadas])
+    no_plan = marcar_no_planificadas([f["creado_en"] for f in juzgadas], referencia)
     props = []
-    for f in juzgadas:
+    for f, np in zip(juzgadas, no_plan):
         props.append({
             **{k: v for k, v in f.items() if k not in ("creado_en", "fecha")},
             "supervisor_nombre": nombres.get(f["supervisor_id"]),
             "cumplida": veredicto(f["comprometido"], f["alcanzado"], f["estado"]),
-            "no_planificada": es_no_planificada(f["creado_en"], referencia),
+            "no_planificada": np,
         })
     comprometidas = [p for p in props if not p["no_planificada"]]
     cumplidas = [p for p in comprometidas if p["cumplida"]]
@@ -325,15 +342,17 @@ async def cerrar_semana(data: dict):
             "SELECT hasta FROM prog_semana_cierre WHERE proyecto_id=$1 AND lunes=$2",
             proyecto_id, lun - timedelta(days=7))
         referencia = prev or lun
+        juzgadas = [f for f in filas if entra_al_cierre(f["comprometido"], f["fecha"], lun)]
+        # La misma marca que vio el planner en la propuesta: si la calculáramos
+        # distinto aquí, cerraría algo diferente de lo que reviso.
+        no_plan_auto = marcar_no_planificadas([f["creado_en"] for f in juzgadas], referencia)
         det = []
-        for f in filas:
-            if not entra_al_cierre(f["comprometido"], f["fecha"], lun):
-                continue
+        for f, np_auto in zip(juzgadas, no_plan_auto):
             aj = ajustes.get(f["actividad_id"], {})
             cumplida = bool(aj["cumplida"]) if "cumplida" in aj else veredicto(
                 f["comprometido"], f["alcanzado"], f["estado"])
             no_plan = (bool(aj["no_planificada"]) if "no_planificada" in aj
-                       else es_no_planificada(f["creado_en"], referencia))
+                       else np_auto)
             # Lo que el planner escriba manda; si no toca nada, se conserva la
             # causa que la actividad ya traía de la evaluación semanal.
             cat = str(aj.get("causa_cat") if "causa_cat" in aj
