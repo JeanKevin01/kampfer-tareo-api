@@ -1262,6 +1262,18 @@ def main():
           and (pl.get("restricciones") or [{}])[0].get("cat") == "EQUIPOS",
           f"status={r.status_code} plantilla={pl} ph={ph}")
 
+    # P49b — La misma ayuda para una partida que el planner NO programó: cuando
+    # el supervisor abre el parte todavía no hay actividad de la que colgarse,
+    # así que se pregunta por la partida. Sin argumentos, 422.
+    r = c.get(f"{API}/campo/reporte-plantilla", params={"partida_id": p1["id"]})
+    plp = r.json() if r.status_code == 200 else {}
+    r2 = c.get(f"{API}/campo/reporte-plantilla")
+    check("P49b plantilla por partida: sirve sin actividad previa (y 422 sin argumentos)",
+          r.status_code == 200 and plp.get("frente") == "BAHIA 4"
+          and "Corte de esparragos" in (plp.get("anotaciones") or [])
+          and r2.status_code == 422,
+          f"status={r.status_code} plantilla={plp} sin_args={r2.status_code}")
+
     # P50 — RESTRICCIONES EN EL PPC: las que reportó el supervisor (con la
     # actividad SÍ ejecutada) salen por actividad para la tabla F030b y en su
     # propio Pareto, SIN mezclarse con las causas de no cumplimiento.

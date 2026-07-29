@@ -3250,11 +3250,36 @@ async def frentes_otm(otm_id: str = "", user: dict = Depends(require_role())):
 
 
 @router_campo.get("/reporte-plantilla")
-async def reporte_plantilla(actividad_id: int, user: dict = Depends(require_role())):
+async def reporte_plantilla(actividad_id: Optional[int] = None,
+                            partida_id: Optional[int] = None,
+                            user: dict = Depends(require_role())):
     """Último reporte de ESA misma partida/hito, para reusarlo como plantilla:
     el supervisor solo cambia lo que cambió en vez de escribir todo de nuevo.
-    Devuelve {} si es la primera vez que se reporta esa partida."""
+    Devuelve {} si es la primera vez que se reporta esa partida.
+
+    Se puede preguntar por `actividad_id` (actividad programada) o por
+    `partida_id`: una partida que el planner no programó todavía no tiene fila
+    en el LookAhead cuando el supervisor abre el parte, y aun así merece la
+    misma ayuda — si ya la reportó otro día, no debería reescribirlo todo."""
+    if actividad_id is None and partida_id is None:
+        raise HTTPException(422, "Indica actividad_id o partida_id")
     pool = await db()
+    if actividad_id is None:
+        # Sin actividad: cualquier hito de esa partida sirve como base.
+        prev = await pool.fetchrow(
+            """SELECT r.id, r.fecha::text AS fecha, r.area, r.frente, r.turno,
+                      r.anotaciones, r.restricciones
+               FROM campo_reportes r
+               JOIN prog_actividades a ON a.id = r.actividad_id
+              WHERE a.partida_id = $1
+                AND (r.anotaciones IS NOT NULL OR r.area IS NOT NULL)
+              ORDER BY r.fecha DESC, r.id DESC LIMIT 1""", partida_id)
+        if not prev:
+            return {}
+        return {"fecha": prev["fecha"], "area": prev["area"], "frente": prev["frente"],
+                "turno": prev["turno"],
+                "anotaciones": json.loads(prev["anotaciones"]) if prev["anotaciones"] else [],
+                "restricciones": json.loads(prev["restricciones"]) if prev["restricciones"] else []}
     act = await pool.fetchrow(
         "SELECT partida_id, hito_id, otm_id FROM prog_actividades WHERE id = $1", actividad_id)
     if not act:
