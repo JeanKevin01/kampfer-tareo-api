@@ -3401,6 +3401,40 @@ async def reporte_dia(fecha: str = "", supervisor_id: str = "", proyecto_id: int
     return {"fecha": f.isoformat(), "partes": out}
 
 
+async def _actividad_para_parte(con, partida_id: int, otm_id: str, supervisor_id: str,
+                                fecha: date, creado_por) -> Optional[int]:
+    """La actividad a la que se cuelga el parte de una partida NO programada.
+
+    Decisión de Jean: el trabajo ocurrió, así que entra al LookAhead. Es lo que
+    dice Last Planner — lo que el planner no previó es justo lo que hay que
+    medir, y el cierre semanal ya lo cuenta como NO PLANIFICADO (lo deduce de
+    que la fila nació después de empezada la semana, § prog_cierre).
+
+    Si ese supervisor ya tiene una actividad viva de esa partida ese día, se
+    reusa: mandar dos partes del mismo frente no puede crear dos filas.
+    """
+    p = await con.fetchrow(
+        "SELECT id, codigo, descripcion FROM ev_partidas WHERE id = $1 AND activo",
+        partida_id)
+    if not p:
+        raise HTTPException(400, "La partida no existe o está desactivada")
+    ya = await con.fetchval(
+        """SELECT id FROM prog_actividades
+            WHERE partida_id = $1 AND supervisor_id = $2 AND estado <> 'CANCELADO'
+              AND $3 BETWEEN fecha AND COALESCE(fecha_fin, fecha)
+              AND NOT EXISTS (SELECT 1 FROM prog_actividades h WHERE h.padre_id = prog_actividades.id)
+            ORDER BY id LIMIT 1""", partida_id, supervisor_id, fecha)
+    if ya:
+        return ya
+    titulo = (p["descripcion"] or p["codigo"] or "Trabajo no programado")[:120]
+    return await con.fetchval(
+        """INSERT INTO prog_actividades
+             (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo,
+              supervisor_id, creado_por, modo_fecha)
+           VALUES (1, $1, $1, $2, $3, $4, $5, $6, 'INICIO_FIN') RETURNING id""",
+        fecha, otm_id or None, partida_id, titulo, supervisor_id, creado_por)
+
+
 @router_campo.post("/reportes")
 async def crear_reporte(
     proyecto_id: int = Form(1),
@@ -3409,6 +3443,12 @@ async def crear_reporte(
     supervisor_id: str = Form(...),
     descripcion: str = Form(""),
     actividad_id: Optional[int] = Form(None),
+    # Partida que se trabajó SIN estar programada: el parte no tiene actividad a
+    # la que colgarse, así que se crea aquí (ver `_actividad_para_parte`). Va
+    # como dato del formulario y no como una llamada aparte a propósito: la app
+    # de campo guarda el parte en su outbox y lo manda cuando hay señal, así que
+    # no puede depender de una respuesta previa del servidor.
+    partida_id: Optional[int] = Form(None),
     id_local: Optional[str] = Form(None),
     area: str = Form(""),             # legado: se IGNORA (el área la fija el proyecto)
     frente: str = Form(""),           # zona concreta donde trabajó la cuadrilla
@@ -3483,6 +3523,13 @@ async def crear_reporte(
                     # mañana cambia otms.area los partes viejos no se alteran.
                     area_proy = await con.fetchval(
                         "SELECT area FROM otms WHERE id = $1", otm_id.strip())
+                    # Partida trabajada sin programar: su fila nace aquí, para
+                    # que el parte tenga de dónde colgarse y el trabajo no
+                    # planificado quede contado en el PPC.
+                    if actividad_id is None and partida_id:
+                        actividad_id = await _actividad_para_parte(
+                            con, partida_id, otm_id.strip(), supervisor_id.strip(),
+                            f_rep, user.get("sub"))
                     rid = await con.fetchval(
                         """INSERT INTO campo_reportes
                            (proyecto_id, fecha, otm_id, actividad_id, supervisor_id, descripcion,
