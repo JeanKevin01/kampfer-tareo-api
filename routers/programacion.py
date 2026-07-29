@@ -319,13 +319,32 @@ _HITO_CLAVE = """
 """
 
 
+# Un TRAMO (sub-fila «Frente / Tramo / Sector», 0038) no entra en este reparto:
+# guarda su propio real con tramo_id y por eso no compite por el del día. Su
+# PADRE tampoco: es un contenedor, no tiene celdas propias — lo que se ve en su
+# fila es la suma de los hijos.
+_CLASICAS = """
+      AND NOT a.es_frente
+      AND NOT EXISTS (SELECT 1 FROM prog_actividades h WHERE h.padre_id = a.id)
+"""
+
+
 async def _hermanas(con, partida_id: int, hito_id: Optional[int]) -> list:
-    """Actividades vivas de la MISMA partida y etapa (incluida la propia)."""
+    """Actividades vivas de la MISMA partida y etapa (incluida la propia), sin
+    contar tramos ni contenedores: solo las que se reparten el real del día."""
     return [dict(r) for r in await con.fetch(
-        f"""SELECT id, fecha, COALESCE(fecha_fin, fecha) AS fecha_fin
-              FROM prog_actividades
-             WHERE partida_id = $1 AND estado <> 'CANCELADO' AND {_HITO_CLAVE}""",
+        f"""SELECT a.id, a.fecha, COALESCE(a.fecha_fin, a.fecha) AS fecha_fin
+              FROM prog_actividades a
+             WHERE a.partida_id = $1 AND a.estado <> 'CANCELADO'
+               {_CLASICAS} AND {_HITO_CLAVE}""",
         partida_id, hito_id)]
+
+
+async def _es_contenedor(con, act_id: int) -> bool:
+    """¿La fila tiene sub-filas colgando? Entonces no se programa ni se avanza
+    en ella: eso se hace en sus hijos."""
+    return bool(await con.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM prog_actividades WHERE padre_id = $1)", act_id))
 
 
 async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) -> None:
@@ -344,6 +363,11 @@ async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) 
         sigue apuntando a terminar en su F.Fin con lo que falta.
     Con solo_despues_de (al registrar un avance): los días ANTERIORES no se
     tocan ("eso ya se hizo") y el saldo cae solo en los días posteriores."""
+    if await _es_contenedor(con, act["id"]):
+        # La fila padre no tiene plan propio: lo que muestra por día es la suma
+        # de sus sub-filas. Si tuviera celdas, el metrado se contaría dos veces.
+        await con.execute("DELETE FROM prog_metrado_dia WHERE actividad_id = $1", act["id"])
+        return
     desde, hasta = act["fecha"], act["fecha_fin"] or act["fecha"]
     dias_semana, feriados = await _calendario(con, act["proyecto_id"], desde, hasta)
     saltos = set(act.get("dias_salto") or [])
@@ -356,19 +380,28 @@ async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) 
         # rango viejo sigue descontando del saldo (si no, el metrado completo
         # reaparecería prorrateado como si nada se hubiera hecho). Una
         # actividad del hito principal equivale a una sin hito (NULL).
-        filas = await con.fetch(
-            f"""SELECT fecha, cantidad_dia, actividad_id FROM ev_avances_diarios ad
-               WHERE partida_id = $1 AND cantidad_dia IS NOT NULL AND {_HITO_CLAVE}""",
-            act["partida_id"], act.get("hito_id"))
-        reales = {r["fecha"]: float(r["cantidad_dia"]) for r in filas}
-        # Si la partida-etapa se programó en varios tramos, cada uno descuenta
-        # SOLO el real que le toca: si no, el avance de un tramo le vacía el
-        # plan al otro (§ _dueno_del_real).
-        hermanas = await _hermanas(con, act["partida_id"], act.get("hito_id"))
-        if len(hermanas) > 1:
-            dueno = _dueno_del_real(
-                [(r["fecha"], r["actividad_id"]) for r in filas], hermanas)
-            reales = {f: c for f, c in reales.items() if dueno.get(f) == act["id"]}
+        if act.get("es_frente"):
+            # Sub-fila (0038): su real es suyo y de nadie más — no hay reparto
+            # que adivinar. Es lo que hace verdadero el historial por área.
+            filas = await con.fetch(
+                """SELECT fecha, cantidad_dia FROM ev_avances_diarios
+                   WHERE tramo_id = $1 AND cantidad_dia IS NOT NULL""", act["id"])
+            reales = {r["fecha"]: float(r["cantidad_dia"]) for r in filas}
+        else:
+            filas = await con.fetch(
+                f"""SELECT fecha, cantidad_dia, actividad_id FROM ev_avances_diarios ad
+                   WHERE partida_id = $1 AND cantidad_dia IS NOT NULL
+                     AND tramo_id IS NULL AND {_HITO_CLAVE}""",
+                act["partida_id"], act.get("hito_id"))
+            reales = {r["fecha"]: float(r["cantidad_dia"]) for r in filas}
+            # Si la partida-etapa se programó en varios tramos, cada uno descuenta
+            # SOLO el real que le toca: si no, el avance de un tramo le vacía el
+            # plan al otro (§ _dueno_del_real).
+            hermanas = await _hermanas(con, act["partida_id"], act.get("hito_id"))
+            if len(hermanas) > 1:
+                dueno = _dueno_del_real(
+                    [(r["fecha"], r["actividad_id"]) for r in filas], hermanas)
+                reales = {f: c for f, c in reales.items() if dueno.get(f) == act["id"]}
 
     # Celdas manuales del rango vigente: plan fino del planner, se protege.
     manuales = {r["fecha"]: float(r["cantidad"]) for r in await con.fetch(
@@ -568,6 +601,62 @@ def _desglose(v) -> Optional[str]:
     return s[:40] or None
 
 
+def herencia_subfila(padre: dict, es_frente: bool, und, metrado, hito_id) -> dict:
+    """Qué hereda una sub-fila de la fila que la contiene. PURA (0038).
+
+    La sub-fila NO elige partida ni OTM: son las de su padre, o su metrado se
+    descontaría del presupuesto de otra partida y el saldo dejaría de cuadrar.
+    Un «Frente / Tramo / Sector» hereda además la etapa (hito) del padre —la
+    necesita para alimentar el % de Valor Ganado—, mientras que una sub-etapa
+    trae la suya. Y si no se teclea metrado, se hereda el del padre: es el caso
+    de dividir en dos una fila que ya estaba programada.
+    """
+    return {
+        "partida_id": padre["partida_id"],
+        "otm_id": padre["otm_id"],
+        "und": und or padre.get("und"),
+        "hito_id": padre.get("hito_id") if es_frente else hito_id,
+        "metrado": metrado if metrado is not None else (float(padre.get("metrado_prog") or 0) or None),
+    }
+
+
+async def _padre_para_hijo(con, padre_id: int, proyecto_id: int) -> dict:
+    """Valida la fila de la que cuelga una sub-fila y devuelve lo que se hereda.
+
+    Un solo nivel a propósito: el árbol del LookAhead se lee de un vistazo en la
+    reunión y con nietos deja de leerse. Área y capa (0037) ya dan las dos
+    dimensiones dentro del mismo nivel.
+    """
+    p = await con.fetchrow(
+        """SELECT id, proyecto_id, otm_id, partida_id, hito_id, und, padre_id,
+                  metrado_prog, titulo
+             FROM prog_actividades WHERE id = $1""", padre_id)
+    if not p:
+        raise HTTPException(404, "La fila de la que quieres colgar no existe")
+    if p["padre_id"] is not None:
+        raise HTTPException(400, "Una sub-fila no se puede volver a subdividir")
+    if p["proyecto_id"] != proyecto_id:
+        raise HTTPException(400, "La sub-fila tiene que ser del mismo proyecto")
+    if not p["partida_id"]:
+        raise HTTPException(
+            400, "Asígnale una partida a la fila antes de dividirla: el metrado de las "
+                 "sub-filas se descuenta de esa partida")
+    return dict(p)
+
+
+async def _mudar_al_contenedor(con, padre: dict, hijo_id: int, es_frente: bool) -> None:
+    """El padre pasa a ser contenedor al aparecer su primera sub-fila: su plan
+    diario y su metrado dejan de ser propios (lo que muestra es la suma de los
+    hijos) y el avance que ya tuviera se le atribuye al primer hijo, para que el
+    historial no se pierda al dividir una fila que ya estaba en marcha."""
+    await con.execute("UPDATE prog_actividades SET metrado_prog = 0 WHERE id = $1", padre["id"])
+    await con.execute("DELETE FROM prog_metrado_dia WHERE actividad_id = $1", padre["id"])
+    if es_frente:
+        await con.execute(
+            """UPDATE ev_avances_diarios SET tramo_id = $2
+                WHERE actividad_id = $1 AND tramo_id IS NULL""", padre["id"], hijo_id)
+
+
 @router.post("/actividades")
 async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina"))):
     fecha = parse_fecha(data.get("fecha"))
@@ -585,12 +674,24 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
         raise HTTPException(400, "Un día no puede ser salto y medio día a la vez")
     partida_id = int(data["partida_id"]) if data.get("partida_id") else None
     hito_id = int(data["hito_id"]) if data.get("hito_id") else None
-    _exigir_partida(metrado, partida_id)
+    padre_id = int(data["padre_id"]) if data.get("padre_id") else None
+    if padre_id is None:
+        _exigir_partida(metrado, partida_id)
     proyecto_id = int(data.get("proyecto_id") or 1)
     modo = _parse_modo(data.get("modo_fecha"))
     plazo = _parse_plazo(data.get("plazo_dias"))
+    otm_id = (str(data["otm_id"]).strip() or None) if data.get("otm_id") else None
+    # Sub-fila (0038): por defecto es un «Frente / Tramo / Sector»; con
+    # es_frente=false es una sub-etapa (un hito de la partida).
+    es_frente = bool(data.get("es_frente", True)) if padre_id else False
     pool = await db()
     async with pool.acquire() as con:
+        padre = None
+        if padre_id:
+            padre = await _padre_para_hijo(con, padre_id, proyecto_id)
+            h = herencia_subfila(padre, es_frente, und, metrado, hito_id)
+            partida_id, otm_id = h["partida_id"], h["otm_id"]
+            und, hito_id, metrado = h["und"], h["hito_id"], h["metrado"]
         if hito_id:
             await _validar_hito(con, partida_id, hito_id)
         # Con plazo se deriva la fecha que falte (0034); sin él, el plazo sale
@@ -606,19 +707,27 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
                     """INSERT INTO prog_actividades
                        (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo, descripcion,
                         responsable, supervisor_id, metrado_prog, und, dias_salto, dias_medio,
-                        hito_id, creado_por, plazo_dias, modo_fecha, desglose_1, desglose_2)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+                        hito_id, creado_por, plazo_dias, modo_fecha, desglose_1, desglose_2,
+                        padre_id, es_frente)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
+                               $20,$21)
                        RETURNING *""",
-                    proyecto_id, fecha, fecha_fin,
-                    (str(data["otm_id"]).strip() or None) if data.get("otm_id") else None,
-                    partida_id,
+                    proyecto_id, fecha, fecha_fin, otm_id, partida_id,
                     titulo, data.get("descripcion") or None, data.get("responsable") or None,
                     (str(data["supervisor_id"]).strip() or None) if data.get("supervisor_id") else None,
                     metrado, und, saltos, medios, hito_id, user.get("sub"), plazo, modo,
-                    _desglose(data.get("desglose_1")), _desglose(data.get("desglose_2")))
+                    _desglose(data.get("desglose_1")), _desglose(data.get("desglose_2")),
+                    padre_id, es_frente)
             except _ERRORES_DATO:
                 raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
+            if padre is not None:
+                await _mudar_al_contenedor(con, padre, row["id"], es_frente)
             await _redistribuir(con, dict(row))
+            if padre is not None:
+                # El padre acaba de perder su plan propio: sus celdas se borran
+                # y desde ahora la fila muestra la suma de sus sub-filas.
+                await _redistribuir(con, {**padre, "fecha": fecha, "fecha_fin": fecha_fin,
+                                          "metrado_prog": 0})
     return dict(row)
 
 
@@ -647,6 +756,13 @@ async def editar_actividad(act_id: int, data: dict):
     if "fecha_fin" in data:
         campos.append("fecha_fin"); valores.append(parse_fecha(data["fecha_fin"]))
     if "metrado_prog" in data:
+        # El metrado de un contenedor es la suma de sus sub-filas: si se pudiera
+        # escribir aquí, el mismo metrado se contaría dos veces contra la partida.
+        pool_g = await db()
+        async with pool_g.acquire() as con_g:
+            if await _es_contenedor(con_g, act_id) and _parse_metrado(data["metrado_prog"]):
+                raise HTTPException(
+                    409, "Esta fila está dividida: el metrado se edita en cada sub-fila")
         campos.append("metrado_prog"); valores.append(_parse_metrado(data["metrado_prog"]))
     if "und" in data:
         campos.append("und")
@@ -736,13 +852,20 @@ async def editar_actividad(act_id: int, data: dict):
 
 
 @router.delete("/actividades/{act_id}")
-async def borrar_actividad(act_id: int):
+async def borrar_actividad(act_id: int, con_subfilas: bool = False):
     pool = await db()
     async with pool.acquire() as con:
         n_reps = await con.fetchval(
             "SELECT count(*) FROM campo_reportes WHERE actividad_id = $1", act_id)
         if n_reps:
             raise HTTPException(409, "La actividad tiene reportes de campo; cancélala en vez de borrarla")
+        # Borrar el padre se lleva a los hijos (CASCADE, 0038): que no pase sin
+        # que quien lo pide sepa cuántas sub-filas se van con él.
+        n_sub = await con.fetchval(
+            "SELECT count(*) FROM prog_actividades WHERE padre_id = $1", act_id)
+        if n_sub and not con_subfilas:
+            raise HTTPException(
+                409, f"Esta fila tiene {n_sub} sub-fila(s): al borrarla se borran también")
         n = await con.execute("DELETE FROM prog_actividades WHERE id = $1", act_id)
     if n == "DELETE 0":
         raise HTTPException(404, "Actividad no encontrada")
@@ -893,6 +1016,66 @@ async def ver_saldo_partida(partida_id: int, proyecto_id: int = 1, excluir: int 
     }
 
 
+@router.get("/historial-partida")
+async def historial_partida(partida_id: int, proyecto_id: int = 1):
+    """Todo lo que se programó de una partida y cómo terminó cada sub-fila.
+
+    Es la pregunta que se hace en la reunión cuando una partida grande lleva
+    meses avanzando de a pocos: «¿qué áreas ya cerré y cuánto me queda?». Trae
+    también las TERMINADAS, que en la cuadrícula se ocultan justo para que no
+    estorben, y el avance por día de cada una — el de verdad, no el repartido
+    (0038).
+    """
+    pool = await db()
+    async with pool.acquire() as con:
+        p = await con.fetchrow(
+            """SELECT id, codigo, descripcion, unidad, COALESCE(metrado_presup,0) AS metrado_presup
+                 FROM ev_partidas WHERE id = $1""", partida_id)
+        if not p:
+            raise HTTPException(404, "Partida no encontrada")
+        filas = [dict(r) for r in await con.fetch(
+            """SELECT a.id, a.padre_id, a.es_frente, a.titulo, a.estado, a.fecha,
+                      COALESCE(a.fecha_fin, a.fecha) AS fecha_fin, a.metrado_prog,
+                      a.desglose_1, a.desglose_2, a.supervisor_id, a.responsable,
+                      s.nombre AS supervisor_nombre, h.descripcion AS hito_desc,
+                      (SELECT COALESCE(SUM(cantidad_dia),0) FROM ev_avances_diarios d
+                        WHERE d.tramo_id = a.id) AS real_tramo
+                 FROM prog_actividades a
+                 LEFT JOIN supervisores s ON s.id = a.supervisor_id
+                 LEFT JOIN ev_hitos h ON h.id = a.hito_id
+                WHERE a.partida_id = $1 AND a.proyecto_id = $2
+                ORDER BY a.desglose_1 NULLS LAST, a.desglose_2 NULLS LAST, a.fecha, a.id""",
+            partida_id, proyecto_id)]
+        ids = [f["id"] for f in filas]
+        dias = await con.fetch(
+            """SELECT tramo_id, fecha::text AS f, cantidad_dia FROM ev_avances_diarios
+                WHERE tramo_id = ANY($1) AND cantidad_dia IS NOT NULL
+                ORDER BY fecha""", ids) if ids else []
+        ejec = float(await con.fetchval(
+            """SELECT COALESCE(SUM(cantidad_dia),0) FROM ev_avances_diarios
+                WHERE partida_id = $1 AND cantidad_dia IS NOT NULL""", partida_id) or 0)
+    por_dia: dict = {}
+    for r in dias:
+        por_dia.setdefault(r["tramo_id"], {})[r["f"]] = float(r["cantidad_dia"])
+    prog = sum(float(f["metrado_prog"] or 0) for f in filas if f["estado"] != "CANCELADO")
+    return {
+        "partida_id": p["id"], "codigo": p["codigo"], "descripcion": p["descripcion"],
+        "unidad": p["unidad"],
+        **saldo_partida(p["metrado_presup"], prog, ejec),
+        "filas": [{
+            "id": f["id"], "padre_id": f["padre_id"], "es_frente": f["es_frente"],
+            "titulo": f["titulo"], "estado": f["estado"],
+            "fecha": str(f["fecha"]), "fecha_fin": str(f["fecha_fin"]),
+            "metrado_prog": float(f["metrado_prog"]) if f["metrado_prog"] is not None else None,
+            "desglose_1": f["desglose_1"], "desglose_2": f["desglose_2"],
+            "hito_desc": f["hito_desc"],
+            "responsable": f["supervisor_nombre"] or f["responsable"],
+            "real": round(float(f["real_tramo"] or 0), 3),
+            "dias": por_dia.get(f["id"], {}),
+        } for f in filas],
+    }
+
+
 @router.get("/desgloses")
 async def valores_desglose(partida_id: int = 0, proyecto_id: int = 1):
     """Áreas y capas ya usadas — para autocompletar en vez de teclear.
@@ -1033,7 +1216,8 @@ async def _rollup_ev_avances(con, partida_id: int) -> None:
 async def registrar_avance_partida(con, partida_id: int, fecha: date, cantidad,
                                    notas=None, actualizar_notas: bool = False,
                                    hito_id: Optional[int] = None,
-                                   actividad_id: Optional[int] = None) -> None:
+                                   actividad_id: Optional[int] = None,
+                                   tramo_id: Optional[int] = None) -> None:
     """Escritura ÚNICA del avance real diario (F1 LookAhead v2 / auditoría F-2):
     upsert (o DELETE si cantidad es None) en ev_avances_diarios y re-prorrateo
     de TODA actividad del LookAhead vinculada a la partida cuyo rango cubre la
@@ -1043,7 +1227,10 @@ async def registrar_avance_partida(con, partida_id: int, fecha: date, cantidad,
     principal). Tras escribir, _rollup_ev_avances deriva ev_avances (la entrada
     del motor EV): un solo dato alimenta LookAhead, VG diario y % de avance.
     actividad_id = de qué actividad del LookAhead vino (0035); NULL cuando el
-    avance se carga desde Valor Ganado y entonces se atribuye por fechas."""
+    avance se carga desde Valor Ganado y entonces se atribuye por fechas.
+    tramo_id = sub-fila «Frente / Tramo / Sector» dueña del registro (0038):
+    con él, dos áreas que avanzan el MISMO día guardan cada una su cifra en vez
+    de repartirse un total. NULL = avance de la partida, como siempre."""
     from routers.ev._datos import _fecha_base
     # Convención dura: el hito principal SIEMPRE se guarda como NULL (las
     # vistas por partida — semana-grid, matriz — leen NULL = cant. instalada).
@@ -1053,8 +1240,9 @@ async def registrar_avance_partida(con, partida_id: int, fecha: date, cantidad,
     if cantidad is None:
         await con.execute(
             """DELETE FROM ev_avances_diarios WHERE partida_id = $1 AND fecha = $2
-               AND COALESCE(hito_id, 0) = COALESCE($3, 0)""",
-            partida_id, fecha, hito_id)
+               AND COALESCE(hito_id, 0) = COALESCE($3, 0)
+               AND COALESCE(tramo_id, 0) = COALESCE($4, 0)""",
+            partida_id, fecha, hito_id, tramo_id)
     else:
         base = await _fecha_base(con)
         semana = max(1, semana_de(fecha, base)) if base else 1
@@ -1065,22 +1253,23 @@ async def registrar_avance_partida(con, partida_id: int, fecha: date, cantidad,
             await con.execute(
                 """INSERT INTO ev_avances_diarios
                      (partida_id, fecha, semana, cantidad_dia, notas, hito_id,
-                      actividad_id, registrado_en)
-                   VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-                   ON CONFLICT (partida_id, fecha, COALESCE(hito_id, 0))
+                      actividad_id, tramo_id, registrado_en)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+                   ON CONFLICT (partida_id, fecha, COALESCE(hito_id, 0), COALESCE(tramo_id, 0))
                    DO UPDATE SET cantidad_dia = $4, notas = $5, registrado_en = NOW(),
                      actividad_id = COALESCE($7, ev_avances_diarios.actividad_id)""",
-                partida_id, fecha, semana, cantidad, notas, hito_id, actividad_id)
+                partida_id, fecha, semana, cantidad, notas, hito_id, actividad_id,
+                tramo_id)
         else:
             await con.execute(
                 """INSERT INTO ev_avances_diarios
                      (partida_id, fecha, semana, cantidad_dia, hito_id,
-                      actividad_id, registrado_en)
-                   VALUES ($1, $2, $3, $4, $5, $6, NOW())
-                   ON CONFLICT (partida_id, fecha, COALESCE(hito_id, 0))
+                      actividad_id, tramo_id, registrado_en)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+                   ON CONFLICT (partida_id, fecha, COALESCE(hito_id, 0), COALESCE(tramo_id, 0))
                    DO UPDATE SET cantidad_dia = $4, registrado_en = NOW(),
                      actividad_id = COALESCE($6, ev_avances_diarios.actividad_id)""",
-                partida_id, fecha, semana, cantidad, hito_id, actividad_id)
+                partida_id, fecha, semana, cantidad, hito_id, actividad_id, tramo_id)
     await _rollup_ev_avances(con, partida_id)
     # Los días anteriores al registrado no se tocan; el saldo para cumplir el
     # metrado meta se re-prorratea en los días siguientes de cada actividad
@@ -1089,11 +1278,20 @@ async def registrar_avance_partida(con, partida_id: int, fecha: date, cantidad,
     # Se re-prorratean TODAS las actividades vivas de la partida-etapa, no solo
     # la que cubre la fecha: el día registrado puede cambiar de dueño (§
     # _dueno_del_real) y el tramo que lo pierde tiene que recuperar su saldo.
-    acts = await con.fetch(
-        """SELECT * FROM prog_actividades
-           WHERE partida_id = $1 AND estado <> 'CANCELADO'
-             AND COALESCE(hito_id, $3) = COALESCE($2, $3)""",
-        partida_id, hito_id, principal)
+    # Con tramo (0038) no hay nada que repartir: el real es de esa sub-fila, así
+    # que solo ella recalcula su saldo. Sin tramo, sigue el reparto de siempre
+    # entre las actividades clásicas de la partida-etapa.
+    if tramo_id is not None:
+        acts = await con.fetch(
+            "SELECT * FROM prog_actividades WHERE id = $1 AND estado <> 'CANCELADO'",
+            tramo_id)
+    else:
+        acts = await con.fetch(
+            f"""SELECT a.* FROM prog_actividades a
+               WHERE a.partida_id = $1 AND a.estado <> 'CANCELADO'
+                 {_CLASICAS}
+                 AND COALESCE(a.hito_id, $3) = COALESCE($2, $3)""",
+            partida_id, hito_id, principal)
     for a in acts:
         await _redistribuir(con, dict(a), solo_despues_de=fecha)
 
@@ -1116,11 +1314,16 @@ async def avance_dia_actividad(act_id: int, data: dict):
             raise HTTPException(404, "Actividad no encontrada")
         if not act["partida_id"]:
             raise HTTPException(400, "La actividad no tiene partida de control: asígnala para registrar avance")
+        if await _es_contenedor(con, act_id):
+            raise HTTPException(
+                409, "Esta fila está dividida en sub-filas: anota el avance en la sub-fila que trabajó")
         async with con.transaction():
             # El avance queda ligado a ESTA actividad (0035): si la partida se
-            # programó en varios tramos, el real no se le atribuye a otro.
+            # programó en varios tramos, el real no se le atribuye a otro. Y si
+            # es una sub-fila (0038), además guarda cifra propia (tramo_id).
             await registrar_avance_partida(con, act["partida_id"], f, cantidad,
-                                           hito_id=act["hito_id"], actividad_id=act_id)
+                                           hito_id=act["hito_id"], actividad_id=act_id,
+                                           tramo_id=act_id if act["es_frente"] else None)
     return {"ok": True, "cantidad": cantidad}
 
 
@@ -1622,19 +1825,27 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             ids, base, fin) if ids else []
         real_rows = await con.fetch(
             """SELECT partida_id, hito_id, fecha, fecha::text AS f, cantidad_dia,
-                      actividad_id
+                      actividad_id, tramo_id
                FROM ev_avances_diarios
                WHERE partida_id = ANY($1) AND fecha BETWEEN $2 AND $3""",
             pids, base, fin) if pids else []
         partidas = {r["id"]: dict(r) for r in await con.fetch(
             """SELECT id, unidad, metrado_presup FROM ev_partidas WHERE id = ANY($1)""",
             pids)} if pids else {}
+        # Acumulado de la partida-etapa SIN los tramos: cada sub-fila lleva el
+        # suyo aparte (0038) y si se sumaran aquí, la fila clásica mostraría
+        # como propio el avance de las sub-filas.
         acum = {(r["partida_id"], r["hito_id"]): float(r["total"] or 0)
                 for r in await con.fetch(
             """SELECT partida_id, hito_id, SUM(cantidad_dia) AS total
                FROM ev_avances_diarios
-               WHERE partida_id = ANY($1) GROUP BY partida_id, hito_id""",
+               WHERE partida_id = ANY($1) AND tramo_id IS NULL
+               GROUP BY partida_id, hito_id""",
             pids)} if pids else {}
+        acum_tramo = {r["tramo_id"]: float(r["total"] or 0) for r in await con.fetch(
+            """SELECT tramo_id, SUM(cantidad_dia) AS total FROM ev_avances_diarios
+               WHERE partida_id = ANY($1) AND tramo_id IS NOT NULL
+               GROUP BY tramo_id""", pids)} if pids else {}
         hitos_rows = [dict(r) for r in await con.fetch(
             """SELECT id, partida_id, descripcion, peso, es_principal FROM ev_hitos
                WHERE partida_id = ANY($1)
@@ -1643,11 +1854,18 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
         # TODAS las actividades de esas partidas (también las de fuera de la
         # ventana): hacen falta para repartir bien el real entre los tramos.
         todas_acts = [dict(r) for r in await con.fetch(
-            """SELECT id, partida_id, hito_id, fecha, COALESCE(fecha_fin, fecha) AS fecha_fin
-                 FROM prog_actividades
-                WHERE partida_id = ANY($1) AND estado <> 'CANCELADO'""",
+            f"""SELECT a.id, a.partida_id, a.hito_id, a.fecha,
+                       COALESCE(a.fecha_fin, a.fecha) AS fecha_fin
+                 FROM prog_actividades a
+                WHERE a.partida_id = ANY($1) AND a.estado <> 'CANCELADO' {_CLASICAS}""",
             pids)] if pids else []
         dias_semana, feriados = await _calendario(con, proyecto_id, base, fin)
+        # Sub-filas de las filas visibles (0038), TAMBIÉN las que caen fuera de
+        # la ventana: una fila dividida no se edita ni se avanza, y eso tiene
+        # que saberse aunque sus hijos estén en otra semana.
+        hijos_rows = await con.fetch(
+            "SELECT id, padre_id FROM prog_actividades WHERE padre_id = ANY($1)",
+            ids) if ids else []
         deps = await con.fetch(
             """SELECT d.id AS dep_id, d.actividad_id, d.predecesora_id, d.lag_dias, d.tipo,
                       p.titulo AS pred_titulo, COALESCE(p.fecha_fin, p.fecha) AS pred_fin
@@ -1655,6 +1873,10 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
                JOIN prog_actividades p ON p.id = d.predecesora_id
                WHERE d.actividad_id = ANY($1) OR d.predecesora_id = ANY($1)""",
             ids) if ids else []
+
+    hijos_de: dict = {}
+    for r in hijos_rows:
+        hijos_de.setdefault(r["padre_id"], []).append(r["id"])
 
     preds_map: dict = {}
     sucs_map: dict = {}
@@ -1674,11 +1896,16 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
     # Reales por (partida, etapa): NULL = hito principal (convención 0025).
     real_map: dict = {}
     dueno_reg: dict = {}
+    real_tramo: dict = {}          # sub-fila (0038) → {fecha: cantidad}, sin reparto
     for r in real_rows:
-        if r["cantidad_dia"] is not None:
-            real_map.setdefault((r["partida_id"], r["hito_id"]), {})[r["f"]] = \
-                float(r["cantidad_dia"])
-            dueno_reg[(r["partida_id"], r["hito_id"], r["fecha"])] = r["actividad_id"]
+        if r["cantidad_dia"] is None:
+            continue
+        if r["tramo_id"] is not None:
+            real_tramo.setdefault(r["tramo_id"], {})[r["f"]] = float(r["cantidad_dia"])
+            continue
+        real_map.setdefault((r["partida_id"], r["hito_id"]), {})[r["f"]] = \
+            float(r["cantidad_dia"])
+        dueno_reg[(r["partida_id"], r["hito_id"], r["fecha"])] = r["actividad_id"]
     principal_de: dict = {}
     hitos_de: dict = {}
     for h in hitos_rows:
@@ -1712,13 +1939,24 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
         hkey = a["hito_id"]
         if hkey is not None and hkey == principal_de.get(a["partida_id"]):
             hkey = None
-        acum_real = acum.get((a["partida_id"], hkey)) if a["partida_id"] else None
-        # Real de ESTA actividad (no el de toda la partida): si la partida se
-        # programó en varios tramos, cada fila muestra lo suyo.
-        real_act = real_map.get((a["partida_id"], hkey), {}) if a["partida_id"] else {}
-        dueno = dueno_de.get((a["partida_id"], hkey))
-        if dueno:
-            real_act = {f: v for f, v in real_act.items() if dueno.get(f) == a["id"]}
+        subfilas = hijos_de.get(a["id"], [])
+        if a["es_frente"]:
+            # Sub-fila: su real es suyo, sin reparto que adivinar (0038).
+            acum_real = acum_tramo.get(a["id"], 0.0)
+            real_act = real_tramo.get(a["id"], {})
+        elif subfilas:
+            # Contenedor: lo que muestra por día es la suma de sus sub-filas, y
+            # eso lo arma el panel, que las tiene todas en la misma respuesta.
+            acum_real = round(sum(acum_tramo.get(h, 0.0) for h in subfilas), 4)
+            real_act = {}
+        else:
+            acum_real = acum.get((a["partida_id"], hkey)) if a["partida_id"] else None
+            # Real de ESTA actividad (no el de toda la partida): si la partida se
+            # programó en varios tramos, cada fila muestra lo suyo.
+            real_act = real_map.get((a["partida_id"], hkey), {}) if a["partida_id"] else {}
+            dueno = dueno_de.get((a["partida_id"], hkey))
+            if dueno:
+                real_act = {f: v for f, v in real_act.items() if dueno.get(f) == a["id"]}
         act_out = {
             "id": a["id"], "titulo": a["titulo"], "estado": a["estado"],
             "descripcion": a["descripcion"],
@@ -1765,6 +2003,11 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             # Cuántos tramos comparten la partida-etapa (1 = el caso normal).
             # El panel lo usa para avisar de que el real está repartido.
             "tramos": len(tramos.get((a["partida_id"], hkey), [])) if a["partida_id"] else 0,
+            # Árbol del LookAhead (0038): de qué fila cuelga, de qué tipo es y
+            # cuántas sub-filas tiene (también las de fuera de la ventana, para
+            # que la fila no se dibuje como editable cuando está dividida).
+            "padre_id": a["padre_id"], "es_frente": a["es_frente"],
+            "n_subfilas": len(subfilas),
         }
         clave = a["otm_id"] or ""
         if clave not in idx:
@@ -2254,9 +2497,10 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8,
         # Tramos de cada partida-etapa (también fuera de la ventana) para poder
         # atribuir el real a la actividad correcta.
         todas_acts = [dict(r) for r in await con.fetch(
-            """SELECT id, partida_id, hito_id, fecha, COALESCE(fecha_fin, fecha) AS fecha_fin
-                 FROM prog_actividades
-                WHERE partida_id = ANY($1) AND estado <> 'CANCELADO'""",
+            f"""SELECT a.id, a.partida_id, a.hito_id, a.fecha,
+                       COALESCE(a.fecha_fin, a.fecha) AS fecha_fin
+                 FROM prog_actividades a
+                WHERE a.partida_id = ANY($1) AND a.estado <> 'CANCELADO' {_CLASICAS}""",
             pids)] if pids else []
         prog_rows = await con.fetch(
             """SELECT actividad_id,
