@@ -914,7 +914,11 @@ async def _reprorratear_programadas(con, proyecto_id: int) -> int:
     return len(acts)
 
 
-DESGLOSE_DEFECTO = ("Área", "Capa")
+# Cómo se llaman por defecto las dos etiquetas con que se clasifica una porción
+# de partida. La segunda NO puede ser «Capa»: eso solo existe en movimiento de
+# tierras y el sistema tiene que servir igual en estructuras o en tuberías
+# (0039). Ambas se renombran por proyecto desde `PUT /config/desglose`.
+DESGLOSE_DEFECTO = ("Área", "Frente / Tramo / Sector")
 
 
 @router.get("/config")
@@ -942,7 +946,7 @@ async def guardar_etiquetas_desglose(data: dict):
     """Cómo se llaman en este proyecto las dos dimensiones en que se subdivide
     una partida grande al programarla."""
     def _et(v, defecto):
-        return " ".join(str(v or "").split())[:24] or defecto
+        return " ".join(str(v or "").split())[:40] or defecto
     e1 = _et(data.get("etiqueta_desglose_1"), DESGLOSE_DEFECTO[0])
     e2 = _et(data.get("etiqueta_desglose_2"), DESGLOSE_DEFECTO[1])
     proyecto_id = int(data.get("proyecto_id") or 1)
