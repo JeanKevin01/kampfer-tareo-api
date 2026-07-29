@@ -59,6 +59,17 @@ async def guardar_avance_diario(data: dict):
     hito_id = int(data["hito_id"]) if data.get("hito_id") else None
     pool = await db()
     async with pool.acquire() as con:
+        # Partida dividida en frentes (0038): su avance lo llevan los frentes.
+        # Escribir aquí crearía una fila SIN frente que se sumaría a las de
+        # ellos — el mismo trabajo contado dos veces en el % de avance.
+        con_frentes = await con.fetchval(
+            """SELECT EXISTS (SELECT 1 FROM prog_actividades
+                               WHERE partida_id = $1 AND es_frente
+                                 AND estado <> 'CANCELADO')""", int(partida_id))
+        if con_frentes:
+            raise HTTPException(
+                409, "Esta partida se avanza por frente / tramo / sector: "
+                     "registra el avance en el frente que trabajó, desde el LookAhead")
         async with con.transaction():
             await registrar_avance_partida(
                 con, int(partida_id), _as_date(fecha_str), cantidad_dia,

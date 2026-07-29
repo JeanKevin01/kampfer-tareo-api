@@ -2215,6 +2215,12 @@ async def historial_grid(otm: str, desde: str = "", semanas: int = 0):
             """SELECT id, partida_id, descripcion, peso, es_principal FROM ev_hitos
                WHERE partida_id = ANY($1)
                ORDER BY partida_id, es_principal DESC, peso DESC, id""", pids)]
+        # Partidas divididas en frentes: su avance se registra en el frente, no
+        # aquí (si se escribiera aquí, el mismo trabajo se contaría dos veces).
+        con_frentes = {r["partida_id"] for r in await con.fetch(
+            """SELECT DISTINCT partida_id FROM prog_actividades
+                WHERE partida_id = ANY($1) AND es_frente AND estado <> 'CANCELADO'""",
+            pids)}
         primer_reg = {r["partida_id"]: r["ini"] for r in await con.fetch(
             """SELECT partida_id, LEAST(MIN(f1), MIN(f2)) AS ini FROM (
                  SELECT partida_id, fecha AS f1, NULL::date AS f2
@@ -2235,8 +2241,13 @@ async def historial_grid(otm: str, desde: str = "", semanas: int = 0):
 
     real_map: dict = {}
     for r in real_rows:
-        real_map.setdefault((r["partida_id"], _hkey(r["partida_id"], r["hito_id"])),
-                            {})[r["f"]] = float(r["cantidad_dia"])
+        # SUMA, no asignación: desde 0038 una partida-etapa puede tener varias
+        # filas el mismo día, una por frente. Pisando el valor, el día se
+        # quedaba con el avance de UN frente y el acumulado de esta vista
+        # discrepaba del LookAhead (1 760 se veía como 260).
+        k = (r["partida_id"], _hkey(r["partida_id"], r["hito_id"]))
+        real_map.setdefault(k, {})[r["f"]] = \
+            real_map.get(k, {}).get(r["f"], 0) + float(r["cantidad_dia"])
     hh_map: dict = {}
     for r in hh_rows:
         hh_map.setdefault(r["partida_id"], {})[r["f"]] = float(r["hh"])
@@ -2280,6 +2291,8 @@ async def historial_grid(otm: str, desde: str = "", semanas: int = 0):
             "hh": hh_map.get(pid, {}),
             "primer_registro": str(primer_reg[pid]) if primer_reg.get(pid) else None,
             "sin_registros": primer_reg.get(pid) is None,
+            # El día se suma de sus frentes: aquí se lee, no se escribe.
+            "con_frentes": pid in con_frentes,
             "etapas": etapas,
         })
 
