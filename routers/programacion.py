@@ -558,6 +558,16 @@ def _parse_metrado(v) -> Optional[float]:
     return m or None
 
 
+def _desglose(v) -> Optional[str]:
+    """Etiqueta de área/capa del tramo (0037). PURA.
+
+    Texto libre pero normalizado en mayúsculas y sin espacios de sobra: «área b»
+    y «Área B » tienen que agrupar juntas o la vista por áreas no sirve de nada.
+    """
+    s = " ".join(str(v or "").split()).upper()
+    return s[:40] or None
+
+
 @router.post("/actividades")
 async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina"))):
     fecha = parse_fecha(data.get("fecha"))
@@ -596,15 +606,16 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
                     """INSERT INTO prog_actividades
                        (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo, descripcion,
                         responsable, supervisor_id, metrado_prog, und, dias_salto, dias_medio,
-                        hito_id, creado_por, plazo_dias, modo_fecha)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+                        hito_id, creado_por, plazo_dias, modo_fecha, desglose_1, desglose_2)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
                        RETURNING *""",
                     proyecto_id, fecha, fecha_fin,
                     (str(data["otm_id"]).strip() or None) if data.get("otm_id") else None,
                     partida_id,
                     titulo, data.get("descripcion") or None, data.get("responsable") or None,
                     (str(data["supervisor_id"]).strip() or None) if data.get("supervisor_id") else None,
-                    metrado, und, saltos, medios, hito_id, user.get("sub"), plazo, modo)
+                    metrado, und, saltos, medios, hito_id, user.get("sub"), plazo, modo,
+                    _desglose(data.get("desglose_1")), _desglose(data.get("desglose_2")))
             except _ERRORES_DATO:
                 raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
             await _redistribuir(con, dict(row))
@@ -652,6 +663,9 @@ async def editar_actividad(act_id: int, data: dict):
         campos.append("causa_nc_cat"); valores.append(_validar_cnc(data["causa_nc_cat"]))
     if "causa_nc_planner_cat" in data:
         campos.append("causa_nc_planner_cat"); valores.append(_validar_cnc(data["causa_nc_planner_cat"]))
+    for k in ("desglose_1", "desglose_2"):
+        if k in data:
+            campos.append(k); valores.append(_desglose(data[k]))
     for k in ("titulo", "descripcion", "responsable", "otm_id", "supervisor_id",
               "causa_nc", "causa_nc_planner"):
         if k in data:
@@ -777,18 +791,132 @@ async def _reprorratear_programadas(con, proyecto_id: int) -> int:
     return len(acts)
 
 
+DESGLOSE_DEFECTO = ("Área", "Capa")
+
+
 @router.get("/config")
 async def ver_config(proyecto_id: int = 1):
     pool = await db()
     async with pool.acquire() as con:
-        ds = await con.fetchval(
-            "SELECT dias_semana FROM prog_config WHERE proyecto_id = $1", proyecto_id)
+        cfg = await con.fetchrow(
+            """SELECT dias_semana, etiqueta_desglose_1, etiqueta_desglose_2
+                 FROM prog_config WHERE proyecto_id = $1""", proyecto_id)
         fer = await con.fetch(
             "SELECT id, fecha, motivo FROM prog_feriados WHERE proyecto_id = $1 ORDER BY fecha",
             proyecto_id)
+    ds = cfg["dias_semana"] if cfg else None
     return {"dias_semana": sorted(ds) if ds else [1, 2, 3, 4, 5, 6, 7],
+            # Cómo llama ESTE proyecto a las dos dimensiones del desglose: en
+            # tierras «Área» y «Capa», en estructuras «Eje» y «Nivel».
+            "etiqueta_desglose_1": (cfg and cfg["etiqueta_desglose_1"]) or DESGLOSE_DEFECTO[0],
+            "etiqueta_desglose_2": (cfg and cfg["etiqueta_desglose_2"]) or DESGLOSE_DEFECTO[1],
             "feriados": [{"id": r["id"], "fecha": str(r["fecha"]), "motivo": r["motivo"]}
                          for r in fer]}
+
+
+@router.put("/config/desglose")
+async def guardar_etiquetas_desglose(data: dict):
+    """Cómo se llaman en este proyecto las dos dimensiones en que se subdivide
+    una partida grande al programarla."""
+    def _et(v, defecto):
+        return " ".join(str(v or "").split())[:24] or defecto
+    e1 = _et(data.get("etiqueta_desglose_1"), DESGLOSE_DEFECTO[0])
+    e2 = _et(data.get("etiqueta_desglose_2"), DESGLOSE_DEFECTO[1])
+    proyecto_id = int(data.get("proyecto_id") or 1)
+    pool = await db()
+    await pool.execute(
+        """INSERT INTO prog_config (proyecto_id, etiqueta_desglose_1, etiqueta_desglose_2)
+           VALUES ($1,$2,$3) ON CONFLICT (proyecto_id)
+           DO UPDATE SET etiqueta_desglose_1 = $2, etiqueta_desglose_2 = $3,
+                         actualizado_en = now()""", proyecto_id, e1, e2)
+    return {"ok": True, "etiqueta_desglose_1": e1, "etiqueta_desglose_2": e2}
+
+
+def saldo_partida(metrado_presup: float, programado: float, ejecutado: float) -> dict:
+    """Cuánto queda de una partida grande que se ejecuta en porciones. PURA.
+
+    El caso de Jean: RELLENO ZONA 5 son 15 000 m³ que se avanzan de 200 en 200
+    por áreas y capas. Sin este saldo, «se va quitando de a pocos» es una cuenta
+    que alguien lleva de memoria o en un Excel aparte, y nadie se entera de que
+    se pasó hasta que el RO no cuadra.
+
+    Excedido se informa, NO se bloquea (decisión de Jean): la obra manda y el
+    mayor metrado se sustenta después: bloquear frenaría la programación de la
+    semana por un trámite.
+    """
+    presup = float(metrado_presup or 0)
+    prog = round(float(programado or 0), 3)
+    ejec = round(float(ejecutado or 0), 3)
+    return {
+        "metrado_presup": presup, "programado": prog, "ejecutado": ejec,
+        "saldo_por_programar": round(presup - prog, 3),
+        "saldo_por_ejecutar": round(presup - ejec, 3),
+        # Con presupuesto 0 no hay contra qué comparar: no se inventa un exceso.
+        "excedido": round(prog - presup, 3) if presup > 0 and prog > presup + 5e-4 else 0.0,
+        "pct_programado": round(prog / presup, 4) if presup > 0 else None,
+        "pct_ejecutado": round(ejec / presup, 4) if presup > 0 else None,
+    }
+
+
+@router.get("/saldo-partida")
+async def ver_saldo_partida(partida_id: int, proyecto_id: int = 1, excluir: int = 0):
+    """Presupuestado vs programado vs ejecutado de una partida, con su desglose
+    por área/capa. `excluir` deja fuera una actividad (la que se está editando),
+    para que su propio metrado no cuente dos veces en el aviso."""
+    pool = await db()
+    async with pool.acquire() as con:
+        p = await con.fetchrow(
+            """SELECT id, codigo, descripcion, unidad, COALESCE(metrado_presup,0) AS metrado_presup
+                 FROM ev_partidas WHERE id = $1 AND activo""", partida_id)
+        if not p:
+            raise HTTPException(404, "Partida no encontrada")
+        prog = await con.fetchval(
+            """SELECT COALESCE(SUM(COALESCE(metrado_prog,0)),0) FROM prog_actividades
+                WHERE partida_id = $1 AND estado <> 'CANCELADO' AND id <> $2""",
+            partida_id, excluir)
+        ejec = await con.fetchval(
+            """SELECT COALESCE(SUM(cantidad_dia),0) FROM ev_avances_diarios
+                WHERE partida_id = $1 AND cantidad_dia IS NOT NULL""", partida_id)
+        det = await con.fetch(
+            """SELECT desglose_1, desglose_2,
+                      COALESCE(SUM(COALESCE(metrado_prog,0)),0) AS prog, count(*) AS n
+                 FROM prog_actividades
+                WHERE partida_id = $1 AND estado <> 'CANCELADO'
+                GROUP BY 1,2 ORDER BY 1 NULLS LAST, 2 NULLS LAST""", partida_id)
+    return {
+        "partida_id": p["id"], "codigo": p["codigo"], "descripcion": p["descripcion"],
+        "unidad": p["unidad"], "proyecto_id": proyecto_id,
+        **saldo_partida(p["metrado_presup"], prog, ejec),
+        "desglose": [{"desglose_1": r["desglose_1"], "desglose_2": r["desglose_2"],
+                      "programado": round(float(r["prog"] or 0), 3), "actividades": int(r["n"])}
+                     for r in det],
+    }
+
+
+@router.get("/desgloses")
+async def valores_desglose(partida_id: int = 0, proyecto_id: int = 1):
+    """Áreas y capas ya usadas — para autocompletar en vez de teclear.
+
+    Se ofrecen primero las de la partida (lo que se está subdividiendo) y luego
+    las del resto del proyecto: escribir «AREA B» de dos maneras distintas
+    rompería la agrupación, que es justo lo que la vista tiene que evitar.
+    """
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            """SELECT desglose_1, desglose_2,
+                      bool_or(partida_id = $2) AS de_la_partida
+                 FROM prog_actividades
+                WHERE proyecto_id = $1 AND (desglose_1 IS NOT NULL OR desglose_2 IS NOT NULL)
+                GROUP BY 1,2""", proyecto_id, partida_id or -1)
+    d1, d2 = {}, {}
+    for r in rows:
+        for col, acc in ((r["desglose_1"], d1), (r["desglose_2"], d2)):
+            if col:
+                acc[col] = acc.get(col, False) or bool(r["de_la_partida"])
+    def _orden(acc):
+        return [k for k, propio in sorted(acc.items(), key=lambda kv: (not kv[1], kv[0]))]
+    return {"desglose_1": _orden(d1), "desglose_2": _orden(d2)}
 
 
 @router.put("/config")
@@ -1594,6 +1722,9 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
         act_out = {
             "id": a["id"], "titulo": a["titulo"], "estado": a["estado"],
             "descripcion": a["descripcion"],
+            # Área y capa del tramo (0037): con qué porción de la partida grande
+            # se corresponde esta fila.
+            "desglose_1": a["desglose_1"], "desglose_2": a["desglose_2"],
             "fecha": str(a["fecha"]), "fecha_fin": str(a["fecha_fin"] or a["fecha"]),
             "otm_id": a["otm_id"], "partida_id": a["partida_id"],
             "partida_codigo": a["partida_codigo"], "partida_desc": a["partida_desc"],
