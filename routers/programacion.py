@@ -1016,6 +1016,40 @@ async def ver_saldo_partida(partida_id: int, proyecto_id: int = 1, excluir: int 
     }
 
 
+@router.put("/renombrar-desglose")
+async def renombrar_desglose(data: dict):
+    """Cambia el nombre de un área (o capa) en TODAS las sub-filas que la usan.
+
+    Renombrar «AREA A» a mano en seis frentes no solo es tedioso: basta con
+    equivocarse en uno para quedarse con dos áreas donde había una, y entonces
+    la banda —y el saldo agrupado— se parten en dos. Se renombra la banda de UNA
+    fila padre, que es el gesto que se hace en pantalla; devuelve cuántas
+    cambiaron para poder decirlo antes de confirmar.
+    """
+    campo = str(data.get("campo") or "desglose_1")
+    if campo not in ("desglose_1", "desglose_2"):
+        raise HTTPException(400, "campo debe ser desglose_1 o desglose_2")
+    padre_id = int(data["padre_id"]) if data.get("padre_id") else None
+    if not padre_id:
+        raise HTTPException(400, "padre_id requerido")
+    de = _desglose(data.get("de"))
+    a = _desglose(data.get("a"))
+    if not a:
+        raise HTTPException(400, "El nombre nuevo no puede quedar vacío")
+    if de == a:
+        return {"ok": True, "n": 0}
+    pool = await db()
+    async with pool.acquire() as con:
+        n = await con.fetchval(
+            f"""WITH t AS (
+                  UPDATE prog_actividades SET {campo} = $1, actualizado_en = NOW()
+                   WHERE padre_id = $2
+                     AND COALESCE({campo}, '') = COALESCE($3, '')
+                  RETURNING 1)
+                SELECT count(*) FROM t""", a, padre_id, de)
+    return {"ok": True, "n": int(n or 0), "de": de, "a": a}
+
+
 @router.get("/historial-partida")
 async def historial_partida(partida_id: int, proyecto_id: int = 1):
     """Todo lo que se programó de una partida y cómo terminó cada sub-fila.
@@ -1846,6 +1880,14 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             """SELECT tramo_id, SUM(cantidad_dia) AS total FROM ev_avances_diarios
                WHERE partida_id = ANY($1) AND tramo_id IS NOT NULL
                GROUP BY tramo_id""", pids)} if pids else {}
+        # Ejecutado TOTAL de la partida (todas sus etapas y todos sus frentes):
+        # es contra esto que se mide el saldo del presupuesto. Restarle a la base
+        # de la partida solo lo de UN frente daba un saldo distinto en cada fila
+        # y ninguno era el de verdad.
+        acum_part = {r["partida_id"]: float(r["total"] or 0) for r in await con.fetch(
+            """SELECT partida_id, SUM(cantidad_dia) AS total FROM ev_avances_diarios
+               WHERE partida_id = ANY($1) AND cantidad_dia IS NOT NULL
+               GROUP BY partida_id""", pids)} if pids else {}
         hitos_rows = [dict(r) for r in await con.fetch(
             """SELECT id, partida_id, descripcion, peso, es_principal FROM ev_hitos
                WHERE partida_id = ANY($1)
@@ -1993,7 +2035,13 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "metrado_prog": float(a["metrado_prog"]) if a["metrado_prog"] is not None else None,
             "metrado_base": met_base,
             "acum_real": acum_real,
-            "saldo": round(met_base - acum_real, 3) if met_base is not None and acum_real is not None else None,
+            # En el árbol, el saldo del PRESUPUESTO es uno solo y es el de la
+            # partida: la misma cifra en el padre y en todos sus frentes. Fuera
+            # del árbol se conserva el saldo por etapa de siempre.
+            "saldo": (round(met_base - (acum_part.get(a["partida_id"], 0.0)
+                                        if (a["es_frente"] or subfilas) else acum_real), 3)
+                      if met_base is not None and acum_real is not None else None),
+            "acum_partida": acum_part.get(a["partida_id"]) if a["partida_id"] else None,
             "hito_id": a["hito_id"],
             "hito_desc": (hito_info.get(a["hito_id"]) or {}).get("descripcion") if a["hito_id"] else None,
             "hito_peso": float(hito_info[a["hito_id"]]["peso"]) if a["hito_id"] in hito_info else None,
@@ -3122,12 +3170,15 @@ async def programacion_dia(fecha: str = "", otm_id: str = ""):
     f = parse_fecha(fecha) or fecha_lima()
     pool = await db()
     rows = await pool.fetch(
-        """SELECT id, titulo, estado FROM prog_actividades
-           WHERE $1 BETWEEN fecha AND COALESCE(fecha_fin, fecha)
-             AND NOT ($1 = ANY(dias_salto))
-             AND estado <> 'CANCELADO'
-             AND (otm_id = $2 OR otm_id IS NULL)
-           ORDER BY id""", f, otm_id or None)
+        """SELECT a.id, a.titulo, a.estado, a.desglose_1, a.desglose_2, a.padre_id
+             FROM prog_actividades a
+           WHERE $1 BETWEEN a.fecha AND COALESCE(a.fecha_fin, a.fecha)
+             AND NOT ($1 = ANY(a.dias_salto))
+             AND a.estado <> 'CANCELADO'
+             AND (a.otm_id = $2 OR a.otm_id IS NULL)
+             -- Una fila dividida no se reporta: lo que se trabaja es el frente.
+             AND NOT EXISTS (SELECT 1 FROM prog_actividades h WHERE h.padre_id = a.id)
+           ORDER BY a.id""", f, otm_id or None)
     return [dict(r) for r in rows]
 
 
@@ -3147,6 +3198,9 @@ async def mis_actividades(supervisor_id: str, fecha: str = "",
                   COALESCE(ev.unidad, a.und) AS und,
                   pm.cantidad AS metrado_dia,
                   h.descripcion AS hito_desc,
+                  -- Qué frente es (0038): sin el área y la capa, «Capa 1» le
+                  -- aparece al supervisor cinco veces y no sabe cuál trabajó.
+                  a.desglose_1, a.desglose_2, a.padre_id, a.es_frente,
                   (SELECT count(*) FROM campo_reportes cr
                     WHERE cr.actividad_id = a.id AND cr.fecha = $1) AS reportes_hoy
            FROM prog_actividades a
@@ -3157,6 +3211,8 @@ async def mis_actividades(supervisor_id: str, fecha: str = "",
            WHERE $1 BETWEEN a.fecha AND COALESCE(a.fecha_fin, a.fecha)
              AND NOT ($1 = ANY(a.dias_salto))
              AND a.supervisor_id = $2 AND a.estado <> 'CANCELADO'
+             -- La fila dividida no es trabajo de nadie: lo son sus frentes.
+             AND NOT EXISTS (SELECT 1 FROM prog_actividades h2 WHERE h2.padre_id = a.id)
            ORDER BY a.id""", f, supervisor_id)
     return [dict(r) for r in rows]
 
