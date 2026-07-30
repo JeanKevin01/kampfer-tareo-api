@@ -164,6 +164,27 @@ def main():
           n == 3 and float(suma) == 19.0 and smin == 1 and smax == 1,
           f"filas={n} hh={suma} semanas={smin}..{smax}")
 
+    # T3b — /campo/tareo-dia devuelve el día partida por partida. La app de campo
+    # lo usa para rellenar su espejo antes de reenviar el tareo con un parte: sin
+    # esto, un parte en un teléfono que no tarearon (otro equipo, caché borrado)
+    # borraría las horas de las demás partidas del día.
+    r = c.get(f"{API}/campo/tareo-dia", params={
+        "fecha": FECHA_TAREO, "otm_id": "OTM-E2E", "supervisor_id": "SUPE2E"})
+    td = r.json() if r.status_code == 200 else []
+    por_part = {}
+    for x in td:
+        por_part.setdefault(x["partida_id"], {})[x["trabajador_id"]] = x["hh"]
+    r2 = c.get(f"{API}/campo/tareo-dia", params={
+        "fecha": "no-es-fecha", "otm_id": "OTM-E2E", "supervisor_id": "SUPE2E"})
+    check("T3b tareo-dia: las 3 asignaciones con sus HH por partida (y 422 si la fecha no es fecha)",
+          r.status_code == 200 and len(td) == 3
+          and por_part.get(p1["id"], {}).get("901") == 5.0
+          and por_part.get(p1["id"], {}).get("902") == 9.5
+          and por_part.get(p2["id"], {}).get("901") == 4.5
+          and all(x["via"] == "e2e" for x in td)
+          and r2.status_code == 422,
+          f"status={r.status_code} filas={td} fecha_mala={r2.status_code}")
+
     # T4 — captura de avance: 50% de E2E-001 (5 de 10 und)
     r = c.post(f"{API}/ev/captura", json={
         "semana": 1, "avances": [{"hito_id": p1["hito_id"], "cantidad_acum": 5}], "hh_gastadas": []})

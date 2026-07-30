@@ -3249,6 +3249,42 @@ async def frentes_otm(otm_id: str = "", user: dict = Depends(require_role())):
     return [r["frente"] for r in rows]
 
 
+@router_campo.get("/tareo-dia")
+async def tareo_dia(fecha: str, otm_id: str, supervisor_id: str,
+                    user: dict = Depends(require_role())):
+    """Tareo YA registrado hoy por ese supervisor en ese proyecto, partida por
+    partida.
+
+    Existe por una razón concreta de la app de campo: el parte de una partida
+    reenvía el tareo COMPLETO del proyecto, porque `enviar-con-partidas`
+    reemplaza por (supervisor, proyecto, fecha). La app lleva un espejo del día
+    en el teléfono, pero ese espejo no existe si el tareo se envió desde otro
+    equipo o si se limpió el almacenamiento — y entonces un parte dejaría sin
+    horas a las demás partidas del día. Con esto la app rellena lo que le falta
+    antes de reenviar."""
+    exigir_identidad_supervisor(user, supervisor_id)
+    try:
+        f = date.fromisoformat(fecha)
+    except ValueError:
+        raise HTTPException(422, "fecha inválida (YYYY-MM-DD)")
+    pool = await db()
+    # Se devuelve TODO lo que hay bajo esa clave, sin filtrar por `fuente`,
+    # porque es exactamente lo que el reenvío borra (el DELETE de
+    # enviar-con-partidas es por supervisor+otm+fecha): si aquí se filtrara,
+    # el reenvío perdería filas.
+    rows = await pool.fetch(
+        """SELECT tp.partida_id, tp.trabajador_id, tp.hh,
+                  st.agregado_via AS via
+             FROM tareo_partida tp
+             LEFT JOIN sesion_trabajadores st
+                    ON st.sesion_id = tp.sesion_id
+                   AND st.trab_id = tp.trabajador_id
+            WHERE tp.supervisor_id = $1 AND tp.otm_id = $2 AND tp.fecha = $3""",
+        supervisor_id.strip(), otm_id.strip(), f)
+    return [{"partida_id": r["partida_id"], "trabajador_id": r["trabajador_id"],
+             "hh": float(r["hh"] or 0), "via": r["via"] or "app"} for r in rows]
+
+
 @router_campo.get("/reporte-plantilla")
 async def reporte_plantilla(actividad_id: Optional[int] = None,
                             partida_id: Optional[int] = None,
