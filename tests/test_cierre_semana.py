@@ -77,9 +77,22 @@ def test_tolerancia_de_redondeo():
     assert veredicto(200, 199.9999, "PROGRAMADO") is True
 
 
-def test_estados_manuales_mandan():
+def test_no_cumplida_manda_siempre():
+    """Es una declaración explícita de fracaso: nadie la pone por error."""
     assert veredicto(200, 500, "NO_CUMPLIDA") is False
-    assert veredicto(200, 0, "EJECUTADO") is True
+
+
+def test_con_metrado_comprometido_manda_el_metrado_no_el_estado():
+    """CAMBIO DE PRECEDENCIA (2026-07-30). Antes EJECUTADO ganaba sobre el
+    metrado, y eso dejó de ser una decisión del planner el día que el parte de
+    campo empezó a poner EJECUTADO solo: una partida con 71 m³ comprometidos y 0
+    registrados salía «cumplida» por haber mandado el parte (el caso real que
+    Jean vio en pantalla, «Valle Principal FL10 CP12»).
+
+    En un sistema donde el metrado es la fuente única, no capturar el avance no
+    puede equivaler a cumplir."""
+    assert veredicto(200, 0, "EJECUTADO") is False
+    assert veredicto(200, 200, "EJECUTADO") is True
 
 
 # ── Actividades sin metrado programado ───────────────────────
