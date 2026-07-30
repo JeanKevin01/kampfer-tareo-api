@@ -313,8 +313,18 @@ async def _leer_cierre(con, proyecto_id: int, lun: date) -> dict:
              FROM prog_semana_cierre_det d
              LEFT JOIN supervisores s ON s.id = d.supervisor_id
             WHERE d.cierre_id = $1 ORDER BY d.cumplida, d.titulo""", cab["id"])
+    # También en la semana cerrada: una cuyo compromiso se congeló en la reunión
+    # es más defendible que una cuya marca se dedujo de fechas de creación, y eso
+    # hay que poder verlo después, no solo antes de cerrar.
+    plan = await con.fetchrow(
+        "SELECT comprometido_en FROM prog_semana_plan WHERE proyecto_id=$1 AND lunes=$2",
+        proyecto_id, lun)
     return {
         "cerrada": True, "lunes": str(cab["lunes"]), "hasta": str(cab["hasta"]),
+        "compromiso": "congelado" if plan else "deducido",
+        "comprometido_en": str(plan["comprometido_en"]) if plan else None,
+        "sin_clasificar": sum(1 for r in det
+                              if r["no_planificada"] and not r["no_plan_motivo"]),
         "parcial": cab["parcial"], "cerrado_en": str(cab["cerrado_en"]),
         "cerrado_por": cab["cerrado_por"], "nota": cab["nota"],
         "comprometidas": cab["comprometidas"], "cumplidas": cab["cumplidas"],
