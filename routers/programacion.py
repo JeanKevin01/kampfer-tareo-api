@@ -3447,6 +3447,165 @@ async def mis_actividades(supervisor_id: str, fecha: str = "",
     return [dict(r) for r in rows]
 
 
+DIAS_ATRAS_MAX = 14   # cuánto puede retroceder el supervisor desde su teléfono
+
+
+def dias_de_agenda(hoy: date, dias: int) -> list:
+    """Los días que la app ofrece para reportar: de hoy hacia atrás.
+
+    Función pura y separada a propósito — es la regla que decide hasta dónde
+    puede llegar un supervisor que se olvidó de reportar, y merece test propio.
+    Nunca hacia adelante: un parte con fecha futura es trabajo que no ocurrió.
+    """
+    try:
+        n = max(1, min(int(dias), DIAS_ATRAS_MAX))
+    except (TypeError, ValueError):
+        n = 7
+    return [hoy - timedelta(days=i) for i in range(n)]
+
+
+@router_campo.get("/mis-dias")
+async def mis_dias(supervisor_id: str, dias: int = 7,
+                   user: dict = Depends(require_role())):
+    """Los últimos días del supervisor, con lo que tenía programado y lo que ya
+    reportó en cada uno.
+
+    Encargo de Jean (2026-07-31): «si al supervisor se le olvida reportar, que
+    pueda reportar lo de un día pasado y ver fácilmente qué tenía programado
+    otro día». Esta es la tira de días de la pantalla inicial: sin ella, elegir
+    una fecha sería a ciegas.
+
+    `cerrada` avisa que la semana ya se cerró (Last Planner): el PPC de esa
+    semana está congelado y meterle trabajo a destiempo lo falsearía. La app lo
+    muestra con candado y no deja reportar ahí.
+    """
+    exigir_identidad_supervisor(user, supervisor_id)
+    fechas = dias_de_agenda(fecha_lima(), dias)
+    desde, hasta = fechas[-1], fechas[0]
+    pool = await db()
+    acts = await pool.fetch(
+        """SELECT d::date AS fecha, a.estado, count(*) AS n
+             FROM prog_actividades a
+             CROSS JOIN generate_series($1::date, $2::date, '1 day') d
+            WHERE d::date BETWEEN a.fecha AND COALESCE(a.fecha_fin, a.fecha)
+              AND NOT (d::date = ANY(a.dias_salto))
+              AND a.supervisor_id = $3 AND a.estado <> 'CANCELADO'
+              AND NOT EXISTS (SELECT 1 FROM prog_actividades h WHERE h.padre_id = a.id)
+            GROUP BY 1, 2""", desde, hasta, supervisor_id)
+    partes = await pool.fetch(
+        """SELECT fecha, count(*) AS n FROM campo_reportes
+            WHERE supervisor_id = $1 AND fecha BETWEEN $2 AND $3
+            GROUP BY 1""", supervisor_id, desde, hasta)
+    hh = await pool.fetch(
+        """SELECT fecha, COALESCE(sum(hh), 0) AS hh FROM tareo_partida
+            WHERE supervisor_id = $1 AND fecha BETWEEN $2 AND $3
+            GROUP BY 1""", supervisor_id, desde, hasta)
+    cerradas = {r["lunes"] for r in await pool.fetch(
+        "SELECT lunes FROM prog_semana_cierre WHERE lunes BETWEEN $1 AND $2",
+        desde - timedelta(days=6), hasta)}
+
+    por_estado = {}
+    for r in acts:
+        por_estado.setdefault(r["fecha"], {})[r["estado"]] = r["n"]
+    n_partes = {r["fecha"]: r["n"] for r in partes}
+    n_hh = {r["fecha"]: float(r["hh"] or 0) for r in hh}
+    return [{
+        "fecha": f.isoformat(),
+        "programadas": por_estado.get(f, {}).get("PROGRAMADO", 0),
+        "reportadas": por_estado.get(f, {}).get("EJECUTADO", 0),
+        "no_cumplidas": por_estado.get(f, {}).get("NO_CUMPLIDA", 0),
+        "partes": n_partes.get(f, 0),
+        "hh": n_hh.get(f, 0.0),
+        "cerrada": (f - timedelta(days=f.weekday())) in cerradas,
+    } for f in fechas]
+
+
+@router_campo.get("/mis-reportes")
+async def mis_reportes(supervisor_id: str, fecha: str = "",
+                       user: dict = Depends(require_role())):
+    """Los partes que ESTE supervisor ya envió ese día, con sus fotos y su texto
+    listo para compartir.
+
+    Existe porque el espejo del teléfono no siempre alcanza: un día pasado no lo
+    tiene, un cambio de equipo tampoco, y limpiar el almacenamiento lo borra.
+    El supervisor tiene que poder ver lo que YA reportó venga de donde venga.
+
+    El personal y las HH salen del tareo de esa partida ese día (`tareo_partida`
+    es por partida-día, no por parte): si una partida se reportó dos veces, los
+    dos partes muestran la misma cuadrilla — que es la verdad del día.
+    """
+    exigir_identidad_supervisor(user, supervisor_id)
+    f = parse_fecha(fecha) or fecha_lima()
+    pool = await db()
+    reps = await pool.fetch(
+        """SELECT r.id, r.actividad_id, r.otm_id, r.area, r.frente, r.turno,
+                  r.anotaciones, r.restricciones, r.descripcion, r.id_local,
+                  to_char(r.creado_en AT TIME ZONE 'America/Lima', 'HH24:MI') AS hora,
+                  a.partida_id, a.titulo,
+                  ev.codigo AS partida_codigo, ev.descripcion AS partida_desc
+             FROM campo_reportes r
+             LEFT JOIN prog_actividades a ON a.id = r.actividad_id
+             LEFT JOIN ev_partidas ev ON ev.id = a.partida_id
+            WHERE r.supervisor_id = $1 AND r.fecha = $2
+            ORDER BY r.id""", supervisor_id, f)
+    if not reps:
+        return []
+    fotos = await pool.fetch(
+        """SELECT f.reporte_id, f.id, f.purgada, f.bytes, f.ancho, f.alto,
+                  f.ruta, f.ruta_thumb
+             FROM campo_fotos f
+            WHERE f.reporte_id = ANY($1::int[]) ORDER BY f.id""",
+        [r["id"] for r in reps])
+    por_rep = {}
+    for x in fotos:
+        por_rep.setdefault(x["reporte_id"], []).append(_foto_out(dict(x)))
+    gente = await pool.fetch(
+        """SELECT tp.partida_id, tp.trabajador_id, sum(tp.hh) AS hh,
+                  COALESCE(t.nombre, tp.trabajador_id) AS nombre,
+                  COALESCE(t.cargo, 'SIN CARGO') AS cargo
+             FROM tareo_partida tp
+             LEFT JOIN trabajadores t ON t.id = tp.trabajador_id
+            WHERE tp.supervisor_id = $1 AND tp.fecha = $2
+            GROUP BY 1, 2, 4, 5 ORDER BY 5, 4""", supervisor_id, f)
+    por_partida = {}
+    for x in gente:
+        por_partida.setdefault(x["partida_id"], []).append(
+            {"id": x["trabajador_id"], "nombre": x["nombre"], "cargo": x["cargo"],
+             "hh": float(x["hh"] or 0)})
+    sup_nombre = await pool.fetchval(
+        "SELECT nombre FROM supervisores WHERE id = $1", supervisor_id) or supervisor_id
+
+    out = []
+    for r in reps:
+        notas = json.loads(r["anotaciones"]) if r["anotaciones"] else [
+            ln.lstrip("•- ").strip() for ln in (r["descripcion"] or "").split("\n") if ln.strip()]
+        rests = json.loads(r["restricciones"]) if r["restricciones"] else []
+        personal = por_partida.get(r["partida_id"], [])
+        cargos = {}
+        for p in personal:
+            cargos[p["cargo"]] = cargos.get(p["cargo"], 0) + 1
+        out.append({
+            # `id_local` es el UUID del outbox: con él la app reconoce cuál de
+            # sus partes pendientes ya llegó y no lo muestra dos veces.
+            "id": r["id"], "id_local": r["id_local"], "hora": r["hora"],
+            "actividad_id": r["actividad_id"],
+            "partida_id": r["partida_id"], "codigo": r["partida_codigo"],
+            "titulo": r["partida_desc"] or r["titulo"], "otm_id": r["otm_id"],
+            "area": r["area"], "frente": r["frente"], "turno": r["turno"],
+            "anotaciones": notas, "restricciones": rests,
+            "personal": personal,
+            "hh": round(sum(p["hh"] for p in personal), 2),
+            "fotos": por_rep.get(r["id"], []),
+            "texto": armar_texto_reporte(
+                f, r["turno"] or "DIA", sup_nombre,
+                [{"cargo": c, "n": n} for c, n in
+                 sorted(cargos.items(), key=lambda kv: (-kv[1], kv[0]))],
+                [{"area": r["area"] or "", "frente": r["frente"], "items": notas}],
+                rests),
+        })
+    return out
+
+
 @router_campo.get("/frentes")
 async def frentes_otm(otm_id: str = "", user: dict = Depends(require_role())):
     """Catálogo de frentes/zonas ya usados en esa OTM — se auto-alimenta con el
@@ -3827,10 +3986,16 @@ async def crear_reporte(
                         rid, g["semana_iso"], g["ruta"], g["ruta_thumb"],
                         g["bytes"], g["bytes_thumb"], g["ancho"], g["alto"])
                 # Calendario combinado: el reporte "ejecuta" la actividad programada.
+                # También desde NO_CUMPLIDA: si el supervisor la dio por no hecha
+                # y después manda un parte con fotos, la evidencia manda sobre el
+                # botón — dejarla incumplida con un parte colgando falsearía el
+                # PPC en contra de la obra. La causa se retira con el estado.
                 if actividad_id:
                     await con.execute(
-                        "UPDATE prog_actividades SET estado='EJECUTADO', actualizado_en=now() "
-                        "WHERE id = $1 AND estado = 'PROGRAMADO'", actividad_id)
+                        "UPDATE prog_actividades SET estado='EJECUTADO', actualizado_en=now(), "
+                        "  causa_nc = CASE WHEN estado='NO_CUMPLIDA' THEN NULL ELSE causa_nc END, "
+                        "  causa_nc_cat = CASE WHEN estado='NO_CUMPLIDA' THEN NULL ELSE causa_nc_cat END "
+                        "WHERE id = $1 AND estado IN ('PROGRAMADO','NO_CUMPLIDA')", actividad_id)
     except _ReporteYaExiste:
         _limpiar_huerfanas()
         pool = await db()

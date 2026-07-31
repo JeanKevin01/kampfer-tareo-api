@@ -1,10 +1,13 @@
 """
 Calendario de programación y reportes de campo — matriz de roles (sin BD).
 """
+from datetime import date
+
 import pytest
 from fastapi.testclient import TestClient
 
 from core import auth, config
+from routers import programacion
 import main
 
 
@@ -104,6 +107,37 @@ def test_no_cumplida_categoria_invalida_422():
                        json={"supervisor_id": "01", "causa_cat": "FLOJERA"},
                        headers=_hdr("supervisor", "01"))
     assert r.status_code == 422
+
+
+# ── Reportar un día pasado (encargo de Jean 2026-07-31) ──────
+def test_mis_dias_suplantado_403():
+    r = _client().get("/campo/mis-dias?supervisor_id=02",
+                      headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_mis_reportes_suplantado_403():
+    r = _client().get("/campo/mis-reportes?supervisor_id=02&fecha=2026-07-28",
+                      headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_agenda_empieza_hoy_y_va_hacia_atras():
+    """Nunca hacia adelante: un parte con fecha futura es trabajo que no ocurrió."""
+    hoy = date(2026, 7, 31)
+    d = programacion.dias_de_agenda(hoy, 3)
+    assert d == [date(2026, 7, 31), date(2026, 7, 30), date(2026, 7, 29)]
+
+
+def test_agenda_se_topa_en_el_maximo():
+    """El olvido razonable son días, no meses: más atrás se corrige en oficina."""
+    d = programacion.dias_de_agenda(date(2026, 7, 31), 999)
+    assert len(d) == programacion.DIAS_ATRAS_MAX
+
+
+def test_agenda_nunca_queda_vacia():
+    """0 o basura → al menos hoy, para que la app siempre tenga dónde reportar."""
+    assert programacion.dias_de_agenda(date(2026, 7, 31), 0) == [date(2026, 7, 31)]
 
 
 # ── Last Planner: lookahead / restricciones / PPC ────────────
