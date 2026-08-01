@@ -22,9 +22,11 @@
 #                      con la MISMA descripción.
 # ============================================================
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from io import BytesIO
 from typing import Optional
 
+import openpyxl
 import xlrd
 
 # Índices de columna (0-based): A=0 B=1 C=2 D=3 E=4 F=5 G=6 H=7 I=8 J=9 K=10
@@ -81,6 +83,59 @@ class ResultadoPU:
     hh_dia: float = 10.0
     errores: list = field(default_factory=list)        # ["fila N: detalle", ...]
     avisos: list = field(default_factory=list)         # no bloquean el import
+
+
+# ── Lectura: .xlsx moderno y .xls de toda la vida ────────────
+# La plantilla que reparte KAMPFER es .xlsx (decisión de Jean, 2026-08-01: «no
+# hay necesidad de xlrd, ya nadie usa eso»). Pero el archivo ORIGINAL del
+# ex-gerente —el que está en `Plantillas base/`— sí es .xls de verdad (BIFF), y
+# retirar xlrd dejaría sin importar el presupuesto meta de la obra real. Así que
+# se detecta por los primeros bytes y se lee con la librería que toque.
+#
+# El resto del parser no se entera: ambas rutas exponen la misma interfaz
+# mínima (`sheet_names`, `sheet_by_name`, `.nrows`, `.cell_value`).
+class _HojaXLSX:
+    def __init__(self, ws):
+        self._filas = [tuple(f) for f in ws.iter_rows(values_only=True)]
+        self.nrows = len(self._filas)
+
+    def cell_value(self, r: int, c: int):
+        if r >= self.nrows:
+            raise IndexError(r)
+        fila = self._filas[r]
+        if c >= len(fila):
+            raise IndexError(c)
+        v = fila[c]
+        # `None` tiene que salir como celda vacía: `str(None)` daría "None" y el
+        # parser lo tomaría por contenido.
+        if v is None:
+            return ""
+        if isinstance(v, (datetime, date)):
+            return v.strftime("%Y-%m-%d")
+        return v
+
+
+class _LibroXLSX:
+    def __init__(self, contenido: bytes):
+        # data_only: interesa el valor, no la fórmula. Las plantillas que genera
+        # KAMPFER escriben valores justamente por esto.
+        self._wb = openpyxl.load_workbook(BytesIO(contenido), data_only=True, read_only=True)
+        self._cache: dict = {}
+
+    def sheet_names(self) -> list:
+        return list(self._wb.sheetnames)
+
+    def sheet_by_name(self, nombre: str) -> _HojaXLSX:
+        if nombre not in self._cache:
+            self._cache[nombre] = _HojaXLSX(self._wb[nombre])
+        return self._cache[nombre]
+
+
+def abrir_libro(contenido: bytes):
+    """Devuelve un libro leíble sea .xlsx (PK) o .xls (OLE2)."""
+    if contenido[:2] == b"PK":
+        return _LibroXLSX(contenido)
+    return xlrd.open_workbook(file_contents=contenido)
 
 
 def _s(sh, r, c) -> str:
@@ -330,11 +385,11 @@ def _verificar(p: PartidaPU, out: ResultadoPU, tol_cud: float = 0.02, tol_hh: fl
 
 
 def parsear_plantilla_pu(contenido: bytes) -> ResultadoPU:
-    """Punto de entrada: bytes del .xls → ResultadoPU. Nunca lanza por datos
-    (los problemas van a .errores/.avisos); sí lanza si el archivo no es un
-    .xls legible o faltan las hojas."""
+    """Punto de entrada: bytes de la plantilla (.xlsx o .xls) → ResultadoPU.
+    Nunca lanza por datos (los problemas van a .errores/.avisos); sí lanza si el
+    archivo no es un Excel legible o faltan las hojas."""
     out = ResultadoPU()
-    wb = xlrd.open_workbook(file_contents=contenido)
+    wb = abrir_libro(contenido)
     faltan = {"PtoMeta", "PU-Meta"} - set(wb.sheet_names())
     if faltan:
         out.errores.append(f"Faltan hojas requeridas: {sorted(faltan)}")

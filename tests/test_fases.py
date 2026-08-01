@@ -52,11 +52,14 @@ def test_plantilla_pu_supervisor_403():
     assert r.status_code == 403
 
 
-def test_plantilla_pu_oficina_descarga_xls():
+def test_plantilla_pu_oficina_descarga_xlsx():
+    """La ruta se conserva, pero ya no sirve el .xls estático —que era el fixture
+    de los tests, con datos «Excavacion test»— sino la plantilla .xlsx generada,
+    con formato e instrucciones (2026-08-01)."""
     r = _client().get("/ev/presupuesto/plantilla-pu", headers=_hdr("oficina"))
     assert r.status_code == 200
-    assert r.content[:4] == b"\xd0\xcf\x11\xe0"   # magic bytes BIFF (.xls)
-    assert "plantilla_pu.xls" in r.headers.get("content-disposition", "")
+    assert r.content[:2] == b"PK"                 # .xlsx es un zip
+    assert ".xlsx" in r.headers.get("content-disposition", "")
 
 
 # ── Normalización (pura) ─────────────────────────────────────

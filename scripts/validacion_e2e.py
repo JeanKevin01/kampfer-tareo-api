@@ -249,9 +249,12 @@ def main():
     check("F4 PUT desactiva y el GET por defecto la oculta",
           r.status_code == 200 and "E2E-99" not in activas, f"activas={len(activas)}")
 
+    # La ruta se conserva por compatibilidad, pero desde 2026-08-01 sirve la
+    # plantilla .xlsx generada (con formato e instrucciones) en vez del .xls
+    # estático, que era el fixture de los tests.
     r = c.get(f"{API}/ev/presupuesto/plantilla-pu")
-    check("F5 plantilla PU descarga .xls (magic bytes BIFF)",
-          r.status_code == 200 and r.content[:4] == b"\xd0\xcf\x11\xe0",
+    check("F5 la ruta antigua de la plantilla PU sirve el .xlsx nuevo",
+          r.status_code == 200 and r.content[:2] == b"PK",
           f"status={r.status_code}")
 
     # M — matriz histórica (fechas × partidas/trabajadores)
@@ -1481,6 +1484,61 @@ def main():
           and bool(pd_.get("por_cargo"))
           and hmal.status_code == 422,
           f"dia={pd_} mes={pm_} invalida={hmal.status_code}")
+
+    # ── P70-P72 · Plantillas Excel ────────────────────────────
+    # Lo que se comprueba no es el aspecto (eso son los tests unitarios) sino el
+    # CONTRATO: que lo que la plantilla produce lo acepte su propio importador.
+    # Hasta ahora nada lo garantizaba, y una cabecera renombrada no daba error
+    # en ningún sitio: el import simplemente no encontraba filas válidas.
+    import io as _io
+    import openpyxl as _op
+
+    esperadas = {
+        "personal":    ["NOMBRE", "CARGO", "DNI", "TIPO", "ES_SUPERVISOR"],
+        "proyectos":   ["NOMBRE", "AREA", "ESTADO", "CENTRO_COSTO", "MONEDA", "PLAZO",
+                        "FECHA DE INICIO", "MONTO CONTRACTUAL", "MONTO VALORIZADO", "ID"],
+        "presupuesto": ["CODIGO", "DESCRIPCION", "UNIDAD", "FASE", "SUB_FASE",
+                        "METRADO", "PRECIO_UNITARIO", "HH_META"],
+        "costos_ro":   ["FASE", "TIPO_RECURSO", "DIRECTO", "PERIODO", "MONTO",
+                        "FUENTE", "NOTA"],
+        "costos":      ["PROVEEDOR", "NUMERO_DOC", "FECHA", "TIPO_DOC", "TIPO_RECURSO",
+                        "DIRECTO", "FASE", "MONEDA", "MONTO", "GLOSA"],
+    }
+
+    def _cabeceras(clave: str) -> list:
+        r = c.get(f"{API}/ev/plantillas/{clave}")
+        if r.status_code != 200 or r.content[:2] != b"PK":
+            return []
+        ws = _op.load_workbook(_io.BytesIO(r.content)).worksheets[0]
+        for fila in range(1, 40):
+            if ws.cell(fila, 2).value == esperadas[clave][0]:
+                return [ws.cell(fila, 2 + i).value for i in range(len(esperadas[clave]))]
+        return []
+
+    malas = {k: _cabeceras(k) for k in esperadas if _cabeceras(k) != esperadas[k]}
+    check("P70 las plantillas traen las cabeceras EXACTAS que espera cada importador",
+          not malas, f"no coinciden: {malas}")
+
+    cat = c.get(f"{API}/ev/plantillas")
+    claves = {p["clave"] for p in cat.json()} if cat.status_code == 200 else set()
+    check("P71 el catálogo de plantillas describe las 7",
+          cat.status_code == 200 and claves == {"personal", "partidas", "proyectos",
+                                                "presupuesto", "costos", "costos_ro", "pu"},
+          f"status={cat.status_code} claves={claves}")
+
+    # Ida y vuelta de verdad: la plantilla de costos se parsea en el SERVIDOR,
+    # así que se puede descargar y volver a subir tal cual. Con solo la fila de
+    # ejemplo dentro, el import debe leerla sin errores.
+    rp = c.get(f"{API}/ev/plantillas/costos")
+    rimp = c.post(f"{API}/ev/ro/costos/importar",
+                  params={"proyecto_id": 1, "confirmar": False},
+                  files={"file": ("plantilla.xlsx", rp.content,
+                                  "application/vnd.openxmlformats-officedocument."
+                                  "spreadsheetml.sheet")})
+    res = rimp.json().get("resumen", {}) if rimp.status_code == 200 else {}
+    check("P72 ida y vuelta: el importador de costos lee la plantilla que él mismo reparte",
+          rimp.status_code == 200 and res.get("filas", 0) >= 2 and not res.get("errores"),
+          f"status={rimp.status_code} resumen={res}")
 
     print()
     if _fallas:

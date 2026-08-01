@@ -2,7 +2,9 @@ fastapi==0.111.0
 uvicorn==0.29.0
 asyncpg==0.29.0
 python-multipart==0.0.9
-# F1.2: la plantilla PU del ex-gerente es .xls (BIFF) - xlrd 2.x solo lee ese formato.
+# F1.2: la plantilla PU que reparte KAMPFER es .xlsx (openpyxl), pero el
+# presupuesto meta REAL del ex-gerente es .xls (BIFF) y xlrd es lo unico que lo
+# lee. Se queda como via de compatibilidad para los archivos que ya existen.
 xlrd==2.0.1
 # F2.2/F2.7: import de costos (.xlsx) y export del RO a Excel.
 openpyxl==3.1.5

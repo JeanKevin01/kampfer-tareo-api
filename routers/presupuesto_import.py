@@ -1,5 +1,5 @@
 # ============================================================
-# routers/presupuesto_import.py — F1.2: importar la plantilla PU (.xls)
+# routers/presupuesto_import.py — F1.2: importar la plantilla PU
 #
 # POST /ev/presupuesto/importar-pu (multipart)
 #   ?confirmar=false → SOLO preview: {resumen, muestra} (no toca la BD)
@@ -9,10 +9,10 @@
 # Toda fila ilegible se reporta con su número; con errores NO se permite
 # confirmar (no hay import parcial). Se monta en main.py con rol oficina.
 # ============================================================
-from pathlib import Path
+from io import BytesIO
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 
 from core.db import db
 from core.log import get_logger
@@ -44,12 +44,21 @@ def _resumen(res) -> dict:
 
 @router.get("/plantilla-pu")
 async def plantilla_pu():
-    """Plantilla .xls de ejemplo del formato PU (hojas PtoMeta y PU-Meta)."""
-    ruta = Path(__file__).resolve().parent.parent / "static" / "plantilla_pu.xls"
-    if not ruta.exists():
-        raise HTTPException(404, "Plantilla no disponible en este despliegue")
-    return FileResponse(ruta, media_type="application/vnd.ms-excel",
-                        filename="plantilla_pu.xls")
+    """Plantilla del presupuesto META (hojas PtoMeta y PU-Meta).
+
+    Se conserva la ruta por compatibilidad, pero ya no sirve el archivo estático
+    —que era literalmente el fixture de los tests, con datos «Excavacion test»—
+    sino la plantilla generada, con formato e instrucciones. La fuente única es
+    `plantillas/pu_meta.py`; el destino nuevo es `GET /ev/plantillas/pu`.
+    """
+    import plantillas
+    wb, archivo = plantillas.generar("pu", {})
+    buf = BytesIO()
+    wb.save(buf)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{archivo}"'})
 
 
 @router.post("/importar-pu")
@@ -60,7 +69,8 @@ async def importar_pu(proyecto_id: int = 1, confirmar: bool = False,
         res = parsear_plantilla_pu(contenido)
     except Exception:
         log.exception("importar-pu: archivo ilegible")
-        raise HTTPException(400, "El archivo no es un .xls legible (formato BIFF esperado)")
+        raise HTTPException(400, "El archivo no es un Excel legible (.xlsx o .xls) "
+                                 "con las hojas PtoMeta y PU-Meta")
 
     resumen = _resumen(res)
     hojas = [p for p in res.partidas if p.es_hoja]
