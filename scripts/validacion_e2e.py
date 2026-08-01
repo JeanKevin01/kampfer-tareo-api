@@ -1754,6 +1754,26 @@ def main():
           r.status_code == 400 and "partida" in str(r.json().get("detail", "")).lower(),
           f"status={r.status_code} detail={r.json().get('detail')}")
 
+    # ── P82 · Actividad LIBRE sin metrado, dada por plazo ─────────────────
+    # Es el camino del medio del selector «Programar actividad»: trabajo NUESTRO
+    # que no está en el presupuesto (andamios, traslados, pruebas). Sin partida y
+    # sin metrado el alta tiene que pasar igual —_exigir_partida solo prohíbe
+    # metrado SIN partida—, la F.Fin se deriva del plazo, y a diferencia de la
+    # externa SÍ cuenta en nuestro PPC: es un compromiso nuestro.
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-09-21", "otm_id": "OTM-E2E",
+        "titulo": "E2E libre — montaje de andamios", "plazo_dias": 3})
+    libre = r.json() if r.status_code == 200 else {}
+    r2 = c.get(f"{API}/ev/programacion/cierre-semana",
+               params={"proyecto_id": 1, "lunes": "2026-09-21"})
+    ids_libre = [x.get("actividad_id") for x in (r2.json() or {}).get("actividades", [])]
+    check("P82 actividad libre: sin partida ni metrado, F.Fin por plazo y SÍ entra al PPC",
+          r.status_code == 200 and libre.get("externa") is False
+          and libre.get("partida_id") is None and not libre.get("metrado_prog")
+          and libre.get("fecha_fin") == "2026-09-23"
+          and libre.get("id") in ids_libre,
+          f"status={r.status_code} act={libre} ids_cierre={ids_libre}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
