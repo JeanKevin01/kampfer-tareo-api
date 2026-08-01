@@ -58,6 +58,16 @@ NO_PLAN_MOTIVOS = {
 # como desorden castigaría al planner por ser flexible.
 MOTIVOS_IMPROVISACION = ("OMISION_PLANNER", "EMERGENCIA", "CLIENTE")
 
+# ── Bitácora de la semana (0041) ─────────────────────────────────────────
+# Los cuatro actos que mueven —o podrían mover— un indicador ya publicado.
+# Cada uno queda registrado con quién y cuándo, y la tabla es append-only.
+EVENTOS = {
+    "COMPROMETIDA": "Semana comprometida",
+    "DESCOMPROMETIDA": "Compromiso deshecho",
+    "CERRADA": "Semana cerrada",
+    "REABIERTA": "Semana reabierta",
+}
+
 
 def validar_motivo_no_plan(m):
     """None o uno de los cuatro; cualquier otra cosa es 422."""
@@ -181,8 +191,13 @@ def veredicto(comprometido: float, alcanzado: float, estado: str) -> bool:
     actividades de apoyo y el PPC subiría solo por tenerlas en el plan; pero
     juzgarlas solo por estado declara NO CUMPLIDA a la que termina su metrado
     antes de tiempo, porque el re-prorrateo le deja el compromiso en cero.
+
+    CANCELADO se juzga igual que NO_CUMPLIDA, y explícito y no por descarte: una
+    actividad comprometida que se cancela después es un compromiso incumplido.
+    Solo llega aquí si estaba en el compromiso congelado (0041) — si no, se
+    filtró antes.
     """
-    if estado == "NO_CUMPLIDA":
+    if estado in ("NO_CUMPLIDA", "CANCELADO"):
         return False
     if float(comprometido or 0) <= 0:
         return estado == "EJECUTADO" or float(alcanzado or 0) > 0
@@ -210,6 +225,53 @@ def marcar_no_planificadas(creados: list, referencia, ids=None,
         return [i not in comprometidos for i in ids]
     v = [es_no_planificada(c, referencia) for c in creados]
     return [False] * len(v) if v and all(v) else v
+
+
+def denominador_comprometido(vigente: dict, congelado=None) -> dict:
+    """Metrado que se juzga en la semana, actividad por actividad (0041).
+
+    `vigente` es lo que hoy dice `prog_metrado_dia`; `congelado` lo que quedó
+    guardado al comprometer la semana, o None si nunca se comprometió.
+
+    Con la semana comprometida MANDA el congelado, y eso es lo que cierra D1/D2:
+    el denominador del PPC deja de depender del plan de hoy, así que correr la
+    F.Inicio de una actividad que no se hizo ya no la saca del indicador ni
+    programar hacia atrás lo reescribe.
+
+    Un metrado congelado en 0 significa «este compromiso es anterior a 0041»
+    —no «se prometió cero»— y cae al vigente, que es el comportamiento de
+    siempre. Sin esa salida, las semanas ya comprometidas se quedarían sin
+    denominador y su PPC pasaría a None de golpe al desplegar.
+
+    Las actividades vigentes que NO están en el compromiso se conservan con su
+    metrado de hoy: se las juzga como no planificadas (§ marcar_no_planificadas)
+    y sacarlas de esta lista las borraría también del indicador de trabajo no
+    planificado y de sus HH, que es justo lo que se quiere medir.
+    """
+    if congelado is None:
+        return {k: float(v or 0) for k, v in vigente.items()}
+    out = {}
+    for aid, m in congelado.items():
+        m = float(m or 0)
+        out[aid] = m if m > 0 else float(vigente.get(aid, 0) or 0)
+    for aid, m in vigente.items():
+        out.setdefault(aid, float(m or 0))
+    return out
+
+
+def origen_denominador(congelado=None, cerrada: bool = False) -> str:
+    """Contra qué plan se está midiendo el PPC de la semana.
+
+    · CERRADA      — el veredicto ya está congelado y no se recalcula.
+    · COMPROMETIDO — el denominador no se mueve aunque se reprograme.
+    · VIGENTE      — se recalcula con el plan de hoy: todavía puede cambiar.
+
+    La UI tiene que decirlo. Un PPC sobre plan vigente no es una promesa medida,
+    es una foto provisional, y presentarlos igual fue exactamente el problema.
+    """
+    if cerrada:
+        return "CERRADA"
+    return "COMPROMETIDO" if congelado is not None else "VIGENTE"
 
 
 def entra_al_cierre(comprometido: float, fecha_inicio, lunes: date) -> bool:
@@ -381,15 +443,42 @@ async def _hh_semana(con, proyecto_id: int, lun: date, hasta: date,
 
 # ── Compromiso congelado de la semana (0040) ─────────────────────────────
 async def _comprometidos(con, proyecto_id: int, lun: date):
-    """Ids comprometidos si la semana se congeló; None si nunca se comprometió."""
+    """El compromiso congelado de la semana: ({actividad_id: metrado}, plan).
+
+    None si la semana nunca se comprometió — distinto de un dict vacío, que es
+    «se comprometió sin nada» y sí congela un denominador (vacío).
+
+    Devuelve un dict y no un set porque desde 0041 el compromiso incluye el
+    CUÁNTO. Donde solo importa la pertenencia (`marcar_no_planificadas`,
+    `en_plan`) el dict se comporta igual que el set que había antes.
+    """
     plan = await con.fetchrow(
         "SELECT id, comprometido_en, comprometido_por, nota FROM prog_semana_plan "
         "WHERE proyecto_id=$1 AND lunes=$2", proyecto_id, lun)
     if not plan:
         return None, None
-    ids = {r["actividad_id"] for r in await con.fetch(
-        "SELECT actividad_id FROM prog_semana_plan_det WHERE plan_id=$1", plan["id"])}
-    return ids, dict(plan)
+    comp = {r["actividad_id"]: float(r["metrado"] or 0) for r in await con.fetch(
+        "SELECT actividad_id, metrado FROM prog_semana_plan_det WHERE plan_id=$1",
+        plan["id"])}
+    return comp, dict(plan)
+
+
+async def _evento(con, proyecto_id: int, lun: date, evento: str, actor=None,
+                  n: int = 0, metrado: float = 0, ppc=None, nota=None,
+                  detalle=None) -> None:
+    """Anota un hito de la semana en la bitácora (0041).
+
+    Append-only y a propósito FUERA de cualquier `try`: si el evento no se puede
+    escribir, la operación entera falla. Una bitácora con huecos silenciosos es
+    peor que no tenerla — se leería como «esta semana nunca se reabrió».
+    """
+    await con.execute(
+        """INSERT INTO prog_semana_eventos
+             (proyecto_id, lunes, evento, actor, n_actividades, metrado, ppc,
+              nota, detalle)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)""",
+        proyecto_id, lun, evento, actor, int(n or 0), float(metrado or 0), ppc,
+        nota, json.dumps(detalle) if detalle is not None else None)
 
 
 @router.get("/plan-semana")
@@ -403,19 +492,30 @@ async def ver_plan_semana(lunes: str = "", proyecto_id: int = 1):
     async with pool.acquire() as con:
         cfg = await leer_config_cierre(con, proyecto_id)
         _corte, hasta, _p = ventana_corte(lun, **_kw(cfg))
-        filas = await _detalle_semana(con, proyecto_id, lun, hasta)
+        # Comprometida: se muestra el metrado CONGELADO, que es contra el que se
+        # va a juzgar. Mostrar el vigente aquí sería enseñar un compromiso que
+        # el planner nunca hizo (§ denominador_comprometido).
+        comp, plan = await _comprometidos(con, proyecto_id, lun)
+        filas = await _detalle_semana(con, proyecto_id, lun, hasta, comp)
         juzgadas = [f for f in filas if entra_al_cierre(f["comprometido"], f["fecha"], lun)]
-        ids, plan = await _comprometidos(con, proyecto_id, lun)
     return {
         "lunes": str(lun), "comprometida": plan is not None,
         "comprometido_en": str(plan["comprometido_en"]) if plan else None,
         "comprometido_por": plan["comprometido_por"] if plan else None,
         "nota": plan["nota"] if plan else None,
+        "origen": origen_denominador(comp),
+        # Cuántas del compromiso congelado ya no tienen metrado en el plan de
+        # hoy: es la señal de que alguien reprogramó lo comprometido. El PPC ya
+        # no se mueve por eso (0041), pero el planner debería enterarse.
+        "reprogramadas": sum(1 for f in juzgadas
+                             if comp and f["actividad_id"] in comp
+                             and not f["comprometido_vigente"]),
         "actividades": [{
             "actividad_id": f["actividad_id"], "titulo": f["titulo"],
             "supervisor_id": f["supervisor_id"], "unidad": f["unidad"],
             "comprometido": f["comprometido"],
-            "en_plan": (f["actividad_id"] in ids) if ids is not None else True,
+            "comprometido_vigente": f["comprometido_vigente"],
+            "en_plan": (f["actividad_id"] in comp) if comp is not None else True,
         } for f in juzgadas],
     }
 
@@ -429,6 +529,12 @@ async def comprometer_semana(data: dict):
     opuestas: marcaba como no planificado un plan acordado el lunes y tecleado
     el martes, y permitía desmarcar al cerrar —convirtiendo la omisión propia en
     compromiso cumplido— sin dejar rastro.
+
+    Desde 0041 se congela también el METRADO de cada actividad, no solo el
+    conjunto: sin el cuánto, el denominador del PPC seguía saliendo del plan
+    vigente y correr una F.Inicio sacaba del indicador a la actividad que no se
+    hizo (D1). Y el acto queda en la bitácora — re-comprometer sobrescribe el
+    plan, así que sin ella no habría forma de saber qué se prometió primero.
 
     Body: {proyecto_id?, lunes, actividades?: [id], nota?}. Sin `actividades` se
     compromete todo lo que hoy está programado en la semana.
@@ -445,13 +551,19 @@ async def comprometer_semana(data: dict):
             raise HTTPException(409, "Esa semana ya está cerrada")
         cfg = await leer_config_cierre(con, proyecto_id)
         _corte, hasta, _p = ventana_corte(lun, **_kw(cfg))
+        # Sin `congelado`: aquí se lee el plan VIGENTE a propósito, que es
+        # justamente lo que se va a congelar. Pasarle el compromiso anterior
+        # haría que re-comprometer copiara el metrado viejo.
         filas = await _detalle_semana(con, proyecto_id, lun, hasta)
         juzgadas = [f for f in filas if entra_al_cierre(f["comprometido"], f["fecha"], lun)]
-        disponibles = {f["actividad_id"] for f in juzgadas}
+        disponibles = {f["actividad_id"]: f for f in juzgadas}
         if pedidas is None:
             ids = sorted(disponibles)
         else:
-            ids = sorted({int(x) for x in pedidas} & disponibles)
+            ids = sorted({int(x) for x in pedidas} & set(disponibles))
+        # El metrado que se congela, actividad por actividad (0041).
+        metrados = {i: float(disponibles[i]["comprometido"] or 0) for i in ids}
+        total = round(sum(metrados.values()), 3)
         async with con.transaction():
             plan_id = await con.fetchval(
                 """INSERT INTO prog_semana_plan (proyecto_id, lunes, comprometido_por, nota)
@@ -463,23 +575,45 @@ async def comprometer_semana(data: dict):
             await con.execute("DELETE FROM prog_semana_plan_det WHERE plan_id=$1", plan_id)
             if ids:
                 await con.executemany(
-                    "INSERT INTO prog_semana_plan_det (plan_id, actividad_id) VALUES ($1,$2)",
-                    [(plan_id, i) for i in ids])
-    log.info("semana comprometida", extra={"lunes": str(lun), "n": len(ids)})
-    return {"ok": True, "lunes": str(lun), "comprometidas": len(ids)}
+                    "INSERT INTO prog_semana_plan_det (plan_id, actividad_id, metrado)"
+                    " VALUES ($1,$2,$3)",
+                    [(plan_id, i, metrados[i]) for i in ids])
+            await _evento(
+                con, proyecto_id, lun, "COMPROMETIDA", por, len(ids), total,
+                nota=nota,
+                detalle=[{"id": i, "titulo": disponibles[i]["titulo"],
+                          "metrado": metrados[i],
+                          "unidad": disponibles[i]["unidad"]} for i in ids])
+    log.info("semana comprometida", extra={"lunes": str(lun), "n": len(ids),
+                                           "metrado": total})
+    return {"ok": True, "lunes": str(lun), "comprometidas": len(ids),
+            "metrado_comprometido": total}
 
 
 @router.delete("/plan-semana")
-async def descomprometer_semana(lunes: str = "", proyecto_id: int = 1):
-    """Deshace el compromiso (solo si la semana no está cerrada)."""
+async def descomprometer_semana(lunes: str = "", proyecto_id: int = 1,
+                                actor: str = "", nota: str = ""):
+    """Deshace el compromiso (solo si la semana no está cerrada).
+
+    Borra el plan pero NO la bitácora: queda el COMPROMETIDA original y el
+    DESCOMPROMETIDA que lo deshizo. Es el gesto que más podría usarse para
+    maquillar el indicador —descomprometer, reprogramar y volver a comprometer
+    con lo que sí se hizo—, así que tiene que dejar rastro."""
     lun = _lunes_arg(lunes)
     pool = await db()
     async with pool.acquire() as con:
         if await con.fetchval("SELECT 1 FROM prog_semana_cierre "
                               "WHERE proyecto_id=$1 AND lunes=$2", proyecto_id, lun):
             raise HTTPException(409, "Esa semana ya está cerrada: reábrela primero")
-        n = await con.execute("DELETE FROM prog_semana_plan "
-                              "WHERE proyecto_id=$1 AND lunes=$2", proyecto_id, lun)
+        comp, _plan = await _comprometidos(con, proyecto_id, lun)
+        async with con.transaction():
+            n = await con.execute("DELETE FROM prog_semana_plan "
+                                  "WHERE proyecto_id=$1 AND lunes=$2", proyecto_id, lun)
+            if comp is not None:
+                await _evento(con, proyecto_id, lun, "DESCOMPROMETIDA",
+                              str(actor or "").strip() or None, len(comp),
+                              round(sum(comp.values()), 3),
+                              nota=str(nota or "").strip() or None)
     return {"ok": True, "borradas": n}
 
 
@@ -528,7 +662,11 @@ async def ver_cierre_semana(lunes: str = "", proyecto_id: int = 1):
             return {**ya, "cnc_catalogo": CNC, "campo": campo}
         cfg = await leer_config_cierre(con, proyecto_id)
         corte, hasta, parcial = ventana_corte(lun, **_kw(cfg))
-        filas = await _detalle_semana(con, proyecto_id, lun, hasta)
+        # El compromiso congelado manda sobre la deducción por fecha (0040) y,
+        # desde 0041, también sobre el metrado: lo que se cierra es lo que se
+        # prometió, no lo que el plan diga hoy.
+        comprom_ids, plan = await _comprometidos(con, proyecto_id, lun)
+        filas = await _detalle_semana(con, proyecto_id, lun, hasta, comprom_ids)
         # Referencia del compromiso: el corte de la semana ANTERIOR si esa
         # semana se cerró; si no, el lunes de esta.
         prev = await con.fetchval(
@@ -540,8 +678,6 @@ async def ver_cierre_semana(lunes: str = "", proyecto_id: int = 1):
         juzgadas = [f for f in filas if entra_al_cierre(f["comprometido"], f["fecha"], lun)]
         campo = await _referencia_campo(
             con, proyecto_id, lun, hasta, [f["actividad_id"] for f in juzgadas])
-        # El compromiso congelado manda sobre la deducción por fecha (0040).
-        comprom_ids, plan = await _comprometidos(con, proyecto_id, lun)
         hh_act, hh_total, hh_huerf = await _hh_semana(
             con, proyecto_id, lun, hasta,
             [{"id": f["actividad_id"], "partida_id": f["partida_id"],
@@ -574,6 +710,14 @@ async def ver_cierre_semana(lunes: str = "", proyecto_id: int = 1):
         # cambia cuánto se puede discutir el número.
         "compromiso": "congelado" if comprom_ids is not None else "deducido",
         "comprometido_en": str(plan["comprometido_en"]) if plan else None,
+        # Contra qué plan se está midiendo, y cuántas comprometidas ya no tienen
+        # metrado en el plan de hoy (alguien las reprogramó o las canceló
+        # después de prometerlas). El PPC ya no se mueve por eso (0041), pero es
+        # justo lo que el planner tiene que mirar antes de cerrar.
+        "origen": origen_denominador(comprom_ids),
+        "reprogramadas": sum(1 for p in props
+                             if comprom_ids and p["actividad_id"] in comprom_ids
+                             and not p["comprometido_vigente"]),
         "comprometidas": len(comprometidas), "cumplidas": len(cumplidas),
         "no_cumplidas": len(comprometidas) - len(cumplidas),
         "no_planificadas": sum(1 for p in props if p["no_planificada"]),
@@ -615,15 +759,15 @@ async def cerrar_semana(data: dict):
         if fecha_lima() < corte:
             raise HTTPException(
                 400, f"La semana se corta el {corte}: todavía no se puede cerrar.")
-        filas = await _detalle_semana(con, proyecto_id, lun, hasta)
+        # El mismo compromiso que vio el planner en la propuesta: si aquí se
+        # calculara distinto, cerraría algo diferente de lo que revisó.
+        comprom_ids, _plan = await _comprometidos(con, proyecto_id, lun)
+        filas = await _detalle_semana(con, proyecto_id, lun, hasta, comprom_ids)
         prev = await con.fetchval(
             "SELECT hasta FROM prog_semana_cierre WHERE proyecto_id=$1 AND lunes=$2",
             proyecto_id, lun - timedelta(days=7))
         referencia = prev or lun
         juzgadas = [f for f in filas if entra_al_cierre(f["comprometido"], f["fecha"], lun)]
-        # La misma marca que vio el planner en la propuesta: si la calculáramos
-        # distinto aquí, cerraría algo diferente de lo que revisó.
-        comprom_ids, _plan = await _comprometidos(con, proyecto_id, lun)
         no_plan_auto = marcar_no_planificadas(
             [f["creado_en"] for f in juzgadas], referencia,
             [f["actividad_id"] for f in juzgadas], comprom_ids)
@@ -683,6 +827,20 @@ async def cerrar_semana(data: dict):
                     d["cumplida"], d["no_planificada"], d["causa_cat"], d["causa"],
                     d["no_plan_motivo"], d["no_plan_desplaza_a"],
                     d["no_plan_desplaza_tit"], d["no_plan_auto"], d["hh"])
+            await _evento(
+                con, proyecto_id, lun, "CERRADA",
+                str(data.get("cerrado_por") or "").strip() or None,
+                len(comprometidas), round(sum(d["comprometido"] for d in comprometidas), 3),
+                ppc=(round(cumplidas / len(comprometidas), 4) if comprometidas else None),
+                nota=str(data.get("nota") or "").strip() or None,
+                detalle={"hasta": str(hasta), "parcial": parcial,
+                         "cumplidas": cumplidas,
+                         "no_cumplidas": len(comprometidas) - cumplidas,
+                         "no_planificadas": len(det) - len(comprometidas),
+                         # Cuántos veredictos difieren de lo que el sistema
+                         # propuso: es la medida de cuánto se corrigió a mano.
+                         "ajustes": sum(1 for d in det
+                                        if d["no_planificada"] != d["no_plan_auto"])})
     log.info("semana cerrada", extra={"proyecto": proyecto_id, "lunes": str(lun),
                                       "comprometidas": len(comprometidas),
                                       "cumplidas": cumplidas,
@@ -722,14 +880,17 @@ async def _no_plan_de_semana(con, proyecto_id: int, lun: date) -> tuple:
 
     cfg = await leer_config_cierre(con, proyecto_id)
     _corte, hasta, _p = ventana_corte(lun, **_kw(cfg))
-    filas = await _detalle_semana(con, proyecto_id, lun, hasta)
+    # Mismo compromiso congelado que usan el cierre y el PPC: las fallidas que
+    # este panel ofrece como «a quién desplazó» tienen que ser las mismas que el
+    # PPC cuenta como no cumplidas.
+    comprom_ids, _plan = await _comprometidos(con, proyecto_id, lun)
+    filas = await _detalle_semana(con, proyecto_id, lun, hasta, comprom_ids)
     juzgadas = [f for f in filas if entra_al_cierre(f["comprometido"], f["fecha"], lun)]
     if not juzgadas:
         return [], [], hasta, False
     prev = await con.fetchval(
         "SELECT hasta FROM prog_semana_cierre WHERE proyecto_id=$1 AND lunes=$2",
         proyecto_id, lun - timedelta(days=7))
-    comprom_ids, _plan = await _comprometidos(con, proyecto_id, lun)
     marcas = marcar_no_planificadas(
         [f["creado_en"] for f in juzgadas], prev or lun,
         [f["actividad_id"] for f in juzgadas], comprom_ids)
@@ -883,16 +1044,126 @@ async def clasificar_no_planificada(act_id: int, data: dict):
             "desplaza_a": desplaza}
 
 
+def resumir_historial(eventos: list) -> dict:
+    """Lectura rápida de una bitácora: cuántas veces se comprometió, se cerró y
+    se reabrió, y si el PPC publicado llegó a cambiar. PURA (testeable).
+
+    `reaperturas` es el número que importa: una semana que se cerró tres veces
+    tuvo tres PPC distintos, y quien lea el indicador tiene derecho a saberlo.
+    `ppc_cambio` compara el primer PPC congelado con el último — si difieren,
+    el número que se publicó en su día no es el que se ve hoy.
+    """
+    conteo = {k: 0 for k in EVENTOS}
+    ppcs = []
+    for e in eventos:
+        ev = e.get("evento")
+        if ev in conteo:
+            conteo[ev] += 1
+        if ev == "CERRADA" and e.get("ppc") is not None:
+            ppcs.append(float(e["ppc"]))
+    return {
+        "eventos": len(eventos),
+        "veces_comprometida": conteo["COMPROMETIDA"],
+        "veces_cerrada": conteo["CERRADA"],
+        "reaperturas": conteo["REABIERTA"],
+        "descompromisos": conteo["DESCOMPROMETIDA"],
+        "ppc_primero": ppcs[0] if ppcs else None,
+        "ppc_ultimo": ppcs[-1] if ppcs else None,
+        "ppc_cambio": (round(ppcs[-1] - ppcs[0], 4)
+                       if len(ppcs) > 1 and ppcs[-1] != ppcs[0] else None),
+    }
+
+
+@router.get("/semana-historial")
+async def semana_historial(lunes: str = "", proyecto_id: int = 1, limite: int = 100):
+    """Bitácora de congelamiento: cuándo se comprometió y se cerró cada semana,
+    quién lo hizo y qué cambió entre una vez y la siguiente (0041).
+
+    Con `lunes` devuelve la historia de ESA semana en orden cronológico (con el
+    detalle congelado de cada evento). Sin `lunes`, los últimos movimientos del
+    proyecto — que es la vista de auditoría: si alguien reabrió una semana de
+    hace un mes, se ve aquí arriba.
+
+    Es de solo lectura y no existe forma de borrar un evento por API: una
+    bitácora que se puede editar no sirve para sustentar un indicador.
+    """
+    n = max(1, min(int(limite or 100), 500))
+    lun = _lunes_arg(lunes) if str(lunes or "").strip() else None
+    pool = await db()
+    async with pool.acquire() as con:
+        if lun is not None:
+            rows = await con.fetch(
+                """SELECT * FROM prog_semana_eventos
+                    WHERE proyecto_id=$1 AND lunes=$2 ORDER BY id""",
+                proyecto_id, lun)
+        else:
+            rows = await con.fetch(
+                """SELECT * FROM prog_semana_eventos
+                    WHERE proyecto_id=$1 ORDER BY id DESC LIMIT $2""",
+                proyecto_id, n)
+    eventos = []
+    for r in rows:
+        d = r["detalle"]
+        if isinstance(d, str):                 # asyncpg devuelve JSONB como texto
+            try:
+                d = json.loads(d)
+            except (ValueError, TypeError):
+                d = None
+        eventos.append({
+            "id": r["id"], "lunes": str(r["lunes"]), "evento": r["evento"],
+            "etiqueta": EVENTOS.get(r["evento"], r["evento"]),
+            "actor": r["actor"], "n_actividades": r["n_actividades"],
+            "metrado": float(r["metrado"] or 0),
+            "ppc": float(r["ppc"]) if r["ppc"] is not None else None,
+            "nota": r["nota"], "detalle": d,
+            # Eventos reconstruidos por la migración 0041 desde las fechas que
+            # ya estaban en BD: la fecha es real, el detalle por actividad no
+            # existe porque nunca se guardó.
+            "backfill": bool(isinstance(d, dict) and d.get("backfill")),
+            "creado_en": str(r["creado_en"]),
+        })
+    return {"proyecto_id": proyecto_id, "lunes": str(lun) if lun else None,
+            "catalogo": EVENTOS, "eventos": eventos,
+            "resumen": resumir_historial(eventos) if lun is not None else None}
+
+
 @router.delete("/cierre-semana")
-async def reabrir_semana(lunes: str = "", proyecto_id: int = 1):
+async def reabrir_semana(lunes: str = "", proyecto_id: int = 1,
+                         actor: str = "", nota: str = ""):
     """Reabre una semana cerrada (se equivocaron, faltaba registrar un avance).
-    Queda en el log: cerrar de nuevo vuelve a congelar con los datos de ahora."""
+
+    El cierre se borra —cerrar de nuevo vuelve a congelar con los datos de
+    ahora— pero el PPC que tenía queda en la bitácora antes de irse. Sin eso,
+    reabrir y volver a cerrar podía cambiar un indicador ya publicado sin dejar
+    ningún rastro de cuál era antes."""
     lun = _lunes_arg(lunes)
     pool = await db()
-    n = await pool.execute(
-        "DELETE FROM prog_semana_cierre WHERE proyecto_id=$1 AND lunes=$2",
-        proyecto_id, lun)
-    if n == "DELETE 0":
-        raise HTTPException(404, "Esa semana no está cerrada")
+    async with pool.acquire() as con:
+        prev = await con.fetchrow(
+            """SELECT comprometidas, cumplidas, no_cumplidas, no_planificadas,
+                      hasta, parcial, cerrado_en, cerrado_por
+                 FROM prog_semana_cierre WHERE proyecto_id=$1 AND lunes=$2""",
+            proyecto_id, lun)
+        if not prev:
+            raise HTTPException(404, "Esa semana no está cerrada")
+        async with con.transaction():
+            await con.execute(
+                "DELETE FROM prog_semana_cierre WHERE proyecto_id=$1 AND lunes=$2",
+                proyecto_id, lun)
+            await _evento(
+                con, proyecto_id, lun, "REABIERTA",
+                str(actor or "").strip() or None, prev["comprometidas"],
+                ppc=(round(prev["cumplidas"] / prev["comprometidas"], 4)
+                     if prev["comprometidas"] else None),
+                nota=str(nota or "").strip() or None,
+                detalle={"ppc_que_se_reabre": (
+                             round(prev["cumplidas"] / prev["comprometidas"], 4)
+                             if prev["comprometidas"] else None),
+                         "cumplidas": prev["cumplidas"],
+                         "no_cumplidas": prev["no_cumplidas"],
+                         "no_planificadas": prev["no_planificadas"],
+                         "hasta": str(prev["hasta"]), "parcial": prev["parcial"],
+                         "cerrado_en": str(prev["cerrado_en"]),
+                         "cerrado_por": prev["cerrado_por"]})
     log.info("semana reabierta", extra={"proyecto": proyecto_id, "lunes": str(lun)})
     return {"ok": True, "lunes": str(lun), "reabierta": True}

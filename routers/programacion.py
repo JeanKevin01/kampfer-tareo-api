@@ -2377,7 +2377,8 @@ async def borrar_restriccion(rest_id: int):
     return {"ok": True}
 
 
-async def _detalle_semana(con, proyecto_id: int, lunes: date, hasta: date) -> list:
+async def _detalle_semana(con, proyecto_id: int, lunes: date, hasta: date,
+                          congelado=None) -> list:
     """Compromiso y avance de UNA semana, actividad por actividad, contando solo
     hasta `hasta` (el corte, que puede caer antes del domingo).
 
@@ -2385,7 +2386,16 @@ async def _detalle_semana(con, proyecto_id: int, lunes: date, hasta: date) -> li
     tramos hermanos de la misma partida-etapa— y por eso vive aquí y no en el
     módulo de cierre: si el cierre congelara números calculados de otra manera,
     el PPC congelado no coincidiría con el que el planner acababa de ver.
+
+    `congelado` ({actividad_id: metrado}, 0041) es el compromiso de la semana:
+    cuando viene, el `comprometido` sale de ahí y no del plan de hoy, y las
+    actividades comprometidas entran AUNQUE hoy estén fuera de la semana o
+    canceladas. Sin eso, mover la F.Inicio o cancelar una actividad que no se
+    hizo la borraba del denominador y el PPC subía solo (D1). El metrado
+    vigente viaja aparte en `comprometido_vigente` para poder mostrar la
+    diferencia — el número no se mueve, pero el planner tiene que verla.
     """
+    ids_comp = sorted(congelado) if congelado else []
     # Las causas viajan para que el cierre PREcargue lo que el planner ya
     # escribió en la evaluación semanal: la misma precedencia del Pareto
     # (planner > campo). Sin esto habría que teclear la causa dos veces, y
@@ -2406,17 +2416,24 @@ async def _detalle_semana(con, proyecto_id: int, lunes: date, hasta: date) -> li
              FROM prog_actividades a
              LEFT JOIN ev_partidas p ON p.id = a.partida_id
              LEFT JOIN prog_actividades d ON d.id = a.no_plan_desplaza_a
-            WHERE a.proyecto_id = $1 AND a.estado <> 'CANCELADO'
-              AND a.fecha <= $3 AND COALESCE(a.fecha_fin, a.fecha) >= $2""",
-        proyecto_id, lunes, hasta)]
+            WHERE a.proyecto_id = $1
+              AND (a.id = ANY($4)
+                   OR (a.estado <> 'CANCELADO'
+                       AND a.fecha <= $3 AND COALESCE(a.fecha_fin, a.fecha) >= $2))""",
+        proyecto_id, lunes, hasta, ids_comp)]
     if not acts:
         return []
     ids = [a["id"] for a in acts]
     pids = sorted({a["partida_id"] for a in acts if a["partida_id"]})
-    comp = {r["actividad_id"]: float(r["c"] or 0) for r in await con.fetch(
+    # Import local (la dirección del import del módulo es prog_cierre →
+    # programacion): la regla del denominador tiene que vivir en un solo sitio
+    # para que el cierre y el PPC no puedan divergir.
+    from routers.prog_cierre import denominador_comprometido
+    comp_vig = {r["actividad_id"]: float(r["c"] or 0) for r in await con.fetch(
         """SELECT actividad_id, SUM(cantidad) AS c FROM prog_metrado_dia
             WHERE actividad_id = ANY($1) AND fecha BETWEEN $2 AND $3
             GROUP BY 1""", ids, lunes, hasta)}
+    comp = denominador_comprometido(comp_vig, congelado)
     principal = {r["partida_id"]: r["id"] for r in await con.fetch(
         """SELECT DISTINCT ON (partida_id) partida_id, id FROM ev_hitos
             WHERE partida_id = ANY($1)
@@ -2475,6 +2492,10 @@ async def _detalle_semana(con, proyecto_id: int, lunes: date, hasta: date) -> li
             "estado": a["estado"], "creado_en": a["creado_en"],
             "fecha": a["fecha"], "fecha_fin": a["fecha_fin"], "unidad": a["unidad"],
             "comprometido": round(comp.get(a["id"], 0.0), 3),
+            # Lo que el plan de HOY dice de esa misma actividad. Igual al
+            # comprometido mientras nadie reprograme; en 0 cuando la actividad
+            # se movió fuera de la semana o se canceló (0041).
+            "comprometido_vigente": round(comp_vig.get(a["id"], 0.0), 3),
             "alcanzado": round(alcanzado, 3),
             "causa_cat": a["causa_cat"], "causa": a["causa"],
             "causa_campo_cat": a["causa_campo_cat"], "causa_campo": a["causa_campo"],
@@ -2663,18 +2684,38 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8,
     NO_CUMPLIDA → no cumplida (su causa alimenta el Pareto) · EJECUTADO →
     cumplida · CANCELADO se excluye. Las actividades sin celdas programadas
     (sin metrado) se evalúan por estado en la semana de su F.Inicio."""
+    from routers.prog_cierre import denominador_comprometido, origen_denominador
     hoy = fecha_lima()
     desde, hasta = ventana_ppc(hoy, semanas, p_desde, p_hasta)
     pool = await db()
     async with pool.acquire() as con:
+        # ── Compromiso congelado del rango (0040 el qué, 0041 el cuánto) ──
+        # Se lee ANTES que las actividades porque las comprometidas tienen que
+        # entrar aunque hoy estén fuera de la semana o canceladas: si no, mover
+        # la F.Inicio de una que no se hizo —o cancelarla— la borraba del
+        # denominador y el PPC subía solo (D1).
+        cong: dict = {}
+        plan_meta: dict = {}
+        for r in await con.fetch(
+                """SELECT p.lunes, p.comprometido_en, d.actividad_id, d.metrado
+                     FROM prog_semana_plan p
+                     LEFT JOIN prog_semana_plan_det d ON d.plan_id = p.id
+                    WHERE p.proyecto_id = $1 AND p.lunes BETWEEN $2 AND $3""",
+                proyecto_id, desde, hasta):
+            cong.setdefault(r["lunes"], {})
+            plan_meta[r["lunes"]] = r["comprometido_en"]
+            if r["actividad_id"]:
+                cong[r["lunes"]][r["actividad_id"]] = float(r["metrado"] or 0)
+        ids_comp = sorted({aid for d in cong.values() for aid in d})
         acts = [dict(r) for r in await con.fetch(
             """SELECT id, partida_id, hito_id, estado, fecha,
                       COALESCE(fecha_fin, fecha) AS fecha_fin, supervisor_id,
                       creado_en, no_plan_motivo, no_plan_desplaza_a
                FROM prog_actividades
                WHERE proyecto_id = $1
-                 AND fecha <= $3 AND COALESCE(fecha_fin, fecha) >= $2""",
-            proyecto_id, desde, hasta)]
+                 AND (id = ANY($4)
+                      OR (fecha <= $3 AND COALESCE(fecha_fin, fecha) >= $2))""",
+            proyecto_id, desde, hasta, ids_comp)]
         ids = [a["id"] for a in acts]
         pids = sorted({a["partida_id"] for a in acts if a["partida_id"]})
         # Tramos de cada partida-etapa (también fuera de la ventana) para poder
@@ -2726,9 +2767,31 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8,
                WHERE r.proyecto_id = $1 AND r.fecha BETWEEN $2 AND $3
                  AND r.restricciones IS NOT NULL""", proyecto_id, desde, hasta)
 
-    prog_de: dict = {}
+    # Plan VIGENTE por semana y, sobre él, el denominador que de verdad se juzga:
+    # con la semana comprometida manda el metrado congelado (§
+    # denominador_comprometido); sin comprometer, el vigente de siempre.
+    vig_sem: dict = {}
     for r in prog_rows:
-        prog_de.setdefault(r["actividad_id"], {})[r["lunes"]] = float(r["c"] or 0)
+        vig_sem.setdefault(r["lunes"], {})[r["actividad_id"]] = float(r["c"] or 0)
+    comp_sem = {lun: denominador_comprometido(vig_sem.get(lun, {}), cong.get(lun))
+                for lun in set(vig_sem) | set(cong)}
+    # Invertido para recorrer por actividad. Los ceros se descartan a propósito:
+    # una actividad sin metrado (de apoyo, o a la que el re-prorrateo no le dejó
+    # saldo) se juzga en la semana de su F.Inicio, no aquí — dejarla con un 0
+    # la sacaría de las dos ramas y desaparecería del PPC.
+    prog_de: dict = {}
+    for lun, dic in comp_sem.items():
+        for aid, m in dic.items():
+            if m > 0:
+                prog_de.setdefault(aid, {})[lun] = m
+    # En qué semana(s) se comprometió cada actividad, para juzgar ahí a las que
+    # no tienen metrado aunque hoy su F.Inicio esté en otra semana.
+    lun_comp: dict = {}
+    for lun, dic in cong.items():
+        for aid in dic:
+            lun_comp.setdefault(aid, []).append(lun)
+    canceladas_comp = {a["id"] for a in acts
+                       if a["estado"] == "CANCELADO" and a["id"] in lun_comp}
 
     def _etapa_de(pid, hid):
         """Etapa normalizada: el hito principal se guarda como NULL en el diario."""
@@ -2796,25 +2859,35 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8,
     # contaba a todas, así que el bloque de cierre decía «7 de 7 → 100%» y el
     # panel, sobre la misma semana, contaba 10: dos verdades del mismo número
     # que recién coincidían al cerrar.
-    cand: dict = {}
-    for a in acts:
-        if a["estado"] == "CANCELADO":
-            continue
+    def _fuera(a: dict) -> bool:
+        """Cancelar una actividad la saca del PPC… salvo que estuviera
+        comprometida. Si no, «no lo hice → la cancelo» limpiaría el indicador
+        igual que mover la fecha, que es el mismo defecto por otra puerta."""
+        return a["estado"] == "CANCELADO" and a["id"] not in canceladas_comp
+
+    def _semanas_de(a: dict) -> list:
+        """En qué semana(s) se juzga esta actividad y contra cuánto metrado."""
         por_semana = prog_de.get(a["id"])
         if por_semana:
-            for lun, comprom in por_semana.items():
-                if comprom > 0:
-                    cand.setdefault(lun, []).append(a)
-        else:
-            lun = _lunes_de(a["fecha"])
-            if desde <= lun <= hasta:
-                cand.setdefault(lun, []).append(a)
+            return sorted(por_semana.items())
+        # Sin metrado comprometido: en la semana en que se prometió, si se
+        # prometió —aunque hoy su F.Inicio esté en otra—; si no, en la de su
+        # F.Inicio, que es el comportamiento de siempre.
+        lunes = lun_comp.get(a["id"]) or [_lunes_de(a["fecha"])]
+        return [(l, 0.0) for l in lunes if desde <= l <= hasta]
+
+    cand: dict = {}
+    for a in acts:
+        if _fuera(a):
+            continue
+        for lun, _m in _semanas_de(a):
+            cand.setdefault(lun, []).append(a)
 
     no_plan_ids, hh_sem = await _no_plan_y_hh(
         pool, proyecto_id, desde, hasta, cand, acts)
 
     for a in acts:
-        if a["estado"] == "CANCELADO":
+        if _fuera(a):
             continue
         por_semana = prog_de.get(a["id"])
         if por_semana:
@@ -2825,7 +2898,10 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8,
                     continue                      # no se prometió: fuera del PPC
                 alcanz = _alcanzado(a, lun)
                 cerrada = lun + timedelta(days=6) < hoy
-                if a["estado"] == "NO_CUMPLIDA":
+                # CANCELADO no aparece aquí salvo que estuviera comprometido, y
+                # entonces cuenta como lo que es: un compromiso que no se
+                # cumplió (§ _fuera).
+                if a["estado"] in ("NO_CUMPLIDA", "CANCELADO"):
                     cump, noc = 0, 1
                 elif a["estado"] == "EJECUTADO" or alcanz >= comprom - 5e-4:
                     cump, noc = 1, 0
@@ -2848,23 +2924,21 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8,
             # solo por estado declaraba NO CUMPLIDA a la actividad que termina
             # su metrado antes de tiempo — el re-prorrateo le vacía el
             # compromiso justo por haber cumplido.
-            lun = _lunes_de(a["fecha"])
-            if not (desde <= lun <= hasta):
-                continue
-            if a["id"] in no_plan_ids.get(lun, ()):
-                continue                          # no se prometió: fuera del PPC
-            cerrada = lun + timedelta(days=6) < hoy
-            if a["estado"] == "NO_CUMPLIDA":       # la marca manual manda
-                cump, noc = 0, 1
-            elif a["estado"] == "EJECUTADO" or _alcanzado(a, lun) > 0:
-                cump, noc = 1, 0
-            elif cerrada:
-                cump, noc = 0, 1
-            else:
-                cump, noc = 0, 0                        # en curso: sin veredicto
-            if noc:
-                fallidas_ids.add(a["id"])
-            _suma(lun, a["supervisor_id"], 1, cump, noc)
+            for lun, _m in _semanas_de(a):
+                if a["id"] in no_plan_ids.get(lun, ()):
+                    continue                      # no se prometió: fuera del PPC
+                cerrada = lun + timedelta(days=6) < hoy
+                if a["estado"] in ("NO_CUMPLIDA", "CANCELADO"):   # la marca manda
+                    cump, noc = 0, 1
+                elif a["estado"] == "EJECUTADO" or _alcanzado(a, lun) > 0:
+                    cump, noc = 1, 0
+                elif cerrada:
+                    cump, noc = 0, 1
+                else:
+                    cump, noc = 0, 0                    # en curso: sin veredicto
+                if noc:
+                    fallidas_ids.add(a["id"])
+                _suma(lun, a["supervisor_id"], 1, cump, noc)
 
     # ── Semanas CERRADAS: manda lo congelado ──────────────────
     # Una vez cerrada la semana, su PPC no se recalcula: reprogramar o agregar
@@ -2984,6 +3058,12 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8,
                      # Congelada = el número ya no se mueve. Sin cerrar, el PPC
                      # es sobre el plan VIGENTE y puede cambiar: hay que decirlo.
                      "congelada": lun in cerradas,
+                     # Contra qué plan se midió: CERRADA (veredicto congelado),
+                     # COMPROMETIDO (denominador congelado, 0041) o VIGENTE
+                     # (todavía se recalcula con el plan de hoy).
+                     "origen": origen_denominador(cong.get(lun), lun in cerradas),
+                     "comprometido_en": (str(plan_meta[lun])
+                                         if lun in plan_meta else None),
                      "parcial": bool(cerradas.get(lun, {}).get("parcial")),
                      "hasta": (str(cerradas[lun]["hasta"]) if lun in cerradas
                                else str(min(lun + timedelta(days=6), hoy))),

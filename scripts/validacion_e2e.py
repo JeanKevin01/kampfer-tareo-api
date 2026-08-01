@@ -48,6 +48,12 @@ def limpiar_y_sembrar(cur):
     cur.execute("DELETE FROM prog_actividades WHERE titulo LIKE 'E2E %' OR otm_id='OTM-E2E'")
     cur.execute("DELETE FROM prog_feriados WHERE proyecto_id=1")
     cur.execute("DELETE FROM prog_config WHERE proyecto_id=1")
+    # Compromiso y bitácora de las semanas que toca el humo (0041). La bitácora
+    # es append-only y NO se puede borrar por API —esa es su gracia—, así que el
+    # humo la limpia por SQL: si no, el segundo run encuentra los eventos del
+    # primero y el conteo de «veces comprometida» sale acumulado.
+    cur.execute("DELETE FROM prog_semana_plan WHERE proyecto_id=1")
+    cur.execute("DELETE FROM prog_semana_eventos WHERE proyecto_id=1")
     cur.execute("DELETE FROM fases WHERE codigo LIKE 'E2E-%'")
     cur.execute("DELETE FROM tareo_partida WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM registros WHERE otm_id='OTM-E2E'")
@@ -1539,6 +1545,143 @@ def main():
     check("P72 ida y vuelta: el importador de costos lee la plantilla que él mismo reparte",
           rimp.status_code == 200 and res.get("filas", 0) >= 2 and not res.get("errores"),
           f"status={rimp.status_code} resumen={res}")
+
+    # ── P73-P77 · D1/D2: el compromiso congelado (migración 0041) ──────────
+    # El defecto: `_redistribuir` borra las celdas de prog_metrado_dia sin filtro
+    # de fecha, así que correr la F.Inicio de una actividad que NO se hizo la
+    # dejaba con comprometido 0 y la sacaba del PPC. «Si no cumpliste, muévela.»
+    #
+    # Se reusa la semana de P36 (2026-05-04, ya cerrada en el calendario, PPC
+    # 0.5: una cumplida y una atrasada). Es el escenario exacto del defecto.
+    LUN_D1 = "2026-05-04"
+
+    def _ppc_semana(lunes=LUN_D1):
+        rr = c.get(f"{API}/ev/programacion/ppc", params={"proyecto_id": 1, "semanas": 26})
+        if rr.status_code != 200:
+            return {}
+        return next((s for s in rr.json().get("semanal", []) if s["lunes"] == lunes), {})
+
+    def _nueva_partida(codigo, desc, metrado, hh):
+        cur.execute("INSERT INTO ev_partidas (codigo, fase, descripcion, unidad, "
+                    "metrado_presup, hh_presup, otm_id) VALUES "
+                    f"('{codigo}','F-E2E','{desc}','und',{metrado},{hh},'OTM-E2E') "
+                    "RETURNING id")
+        return cur.fetchone()[0]
+
+    # D1A — comprometida y NUNCA tocada: es la que el defecto hacía desaparecer.
+    # Sin avance registrado no hay ninguna celda «intacta», así que al mover la
+    # fecha el DELETE de `_redistribuir` se lleva TODAS sus celdas de mayo.
+    p_d1a = _nueva_partida("E2E-D1A", "Partida D1 sin avance", 15, 60)
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": LUN_D1, "fecha_fin": "2026-05-05",
+        "otm_id": "OTM-E2E", "titulo": "E2E D1 sin avance",
+        "partida_id": p_d1a, "metrado_prog": 15})
+    act_d1a = r.json() if r.status_code == 200 else {}
+
+    # D1B — comprometida con 25 y solo 5 hechos. El metrado congelado es lo
+    # único que impide darla por cumplida bajándole el compromiso.
+    p_d1b = _nueva_partida("E2E-D1B", "Partida D1 avance parcial", 25, 100)
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": LUN_D1, "fecha_fin": "2026-05-08",
+        "otm_id": "OTM-E2E", "titulo": "E2E D1 avance parcial",
+        "partida_id": p_d1b, "metrado_prog": 25})
+    act_d1b = r.json() if r.status_code == 200 else {}
+    c.post(f"{API}/ev/programacion/actividades/{act_d1b.get('id')}/avance-dia",
+           json={"fecha": LUN_D1, "cantidad": 5})
+
+    base = _ppc_semana()
+    r = c.post(f"{API}/ev/programacion/plan-semana",
+               json={"proyecto_id": 1, "lunes": LUN_D1,
+                     "comprometido_por": "e2e", "nota": "compromiso E2E"})
+    comp = r.json() if r.status_code == 200 else {}
+    tras_comp = _ppc_semana()
+    check("P73 comprometer la semana congela el metrado y no cambia el PPC",
+          r.status_code == 200 and comp.get("comprometidas", 0) >= 4
+          and comp.get("metrado_comprometido", 0) > 0
+          and tras_comp.get("ppc") == base.get("ppc")
+          and tras_comp.get("comprometidas") == base.get("comprometidas")
+          and tras_comp.get("origen") == "COMPROMETIDO",
+          f"status={r.status_code} post={comp} antes={base} despues={tras_comp}")
+
+    # EL CASO D1. La que no se tocó se mueve DOS MESES adelante. Sin 0041 sus
+    # celdas de mayo desaparecían, la actividad salía del denominador y el PPC
+    # de la semana SUBÍA solo: «si no cumpliste, muévela».
+    r = c.put(f"{API}/ev/programacion/actividades/{act_d1a.get('id')}",
+              json={"fecha": "2026-07-06", "fecha_fin": "2026-07-07"})
+    movida = r.status_code
+    tras_mover = _ppc_semana()
+    check("P73b D1 CERRADO: mover una comprometida sin avance no la saca del PPC",
+          movida == 200
+          and tras_mover.get("comprometidas") == tras_comp.get("comprometidas")
+          and tras_mover.get("no_cumplidas") == tras_comp.get("no_cumplidas")
+          and tras_mover.get("ppc") == tras_comp.get("ppc"),
+          f"put={movida} antes={tras_comp} despues={tras_mover}")
+
+    # LA MISMA FUGA POR LA OTRA PUERTA: en vez de mover la fecha, bajar el
+    # compromiso a lo que sí se hizo (25 → 5, con 5 registrados). Contra el plan
+    # vigente pasaría a cumplida; contra el congelado sigue debiendo 20.
+    r = c.put(f"{API}/ev/programacion/actividades/{act_d1b.get('id')}",
+              json={"metrado_prog": 5})
+    bajada = r.status_code
+    tras_bajar = _ppc_semana()
+    check("P73c D1 CERRADO: bajar el metrado comprometido no vuelve cumplida la actividad",
+          bajada == 200
+          and tras_bajar.get("cumplidas") == tras_mover.get("cumplidas")
+          and tras_bajar.get("no_cumplidas") == tras_mover.get("no_cumplidas")
+          and tras_bajar.get("ppc") == tras_mover.get("ppc"),
+          f"put={bajada} antes={tras_mover} despues={tras_bajar}")
+
+    # EL CASO D2. Trabajo nuevo programado HACIA ATRÁS, dentro de una semana ya
+    # comprometida: no puede entrar al denominador (no se prometió).
+    p_d2 = _nueva_partida("E2E-D2", "Partida D2 tardia", 9, 36)
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": LUN_D1, "fecha_fin": "2026-05-05",
+        "otm_id": "OTM-E2E", "titulo": "E2E D2 programada tarde",
+        "partida_id": p_d2, "metrado_prog": 9})
+    tras_d2 = _ppc_semana()
+    check("P74 D2 CERRADO: programar hacia atrás no reescribe el PPC comprometido",
+          r.status_code == 200
+          and tras_d2.get("comprometidas") == tras_bajar.get("comprometidas")
+          and tras_d2.get("ppc") == tras_bajar.get("ppc")
+          and tras_d2.get("no_planificadas", 0) >= 1,
+          f"status={r.status_code} antes={tras_bajar} despues={tras_d2}")
+
+    # La otra puerta del mismo defecto: cancelar en vez de mover.
+    r = c.put(f"{API}/ev/programacion/actividades/{act_ok.get('id')}",
+              json={"estado": "CANCELADO"})
+    tras_cancel = _ppc_semana()
+    check("P75 cancelar una comprometida no la saca del PPC: cuenta como no cumplida",
+          r.status_code == 200
+          and tras_cancel.get("comprometidas") == tras_d2.get("comprometidas")
+          and tras_cancel.get("no_cumplidas", 0) > tras_d2.get("no_cumplidas", 0),
+          f"put={r.status_code} antes={tras_d2} despues={tras_cancel}")
+
+    # La bitácora: el registro de cuándo se congeló y quién lo hizo.
+    r = c.get(f"{API}/ev/programacion/semana-historial",
+              params={"proyecto_id": 1, "lunes": LUN_D1})
+    h = r.json() if r.status_code == 200 else {}
+    evs = h.get("eventos", [])
+    check("P76 la bitácora registra el compromiso con actor, metrado y fecha",
+          r.status_code == 200 and len(evs) >= 1
+          and evs[0]["evento"] == "COMPROMETIDA" and evs[0]["actor"] == "e2e"
+          and evs[0]["metrado"] > 0 and len(evs[0].get("detalle") or []) >= 4
+          and (h.get("resumen") or {}).get("veces_comprometida") == 1,
+          f"status={r.status_code} eventos={evs} resumen={h.get('resumen')}")
+
+    # Descomprometer NO borra la historia: quedan los dos eventos. Es el gesto
+    # que más podría usarse para maquillar el indicador.
+    c.delete(f"{API}/ev/programacion/plan-semana",
+             params={"proyecto_id": 1, "lunes": LUN_D1, "actor": "e2e"})
+    r = c.get(f"{API}/ev/programacion/semana-historial",
+              params={"proyecto_id": 1, "lunes": LUN_D1})
+    h2 = r.json() if r.status_code == 200 else {}
+    tipos = [e["evento"] for e in h2.get("eventos", [])]
+    sin_comp = _ppc_semana()
+    check("P77 descomprometer deja rastro y devuelve la semana al plan vigente",
+          r.status_code == 200 and tipos == ["COMPROMETIDA", "DESCOMPROMETIDA"]
+          and (h2.get("resumen") or {}).get("descompromisos") == 1
+          and sin_comp.get("origen") == "VIGENTE",
+          f"tipos={tipos} semana={sin_comp}")
 
     print()
     if _fallas:
