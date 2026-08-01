@@ -535,6 +535,36 @@ async def semana(proyecto_id: int = 1, lunes: str = ""):
             "actividades": acts, "reportes": reps}
 
 
+def _normalizar_externa(data: dict, metrado, partida_id, supervisor_id=None) -> tuple:
+    """Valida y normaliza una fila de TERCEROS (0042). PURA (testeable).
+
+    Devuelve (externa, empresa, metrado, partida_id, supervisor_id).
+
+    Una fila externa es trabajo que no ejecutamos: no tiene metrado nuestro, no
+    cuelga de una partida de control y no lleva supervisor. Se responde 400 en
+    vez de dejar que reviente el CHECK de la BD, porque un 500 no le dice al
+    planner qué hizo mal — y aquí lo que hizo mal es mezclar dos cosas que el
+    sistema mide por separado.
+    """
+    externa = bool(data.get("externa"))
+    empresa = (str(data.get("empresa") or "").strip()[:80] or None)
+    if not externa:
+        return False, empresa, metrado, partida_id, supervisor_id
+    if partida_id:
+        raise HTTPException(
+            400, "Una actividad de terceros no cuelga de una partida de control: "
+                 "su avance no es valor ganado nuestro. Si la ejecuta un "
+                 "subcontratista pero el metrado es tuyo, prográmala normal.")
+    if metrado:
+        raise HTTPException(
+            400, "Una actividad de terceros no lleva metrado: lo que se anota es "
+                 "cuánto TARDAN (fechas o plazo), no cuánto producen.")
+    # El supervisor se descarta en silencio: es un campo que la UI puede
+    # arrastrar del formulario y no significa nada aquí (nuestro supervisor no
+    # tarea trabajo ajeno). Rechazarlo con 400 sería pedantería.
+    return True, empresa, None, None, None
+
+
 def _exigir_partida(metrado: Optional[float], partida_id: Optional[int]) -> None:
     """Una actividad CON metrado tiene que colgar de una partida de control.
 
@@ -675,6 +705,12 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
     partida_id = int(data["partida_id"]) if data.get("partida_id") else None
     hito_id = int(data["hito_id"]) if data.get("hito_id") else None
     padre_id = int(data["padre_id"]) if data.get("padre_id") else None
+    supervisor_id = ((str(data["supervisor_id"]).strip() or None)
+                     if data.get("supervisor_id") else None)
+    # 0042 · trabajo de terceros: se valida ANTES de _exigir_partida porque una
+    # fila externa legítimamente no tiene partida (y tampoco metrado).
+    externa, empresa, metrado, partida_id, supervisor_id = _normalizar_externa(
+        data, metrado, partida_id, supervisor_id)
     if padre_id is None:
         _exigir_partida(metrado, partida_id)
     proyecto_id = int(data.get("proyecto_id") or 1)
@@ -708,16 +744,16 @@ async def crear_actividad(data: dict, user: dict = Depends(require_role("oficina
                        (proyecto_id, fecha, fecha_fin, otm_id, partida_id, titulo, descripcion,
                         responsable, supervisor_id, metrado_prog, und, dias_salto, dias_medio,
                         hito_id, creado_por, plazo_dias, modo_fecha, desglose_1, desglose_2,
-                        padre_id, es_frente)
+                        padre_id, es_frente, externa, empresa)
                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,
-                               $20,$21)
+                               $20,$21,$22,$23)
                        RETURNING *""",
                     proyecto_id, fecha, fecha_fin, otm_id, partida_id,
                     titulo, data.get("descripcion") or None, data.get("responsable") or None,
-                    (str(data["supervisor_id"]).strip() or None) if data.get("supervisor_id") else None,
+                    supervisor_id,
                     metrado, und, saltos, medios, hito_id, user.get("sub"), plazo, modo,
                     _desglose(data.get("desglose_1")), _desglose(data.get("desglose_2")),
-                    padre_id, es_frente)
+                    padre_id, es_frente, externa, empresa)
             except _ERRORES_DATO:
                 raise HTTPException(400, "OTM, partida o supervisor inválido: revisa los datos")
             if padre is not None:
@@ -792,6 +828,14 @@ async def editar_actividad(act_id: int, data: dict):
     if "partida_id" in data:
         campos.append("partida_id")
         valores.append(int(data["partida_id"]) if data["partida_id"] else None)
+    # 0042 · trabajo de terceros. `empresa` se puede corregir siempre (es una
+    # etiqueta); `externa` decide si la fila cuenta en NUESTRO PPC, así que
+    # cambiarla se valida contra el estado resultante más abajo.
+    if "empresa" in data:
+        campos.append("empresa")
+        valores.append(str(data["empresa"] or "").strip()[:80] or None)
+    if "externa" in data:
+        campos.append("externa"); valores.append(bool(data["externa"]))
     if not campos:
         raise HTTPException(400, "Nada que actualizar")
     # Modo de programación (0034): según QUÉ tocó el planner se deriva el tercer
@@ -817,6 +861,15 @@ async def editar_actividad(act_id: int, data: dict):
             if {"metrado_prog", "partida_id"} & data.keys():
                 fus = {**dict(actual), **dict(zip(campos, valores))}
                 _exigir_partida(fus.get("metrado_prog"), fus.get("partida_id"))
+            # Convertir una fila en externa (o darle partida/metrado a una que ya
+            # lo es) se valida contra el resultado FUSIONADO, no contra el patch:
+            # si no, marcar «no depende de nosotros» sobre una actividad con
+            # partida reventaría el CHECK de la BD con un 500 mudo.
+            if {"externa", "partida_id", "metrado_prog"} & data.keys():
+                fus = {**dict(actual), **dict(zip(campos, valores))}
+                if fus.get("externa"):
+                    _normalizar_externa({"externa": True}, fus.get("metrado_prog"),
+                                        fus.get("partida_id"))
             # Las fechas se resuelven ANTES de escribir, en un solo UPDATE: si
             # se escribiera la F.Inicio primero, mover una actividad más allá de
             # su antiguo fin violaría el CHECK (fecha_fin >= fecha) de 0019.
@@ -1837,6 +1890,26 @@ async def borrar_dependencia(dep_id: int):
     return {"ok": True}
 
 
+@router.get("/empresas")
+async def empresas_usadas(proyecto_id: int = 1):
+    """Empresas que ya se escribieron en alguna fila de terceros (0042).
+
+    Se autoalimenta con lo usado, igual que el catálogo de frentes: para anotar
+    la fecha que te dio un subcontratista no debería hacer falta ir antes a una
+    pantalla de administración a darlo de alta. La lista existe para que la
+    segunda vez se elija en vez de teclearse — que es lo que evita tener
+    «ELECTRO SAC» y «Electro S.A.C.» como dos empresas distintas.
+    """
+    pool = await db()
+    rows = await pool.fetch(
+        """SELECT empresa, count(*) AS n, MAX(COALESCE(fecha_fin, fecha)) AS ultima
+             FROM prog_actividades
+            WHERE proyecto_id = $1 AND empresa IS NOT NULL AND empresa <> ''
+            GROUP BY empresa ORDER BY n DESC, empresa""", proyecto_id)
+    return [{"empresa": r["empresa"], "n": r["n"], "ultima": str(r["ultima"])}
+            for r in rows]
+
+
 # ── Lookahead-grid: la vista tipo Excel del ex-gerente ───────
 # Réplica del "Anexo 01 - LookAhead" / "F030b - Planeamiento": filas =
 # actividades agrupadas por OTM, columnas = días de N semanas, con el
@@ -2060,6 +2133,9 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             # que la fila no se dibuje como editable cuando está dividida).
             "padre_id": a["padre_id"], "es_frente": a["es_frente"],
             "n_subfilas": len(subfilas),
+            # 0042 · trabajo de terceros: SÍ se ve en el LookAhead y arrastra
+            # fechas por las dependencias; lo que no hace es entrar al PPC.
+            "externa": bool(a.get("externa")), "empresa": a.get("empresa"),
         }
         clave = a["otm_id"] or ""
         if clave not in idx:
@@ -2417,6 +2493,10 @@ async def _detalle_semana(con, proyecto_id: int, lunes: date, hasta: date,
              LEFT JOIN ev_partidas p ON p.id = a.partida_id
              LEFT JOIN prog_actividades d ON d.id = a.no_plan_desplaza_a
             WHERE a.proyecto_id = $1
+              -- 0042: el trabajo de terceros no es un compromiso NUESTRO. Se ve
+              -- en el LookAhead y arrastra fechas, pero ni entra al PPC ni se
+              -- congela con la semana: su atraso no es nuestro incumplimiento.
+              AND NOT a.externa
               AND (a.id = ANY($4)
                    OR (a.estado <> 'CANCELADO'
                        AND a.fecha <= $3 AND COALESCE(a.fecha_fin, a.fecha) >= $2))""",
@@ -2713,6 +2793,8 @@ async def ppc(proyecto_id: int = 1, semanas: int = 8,
                       creado_en, no_plan_motivo, no_plan_desplaza_a
                FROM prog_actividades
                WHERE proyecto_id = $1
+                 -- 0042: fuera el trabajo de terceros (§ _detalle_semana).
+                 AND NOT externa
                  AND (id = ANY($4)
                       OR (fecha <= $3 AND COALESCE(fecha_fin, fecha) >= $2))""",
             proyecto_id, desde, hasta, ids_comp)]
@@ -3486,6 +3568,9 @@ async def programacion_dia(fecha: str = "", otm_id: str = ""):
              AND NOT ($1 = ANY(a.dias_salto))
              AND a.estado <> 'CANCELADO'
              AND (a.otm_id = $2 OR a.otm_id IS NULL)
+             -- 0042: el trabajo de terceros no se reporta desde campo — no lo
+             -- ejecutamos nosotros. Aparece en el LookAhead de oficina y punto.
+             AND NOT a.externa
              -- Una fila dividida no se reporta: lo que se trabaja es el frente.
              AND NOT EXISTS (SELECT 1 FROM prog_actividades h WHERE h.padre_id = a.id)
            ORDER BY a.id""", f, otm_id or None)
@@ -3521,6 +3606,9 @@ async def mis_actividades(supervisor_id: str, fecha: str = "",
            WHERE $1 BETWEEN a.fecha AND COALESCE(a.fecha_fin, a.fecha)
              AND NOT ($1 = ANY(a.dias_salto))
              AND a.supervisor_id = $2 AND a.estado <> 'CANCELADO'
+             -- 0042: explícito aunque hoy sea redundante (una fila externa no
+             -- lleva supervisor). La agenda de campo es trabajo NUESTRO.
+             AND NOT a.externa
              -- La fila dividida no es trabajo de nadie: lo son sus frentes.
              AND NOT EXISTS (SELECT 1 FROM prog_actividades h2 WHERE h2.padre_id = a.id)
            ORDER BY a.id""", f, supervisor_id)

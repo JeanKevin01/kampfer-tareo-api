@@ -1683,6 +1683,77 @@ def main():
           and sin_comp.get("origen") == "VIGENTE",
           f"tipos={tipos} semana={sin_comp}")
 
+    # ── P78-P80 · Trabajo de terceros en el LookAhead (0042) ──────────────
+    # Otra empresa da su plazo y de eso dependen actividades nuestras. La fila
+    # tiene que arrastrar nuestras fechas con los vínculos de siempre pero NO
+    # contar en nuestro PPC: su atraso no es nuestro incumplimiento.
+    SEM_EXT = "2026-09-07"                    # lunes futuro, sin datos de otros checks
+    ppc_ext_antes = _ppc_semana(SEM_EXT)
+
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": SEM_EXT, "otm_id": "OTM-E2E",
+        "titulo": "ELECTRO SAC — Montaje de bandejas",
+        "externa": True, "empresa": "ELECTRO SAC", "plazo_dias": 4})
+    ext = r.json() if r.status_code == 200 else {}
+    # Con plazo, la F.Fin se deriva saltando los no laborables: no hay que
+    # contar días a mano (es como dan el dato: «nos toma 4 días»).
+    r2 = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": SEM_EXT, "fecha_fin": "2026-09-09",
+        "otm_id": "OTM-E2E", "titulo": "E2E depende del tercero",
+        "partida_id": p_d1a, "metrado_prog": 6})
+    nuestra = r2.json() if r2.status_code == 200 else {}
+    check("P78 fila de terceros: se crea sin partida ni metrado, con plazo y empresa",
+          r.status_code == 200 and ext.get("externa") is True
+          and ext.get("empresa") == "ELECTRO SAC"
+          and ext.get("partida_id") is None and not ext.get("metrado_prog")
+          and ext.get("fecha_fin") and ext.get("fecha_fin") > SEM_EXT,
+          f"status={r.status_code} act={ext}")
+
+    # Vincular: la nuestra va DESPUÉS de la del tercero (FS).
+    rv = c.post(f"{API}/ev/programacion/actividades/{nuestra.get('id')}/dependencias",
+                json={"predecesora_id": ext.get("id"), "tipo": "FS", "lag_dias": 0})
+    # El tercero avisa que se atrasa 5 días: al mover SU fecha, la nuestra debe
+    # correrse sola. Es la razón de modelarlo como actividad y no como
+    # restricción (una restricción tiene fecha, no duración, y no arrastra).
+    rm = c.put(f"{API}/ev/programacion/actividades/{ext.get('id')}",
+               json={"fecha": "2026-09-14", "fecha_fin": "2026-09-17"})
+    movidas = (rm.json() or {}).get("movidas") if rm.status_code == 200 else None
+    # OJO: no nombrar `fila` a esta variable — choca con la función `fila()` del
+    # propio script y la vuelve inaccesible en TODO main (UnboundLocalError).
+    cur.execute("SELECT fecha FROM prog_actividades WHERE id=%s", (nuestra.get("id"),))
+    row_ext = cur.fetchone()
+    nueva_fecha = str(row_ext[0]) if row_ext else ""
+    check("P79 el atraso del tercero arrastra nuestra actividad por el vínculo FS",
+          rv.status_code == 200 and rm.status_code == 200
+          and nuestra.get("id") in (movidas or [])
+          and nueva_fecha > "2026-09-09",
+          f"dep={rv.status_code} put={rm.status_code} movidas={movidas} nuestra={nueva_fecha}")
+
+    ppc_ext = _ppc_semana("2026-09-14")
+    r = c.get(f"{API}/ev/programacion/empresas", params={"proyecto_id": 1})
+    emps = [e["empresa"] for e in r.json()] if r.status_code == 200 else []
+    # La semana del tercero NO gana una comprometida por su culpa. Se compara
+    # contra la semana donde quedó tras moverse: si entrara al PPC, aparecería.
+    r2 = c.get(f"{API}/ev/programacion/cierre-semana",
+               params={"proyecto_id": 1, "lunes": "2026-09-14"})
+    cierre_ext = r2.json() if r2.status_code == 200 else {}
+    ids_cierre = [x.get("actividad_id") for x in cierre_ext.get("actividades", [])]
+    check("P80 la fila de terceros NO entra al PPC ni al cierre; la empresa se autocataloga",
+          ext.get("id") not in ids_cierre
+          and (ppc_ext.get("comprometidas") or 0) == (ppc_ext_antes.get("comprometidas") or 0)
+          and "ELECTRO SAC" in emps,
+          f"ids_cierre={ids_cierre} externa={ext.get('id')} ppc={ppc_ext} empresas={emps}")
+
+    # El CHECK de la BD es la última línea: ninguna ruta futura puede crear la
+    # combinación prohibida aunque se salte la validación del router.
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": SEM_EXT, "otm_id": "OTM-E2E",
+        "titulo": "E2E externa invalida", "externa": True,
+        "partida_id": p_d1a, "metrado_prog": 5})
+    check("P81 una fila de terceros con partida o metrado se rechaza con 400 explicado",
+          r.status_code == 400 and "partida" in str(r.json().get("detail", "")).lower(),
+          f"status={r.status_code} detail={r.json().get('detail')}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
