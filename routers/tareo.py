@@ -12,6 +12,7 @@ from core.auth import exigir_identidad_supervisor, require_role
 from core.db import db as core_db
 from core.log import get_logger
 from core.tiempo import fecha_lima, parse_fecha
+from routers.ev.hoja import lineas_protegidas
 from routers.jornada import resolver_jornada
 from routers.valor_ganado import _fecha_base
 
@@ -320,15 +321,24 @@ async def enviar_con_partidas(data: dict, user: dict = Depends(require_role())):
     enviados = 0
     fallidos = 0
     omitidos = 0
+    respetados = 0   # líneas ya corregidas en oficina que el reenvío no toca
 
     try:
         # Todo el registro va en UNA transacción: o entra completo o no entra nada
         # (evita estados a medias y condiciones de carrera en el reenvío).
         async with pool.acquire() as con:
             async with con.transaction():
+                # La corrección de oficina gana sobre todo (decisión de Jean,
+                # 2026-08-02): las líneas ya corregidas ni se borran ni se
+                # reescriben con lo que trae la app. Sin esto, corregir el lunes
+                # desde el panel y que el supervisor reenviara ese día deshacía
+                # la corrección en silencio.
+                protegidas = await lineas_protegidas(con, supervisor_id, otm_id, fecha_obj)
+
                 # Idempotencia: un reenvío del mismo supervisor/OTM/día REEMPLAZA el anterior.
                 await con.execute(
-                    "DELETE FROM tareo_partida WHERE supervisor_id=$1 AND otm_id=$2 AND fecha=$3",
+                    "DELETE FROM tareo_partida WHERE supervisor_id=$1 AND otm_id=$2 AND fecha=$3 "
+                    "AND editado_por IS NULL",
                     supervisor_id, otm_id, fecha_obj,
                 )
 
@@ -368,6 +378,12 @@ async def enviar_con_partidas(data: dict, user: dict = Depends(require_role())):
                             hh = float(asig.get("hh") or hh_dia)
                         except (TypeError, ValueError):
                             hh = 0.0
+                        if (trab_id, pid) in protegidas:
+                            # Oficina ya fijó esta línea: se deja como está y se
+                            # informa, para que la app pueda decírselo al
+                            # supervisor en vez de que el cambio se pierda mudo.
+                            respetados += 1
+                            continue
                         if not pid or hh <= 0:
                             # Antes se descartaba en SILENCIO: la app decía
                             # "enviado" y la partida se quedaba con 0 HH en el
@@ -400,6 +416,7 @@ async def enviar_con_partidas(data: dict, user: dict = Depends(require_role())):
         raise HTTPException(500, f"Error al registrar tareo: {e}")
 
     return {"ok": True, "enviados": enviados, "tareo_fallidos": fallidos,
-            "tareo_omitidos": omitidos, "sesion_id": sesion_id, "hh_dia": hh_dia}
+            "tareo_omitidos": omitidos, "tareo_respetados": respetados,
+            "sesion_id": sesion_id, "hh_dia": hh_dia}
 
 

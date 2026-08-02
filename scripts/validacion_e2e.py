@@ -55,11 +55,19 @@ def limpiar_y_sembrar(cur):
     cur.execute("DELETE FROM prog_semana_plan WHERE proyecto_id=1")
     cur.execute("DELETE FROM prog_semana_eventos WHERE proyecto_id=1")
     cur.execute("DELETE FROM fases WHERE codigo LIKE 'E2E-%'")
+    cur.execute("DELETE FROM tareo_ediciones WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM tareo_partida WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM registros WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM sesion_trabajadores WHERE sesion_id IN "
                 "(SELECT id FROM sesiones WHERE otm_id='OTM-E2E')")
     cur.execute("DELETE FROM sesiones WHERE otm_id='OTM-E2E'")
+    # El segundo supervisor de P85 es de humo y NO tiene ficha de trabajador: si
+    # sobrevive al run, P46 (todo supervisor activo tiene ficha) lo encuentra en
+    # la siguiente pasada y falla. Se borra con su acceso, que se lo crea sola la
+    # semilla del arranque del API.
+    cur.execute("DELETE FROM usuarios WHERE supervisor_id='SUPE2F'")
+    cur.execute("DELETE FROM cuadrillas WHERE supervisor_id='SUPE2F'")
+    cur.execute("DELETE FROM supervisores WHERE id='SUPE2F'")
     cur.execute("DELETE FROM ev_avances WHERE hito_id IN (SELECT id FROM ev_hitos WHERE "
                 "partida_id IN (SELECT id FROM ev_partidas WHERE codigo LIKE 'E2E-%'))")
     cur.execute("DELETE FROM ev_hh_gastadas WHERE partida_id IN "
@@ -1825,6 +1833,87 @@ def main():
           and f_rota.get("prog_total") == 0 and (f_rota.get("metrado_prog") or 0) > 0
           and (f_sana.get("prog_total") or 0) > 0,
           f"celdas={celdas} rota={f_rota.get('prog_total')} sana={f_sana.get('prog_total')}")
+
+    # ── P85-P87 · Hoja semanal de HH y corrección desde oficina (0043) ────
+    # Escenario: DOS supervisores tarean al mismo trabajador el mismo día. Como
+    # el reemplazo del reenvío es por (supervisor, OTM, fecha), las dos sesiones
+    # conviven y suman 14.5 HH contra una jornada de 10. Es el caso que la hoja
+    # existe para cazar y arreglar.
+    F_HOJA = "2026-06-03"   # miércoles de la semana 1 → jornada 10 por defecto
+    cur.execute("INSERT INTO supervisores (id, nombre, activo) VALUES ('SUPE2F','SUP E2E DOS',true) "
+                "ON CONFLICT (id) DO NOTHING")
+    for sup, pid, hh in (("SUPE2E", p1["id"], 9.5), ("SUPE2F", p2["id"], 5.0)):
+        c.post(f"{API}/api/sesion/enviar-con-partidas", json={
+            "supervisor_id": sup, "otm_id": "OTM-E2E", "fecha": F_HOJA,
+            "trabajadores": [{"trab_id": "901", "via": "e2e",
+                              "asignaciones": [{"partida_id": pid, "hh": hh}]}]})
+
+    r = c.get(f"{API}/ev/hoja-semanal", params={"lunes": "2026-06-01"})
+    hoja = r.json() if r.status_code == 200 else {}
+    proy = next((p for p in hoja.get("proyectos", []) if p["otm_id"] == "OTM-E2E"), {})
+    tot = hoja.get("totales_persona_dia", {}).get(f"901|{F_HOJA}", {})
+    check("P85 la hoja agrupa OTM->partida->persona y ve el exceso del día sumando sesiones",
+          r.status_code == 200 and len(proy.get("partidas", [])) >= 2
+          and abs(tot.get("hh", 0) - 14.5) < 0.01 and tot.get("estado") == "extra"
+          and any(a["trab_id"] == "901" and a["fecha"] == F_HOJA for a in hoja.get("avisos", [])),
+          f"partidas={len(proy.get('partidas', []))} tot={tot}")
+
+    # Y filtrando un solo proyecto el total del día NO puede encogerse: el exceso
+    # casi siempre nace de estar en dos sitios a la vez.
+    r = c.get(f"{API}/ev/hoja-semanal", params={"lunes": "2026-06-01", "otm": "OTM-E2E"})
+    tot_f = (r.json() or {}).get("totales_persona_dia", {}).get(f"901|{F_HOJA}", {})
+    check("P85b el total por persona/día no cambia al filtrar por proyecto",
+          abs(tot_f.get("hh", 0) - 14.5) < 0.01, f"tot_filtrado={tot_f}")
+
+    cur.execute("SELECT id FROM tareo_partida WHERE otm_id='OTM-E2E' AND fecha=%s "
+                "AND trabajador_id='901' AND supervisor_id='SUPE2E'", (F_HOJA,))
+    fila_sup = cur.fetchone()
+    linea_id = fila_sup[0] if fila_sup else 0
+    r = c.patch(f"{API}/ev/tareo-linea/{linea_id}", json={"hh": 6.0, "motivo": "E2E doble tareo"})
+    cur.execute("SELECT hh, editado_por FROM tareo_partida WHERE id=%s", (linea_id,))
+    hh_post, editor = cur.fetchone() if linea_id else (None, None)
+    cur.execute("SELECT accion, hh_antes, hh, usuario FROM tareo_ediciones WHERE tareo_id=%s", (linea_id,))
+    traza = cur.fetchone()
+    check("P86 corregir HH desde oficina baja el dato, marca la línea y deja traza",
+          r.status_code == 200 and float(hh_post or 0) == 6.0 and editor
+          and traza and traza[0] == "editar" and float(traza[1]) == 9.5 and float(traza[2]) == 6.0,
+          f"status={r.status_code} hh={hh_post} editor={editor} traza={traza}")
+
+    # El check que de verdad importa: la corrección de oficina gana sobre el
+    # reenvío del supervisor. Sin la marca `editado_por`, este reenvío borraría
+    # la línea y la repondría con 9.5, deshaciendo la corrección en silencio.
+    r = c.post(f"{API}/api/sesion/enviar-con-partidas", json={
+        "supervisor_id": "SUPE2E", "otm_id": "OTM-E2E", "fecha": F_HOJA,
+        "trabajadores": [{"trab_id": "901", "via": "e2e",
+                          "asignaciones": [{"partida_id": p1["id"], "hh": 9.5}]}]})
+    respetados = (r.json() or {}).get("tareo_respetados", 0)
+    cur.execute("SELECT COALESCE(SUM(hh),0) FROM tareo_partida WHERE otm_id='OTM-E2E' "
+                "AND fecha=%s AND trabajador_id='901' AND supervisor_id='SUPE2E'", (F_HOJA,))
+    hh_tras_reenvio = float(cur.fetchone()[0])
+    # Control: el otro supervisor, cuya línea NO está corregida, sí se reemplaza.
+    c.post(f"{API}/api/sesion/enviar-con-partidas", json={
+        "supervisor_id": "SUPE2F", "otm_id": "OTM-E2E", "fecha": F_HOJA,
+        "trabajadores": [{"trab_id": "901", "via": "e2e",
+                          "asignaciones": [{"partida_id": p2["id"], "hh": 2.0}]}]})
+    cur.execute("SELECT COALESCE(SUM(hh),0) FROM tareo_partida WHERE otm_id='OTM-E2E' "
+                "AND fecha=%s AND trabajador_id='901' AND supervisor_id='SUPE2F'", (F_HOJA,))
+    hh_sin_marca = float(cur.fetchone()[0])
+    check("P87 el reenvío del supervisor respeta la línea corregida y sí reemplaza la que no lo está",
+          hh_tras_reenvio == 6.0 and respetados == 1 and hh_sin_marca == 2.0,
+          f"corregida={hh_tras_reenvio} respetados={respetados} sin_marca={hh_sin_marca}")
+
+    # Anular deja la línea en 0 CON la marca (no la borra): si se borrara, el
+    # siguiente reenvío la repondría tal cual.
+    r = c.delete(f"{API}/ev/tareo-linea/{linea_id}")
+    c.post(f"{API}/api/sesion/enviar-con-partidas", json={
+        "supervisor_id": "SUPE2E", "otm_id": "OTM-E2E", "fecha": F_HOJA,
+        "trabajadores": [{"trab_id": "901", "via": "e2e",
+                          "asignaciones": [{"partida_id": p1["id"], "hh": 9.5}]}]})
+    cur.execute("SELECT hh FROM tareo_partida WHERE id=%s", (linea_id,))
+    tras_anular = cur.fetchone()
+    check("P88 anular deja la línea en 0 y el reenvío tampoco la repone",
+          r.status_code == 200 and tras_anular and float(tras_anular[0]) == 0.0,
+          f"fila={tras_anular}")
 
     print()
     if _fallas:
