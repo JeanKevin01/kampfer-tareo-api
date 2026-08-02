@@ -3,6 +3,8 @@
 #
 # GET/POST/PUT /ev/responsables          catálogo de áreas responsables
 # GET  /ev/fiabilidad/restricciones      latencia y reincidencia por tipo/responsable
+# GET  /ev/fiabilidad/pendientes         bandeja de lo que sigue restringido
+# POST /ev/fiabilidad/liberar            liberación en lote con fecha real
 #
 # QUÉ MIDE Y QUÉ NO
 # `liberada_el - fecha_requerida` es la latencia de liberación: días de retraso
@@ -29,12 +31,21 @@ from core.auth import require_role
 from core.db import db
 from core.log import get_logger
 from core.tiempo import fecha_lima, parse_fecha
+# La traza append-only vive con el resto de restricciones; se importa en vez de
+# duplicarla para que exista UN solo sitio que decida qué se apunta al liberar.
+# No hay ciclo: `programacion` no conoce este módulo.
+from routers.programacion import _evento_restriccion
 
 log = get_logger("api")
 
 router = APIRouter(prefix="/ev", tags=["fiabilidad"])
 
 TIPOS_RESP = ("INTERNA", "CLIENTE", "PROVEEDOR", "SUBCONTRATA")
+
+# Tope del lote de liberación. No es una defensa contra el planner —es contra un
+# cliente que mande la lista entera sin querer—: una revisión semanal real no
+# pasa de unas decenas de restricciones.
+MAX_LOTE = 200
 
 # Mínimo de observaciones para que una mediana se presente como referencia y no
 # como anécdota. Por debajo se devuelve igual, pero marcada `suficiente=false`:
@@ -257,3 +268,96 @@ async def fiabilidad_restricciones(desde: str = "", hasta: str = "", proyecto_id
         key=lambda x: -x["dias"])
     out["hoy"] = str(hoy)
     return out
+
+
+# ── Bandeja de liberación ─────────────────────────────────────
+# El libro mayor de arriba mide el pasado. Esto es la otra mitad del encargo de
+# Jean (2026-08-02): el viernes revisa lo que sigue restringido y declara, ahí
+# mismo, qué día se liberó de verdad cada cosa. Sin esto la única vía era abrir
+# actividad por actividad en el Lookahead, y la fecha real acababa siendo
+# siempre «el día en que el planner tuvo tiempo de limpiar» — justo el sesgo que
+# `liberada_el` existe para evitar.
+@router.get("/fiabilidad/pendientes")
+async def fiabilidad_pendientes(proyecto_id: int = 1):
+    """Restricciones sin liberar, la más urgente primero."""
+    hoy = fecha_lima()
+    pool = await db()
+    rows = await pool.fetch(
+        """SELECT r.id, r.descripcion, r.tipo, r.fecha_requerida, r.responsable_id,
+                  COALESCE(p.nombre, '(sin responsable)') AS responsable,
+                  a.id AS actividad_id, a.titulo AS actividad, a.fecha AS actividad_fecha,
+                  a.estado, a.otm_id
+             FROM prog_restricciones r
+             JOIN prog_actividades a       ON a.id = r.actividad_id
+             LEFT JOIN prog_responsables p ON p.id = r.responsable_id
+            WHERE a.proyecto_id = $1 AND NOT r.liberada
+            ORDER BY r.fecha_requerida NULLS LAST, r.id""",
+        proyecto_id)
+    return {
+        "hoy": str(hoy),
+        # `dias` positivo = vencida hace tantos días; negativo = aún queda plazo.
+        # Se manda calculado para que el panel no repita la aritmética de fechas
+        # (que en JS, con zonas horarias de por medio, se equivoca sola).
+        "pendientes": [
+            {**dict(r),
+             "fecha_requerida": str(r["fecha_requerida"]) if r["fecha_requerida"] else None,
+             "actividad_fecha": str(r["actividad_fecha"]) if r["actividad_fecha"] else None,
+             "dias": (hoy - r["fecha_requerida"]).days if r["fecha_requerida"] else None}
+            for r in rows],
+    }
+
+
+def _validar_lote(items, hoy: date) -> list:
+    """[{id, liberada_el}] → [(id, fecha)] validado. Pura, testeable sin BD.
+
+    Rechaza fechas futuras: nadie puede haber liberado algo mañana, y un 2027
+    tecleado por error no se nota en la lista pero envenena la mediana del
+    responsable para siempre. Mejor un 422 que un dato que nadie audita."""
+    if not isinstance(items, list) or not items:
+        raise HTTPException(400, "Nada que liberar")
+    if len(items) > MAX_LOTE:
+        raise HTTPException(422, f"Máximo {MAX_LOTE} restricciones por lote")
+    porid: dict = {}
+    for it in items:
+        if not isinstance(it, dict):
+            raise HTTPException(422, "Cada elemento debe ser {id, liberada_el}")
+        try:
+            rid = int(it.get("id"))
+        except (TypeError, ValueError):
+            raise HTTPException(422, "id de restricción inválido")
+        f = parse_fecha(it.get("liberada_el")) or hoy
+        if f > hoy:
+            raise HTTPException(422, f"La fecha de liberación no puede ser futura ({f})")
+        porid[rid] = f
+    return sorted(porid.items())
+
+
+@router.post("/fiabilidad/liberar")
+async def liberar_lote(data: dict, user: dict = Depends(require_role("oficina"))):
+    """Marca liberadas varias restricciones, cada una con SU fecha real.
+
+    Una sola transacción: la revisión semanal es un acto, no N actos sueltos que
+    puedan quedar a medias si se cae la red a mitad de la lista."""
+    hoy = fecha_lima()
+    pares = _validar_lote(data.get("items"), hoy)
+    notas = str(data.get("notas") or "").strip()
+    actor = user.get("sub", "?")
+
+    liberadas, omitidas = [], []
+    pool = await db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            for rid, fecha in pares:
+                # `AND NOT liberada` hace la operación idempotente: si otro ya la
+                # liberó, no se pisa su fecha ni se apunta un evento duplicado.
+                row = await con.fetchrow(
+                    """UPDATE prog_restricciones
+                          SET liberada = true, liberada_el = $2, liberada_en = now()
+                        WHERE id = $1 AND NOT liberada RETURNING *""",
+                    rid, fecha)
+                if not row:
+                    omitidas.append(rid)
+                    continue
+                await _evento_restriccion(con, "liberar", row, actor, notas)
+                liberadas.append(rid)
+    return {"liberadas": liberadas, "omitidas": omitidas, "hoy": str(hoy)}

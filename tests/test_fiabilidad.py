@@ -7,7 +7,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from core import auth, config
-from routers.fiabilidad import _celda, _percentil, _resumen, _norm, N_MINIMO
+from routers.fiabilidad import (_celda, _percentil, _resumen, _norm, _validar_lote,
+                                MAX_LOTE, N_MINIMO)
 import main
 
 HOY = date(2026, 8, 2)
@@ -125,6 +126,43 @@ def test_norm_agrupa_lo_que_el_texto_libre_separaba():
     assert _norm(None) == ""
 
 
+# ── lote de liberación ───────────────────────────────────────
+def test_lote_toma_la_fecha_de_cada_item_y_completa_con_hoy():
+    """Cada restricción lleva SU fecha: el viernes se declara que una se liberó
+    el martes y otra el jueves, que es justo el caso que hace falta cubrir."""
+    assert _validar_lote(
+        [{"id": 7, "liberada_el": "2026-07-28"}, {"id": "3"}], HOY) == [
+        (3, HOY), (7, date(2026, 7, 28))]
+
+
+def test_lote_rechaza_la_fecha_futura():
+    """Un 2027 tecleado por error no se ve en la lista pero deja la mediana del
+    responsable inservible para siempre."""
+    with pytest.raises(Exception) as e:
+        _validar_lote([{"id": 1, "liberada_el": "2027-01-01"}], HOY)
+    assert e.value.status_code == 422
+
+
+def test_lote_vacio_o_gigante_no_pasa():
+    for malo in (None, [], "3", [{"id": 1}] * (MAX_LOTE + 1)):
+        with pytest.raises(Exception):
+            _validar_lote(malo, HOY)
+
+
+def test_lote_deduplica_por_id():
+    """Doble clic en la misma fila no debe intentar liberarla dos veces; manda
+    la última fecha elegida."""
+    assert _validar_lote(
+        [{"id": 5, "liberada_el": "2026-07-01"}, {"id": 5, "liberada_el": "2026-07-30"}],
+        HOY) == [(5, date(2026, 7, 30))]
+
+
+def test_lote_con_id_no_numerico_es_422():
+    with pytest.raises(Exception) as e:
+        _validar_lote([{"id": "abc"}], HOY)
+    assert e.value.status_code == 422
+
+
 # ── roles ────────────────────────────────────────────────────
 def test_catalogo_y_libro_son_de_oficina():
     c = _client()
@@ -134,6 +172,10 @@ def test_catalogo_y_libro_son_de_oficina():
                   headers=_hdr("supervisor")).status_code == 403
     assert c.get("/ev/fiabilidad/restricciones",
                  headers=_hdr("supervisor")).status_code == 403
+    assert c.get("/ev/fiabilidad/pendientes",
+                 headers=_hdr("supervisor")).status_code == 403
+    assert c.post("/ev/fiabilidad/liberar", json={"items": [{"id": 1}]},
+                  headers=_hdr("supervisor")).status_code == 403
 
 
 def test_tipo_de_responsable_invalido_es_422():

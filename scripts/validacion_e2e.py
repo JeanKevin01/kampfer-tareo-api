@@ -1978,6 +1978,61 @@ def main():
           tras_borrar == ["crear", "liberar", "reabrir", "eliminar"] and quedan == 0,
           f"eventos={tras_borrar} filas={quedan}")
 
+    # ── P93-P96 · Bandeja de liberación en lote ──────────────────────────
+    # La revisión del viernes: ver lo que sigue restringido y declarar, fila por
+    # fila, qué día se liberó DE VERDAD. Las fechas requeridas van dos en el
+    # pasado y una en el futuro para que la bandeja tenga que distinguirlas.
+    rs = []
+    for desc, req in (("Fierro corrugado", "2026-06-01"), ("Plano estructural", "2026-06-05"),
+                      ("Grúa de 30t", "2026-12-01")):
+        rs.append(c.post(f"{API}/ev/programacion/actividades/{act['id']}/restricciones", json={
+            "descripcion": desc, "tipo": "MATERIALES",
+            "responsable_id": resp_log.get("id"), "fecha_requerida": req}).json())
+    r = c.get(f"{API}/ev/fiabilidad/pendientes")
+    band = r.json() if r.status_code == 200 else {}
+    orden = [p["id"] for p in band.get("pendientes", [])]
+    pend = {p["id"]: p for p in band.get("pendientes", [])}
+    check("P93 la bandeja lista lo abierto, lo más urgente primero y con el plazo calculado",
+          r.status_code == 200 and all(x["id"] in pend for x in rs)
+          and pend[rs[0]["id"]]["dias"] > 0 and pend[rs[2]["id"]]["dias"] < 0
+          and orden.index(rs[0]["id"]) < orden.index(rs[2]["id"]),
+          f"n={len(orden)} dias={[pend.get(x['id'], {}).get('dias') for x in rs]}")
+
+    r = c.post(f"{API}/ev/fiabilidad/liberar", json={"items": [
+        {"id": rs[0]["id"], "liberada_el": "2026-06-10"},     # 9 días tarde
+        {"id": rs[1]["id"], "liberada_el": "2026-06-05"}]})   # el mismo día = a tiempo
+    lote = r.json() if r.status_code == 200 else {}
+    cur.execute("SELECT restriccion_id, latencia_dias FROM prog_restriccion_eventos "
+                "WHERE restriccion_id = ANY(%s) AND accion = 'liberar'",
+                ([rs[0]["id"], rs[1]["id"]],))
+    lat = dict(cur.fetchall())
+    sigue = {p["id"] for p in c.get(f"{API}/ev/fiabilidad/pendientes").json().get("pendientes", [])}
+    check("P94 el lote libera cada una con SU fecha real y las saca de la bandeja",
+          r.status_code == 200 and len(lote.get("liberadas", [])) == 2
+          and lat.get(rs[0]["id"]) == 9 and lat.get(rs[1]["id"]) == 0
+          and rs[0]["id"] not in sigue and rs[1]["id"] not in sigue,
+          f"lote={lote} latencias={lat}")
+
+    # Control: un año tecleado de más no se nota en la lista pero deja la mediana
+    # del responsable inservible. Tiene que rebotar Y no tocar la restricción.
+    r = c.post(f"{API}/ev/fiabilidad/liberar",
+               json={"items": [{"id": rs[2]["id"], "liberada_el": "2099-01-01"}]})
+    cur.execute("SELECT liberada FROM prog_restricciones WHERE id = %s", (rs[2]["id"],))
+    intacta = cur.fetchone()
+    check("P95 una fecha de liberación futura se rechaza y no toca la restricción",
+          r.status_code == 422 and intacta is not None and intacta[0] is False,
+          f"status={r.status_code} liberada={intacta}")
+
+    r = c.post(f"{API}/ev/fiabilidad/liberar",
+               json={"items": [{"id": rs[0]["id"], "liberada_el": "2026-06-20"}]})
+    out = r.json() if r.status_code == 200 else {}
+    cur.execute("SELECT liberada_el FROM prog_restricciones WHERE id = %s", (rs[0]["id"],))
+    ya_estaba = cur.fetchone()[0]
+    check("P96 volver a liberar no pisa la fecha real ya declarada",
+          r.status_code == 200 and out.get("omitidas") == [rs[0]["id"]]
+          and out.get("liberadas") == [] and str(ya_estaba) == "2026-06-10",
+          f"out={out} fecha={ya_estaba}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
