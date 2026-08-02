@@ -45,6 +45,12 @@ def limpiar_y_sembrar(cur):
     cur.execute("DELETE FROM campo_fotos WHERE reporte_id IN "
                 "(SELECT id FROM campo_reportes WHERE otm_id='OTM-E2E')")
     cur.execute("DELETE FROM campo_reportes WHERE otm_id='OTM-E2E'")
+    # La traza de restricciones es append-only y NO tiene FK a la restricción
+    # (esa es su gracia: sobrevive al borrado), así que hay que limpiarla ANTES
+    # de que el DELETE de actividades se lleve las restricciones por cascada —
+    # después ya no habría por dónde encontrarlas.
+    cur.execute("DELETE FROM prog_restriccion_eventos WHERE actividad_id IN "
+                "(SELECT id FROM prog_actividades WHERE titulo LIKE 'E2E %' OR otm_id='OTM-E2E')")
     cur.execute("DELETE FROM prog_actividades WHERE titulo LIKE 'E2E %' OR otm_id='OTM-E2E'")
     cur.execute("DELETE FROM prog_feriados WHERE proyecto_id=1")
     cur.execute("DELETE FROM prog_config WHERE proyecto_id=1")
@@ -55,6 +61,9 @@ def limpiar_y_sembrar(cur):
     cur.execute("DELETE FROM prog_semana_plan WHERE proyecto_id=1")
     cur.execute("DELETE FROM prog_semana_eventos WHERE proyecto_id=1")
     cur.execute("DELETE FROM fases WHERE codigo LIKE 'E2E-%'")
+    # El responsable de humo se borra DESPUÉS de las actividades: sus
+    # restricciones lo referencian y el DELETE de arriba ya se las llevó.
+    cur.execute("DELETE FROM prog_responsables WHERE nombre IN ('LOGISTICA','INGENIERIA')")
     cur.execute("DELETE FROM tareo_ediciones WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM tareo_partida WHERE otm_id='OTM-E2E'")
     cur.execute("DELETE FROM registros WHERE otm_id='OTM-E2E'")
@@ -1914,6 +1923,60 @@ def main():
     check("P88 anular deja la línea en 0 y el reenvío tampoco la repone",
           r.status_code == 200 and tras_anular and float(tras_anular[0]) == 0.0,
           f"fila={tras_anular}")
+
+    # ── P89-P92 · Libro mayor de fiabilidad de restricciones (0044) ───────
+    # El circuito completo: catálogo de responsables → restricción ligada →
+    # liberación con FECHA REAL → latencia medida → traza que sobrevive.
+    r = c.post(f"{API}/ev/responsables", json={"nombre": " logistica ", "tipo": "INTERNA"})
+    resp_log = r.json() if r.status_code == 200 else {}
+    # Con tilde: es el duplicado que de verdad se cuela si solo se hace upper().
+    r2 = c.post(f"{API}/ev/responsables", json={"nombre": "Logística"})
+    check("P89 el catálogo normaliza (tildes incluidas) y reutiliza en vez de duplicar",
+          r.status_code == 200 and resp_log.get("nombre") == "LOGISTICA"
+          and r2.status_code == 200 and r2.json().get("id") == resp_log.get("id"),
+          f"1={resp_log} 2={r2.json() if r2.status_code == 200 else r2.status_code}")
+
+    act = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-11-02", "fecha_fin": "2026-11-06",
+        "otm_id": "OTM-E2E", "titulo": "E2E fiabilidad"}).json()
+    rest = c.post(f"{API}/ev/programacion/actividades/{act['id']}/restricciones", json={
+        "descripcion": "Perfiles de acero", "tipo": "MATERIALES",
+        "responsable_id": resp_log.get("id"), "fecha_requerida": "2026-10-20"}).json()
+    # Liberada 9 días TARDE, y se declara la fecha real (no la de captura).
+    r = c.put(f"{API}/ev/programacion/restricciones/{rest.get('id')}",
+              json={"liberada": True, "liberada_el": "2026-10-29"})
+    lib = r.json() if r.status_code == 200 else {}
+    cur.execute("SELECT accion, latencia_dias FROM prog_restriccion_eventos "
+                "WHERE restriccion_id=%s ORDER BY id", (rest.get("id"),))
+    eventos = cur.fetchall()
+    check("P90 liberar con fecha real deja la latencia congelada en la traza",
+          r.status_code == 200 and str(lib.get("liberada_el")) == "2026-10-29"
+          and [e[0] for e in eventos] == ["crear", "liberar"] and eventos[1][1] == 9,
+          f"lib={lib.get('liberada_el')} eventos={eventos}")
+
+    r = c.get(f"{API}/ev/fiabilidad/restricciones")
+    fb = r.json() if r.status_code == 200 else {}
+    mat = next((t for t in fb.get("por_tipo", []) if t["tipo"] == "MATERIALES"), {})
+    logi = next((p for p in fb.get("por_responsable", []) if p["responsable"] == "LOGISTICA"), {})
+    check("P91 el libro mayor mide la latencia por tipo y por responsable, con su n",
+          r.status_code == 200 and mat.get("n_medidas", 0) >= 1
+          and mat.get("mediana_dias") is not None and logi.get("n", 0) >= 1
+          and mat.get("suficiente") is False,   # con 1 observación NO se presenta como referencia
+          f"materiales={mat} logistica={logi}")
+
+    # Reabrir borra la fecha real (la liberación se deshizo) pero el evento
+    # anterior NO desaparece: sin eso, una restricción reabierta perdería la
+    # historia de haberlo estado, que es justo lo que el libro mayor mide.
+    c.put(f"{API}/ev/programacion/restricciones/{rest.get('id')}", json={"liberada": False})
+    c.delete(f"{API}/ev/programacion/restricciones/{rest.get('id')}")
+    cur.execute("SELECT accion FROM prog_restriccion_eventos WHERE restriccion_id=%s ORDER BY id",
+                (rest.get("id"),))
+    tras_borrar = [e[0] for e in cur.fetchall()]
+    cur.execute("SELECT count(*) FROM prog_restricciones WHERE id=%s", (rest.get("id"),))
+    quedan = cur.fetchone()[0]
+    check("P92 la traza sobrevive a reabrir y al borrado de la restricción",
+          tras_borrar == ["crear", "liberar", "reabrir", "eliminar"] and quedan == 0,
+          f"eventos={tras_borrar} filas={quedan}")
 
     print()
     if _fallas:

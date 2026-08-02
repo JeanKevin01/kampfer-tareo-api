@@ -2423,17 +2423,40 @@ async def historial_grid(otm: str, desde: str = "", semanas: int = 0):
             "feriados": sorted(str(f) for f in feriados), "partidas": out}
 
 
+async def _evento_restriccion(con, accion: str, fila, actor: str, notas: str = "") -> None:
+    """Apunta el movimiento en la traza append-only (0044).
+
+    Existe porque al desmarcar `liberada` el código pone `liberada_en = NULL` y
+    el historial se perdía entero: sin esto, una restricción liberada y reabierta
+    no deja rastro de haberlo estado, y la latencia que mide el libro mayor sería
+    la de la última vez que alguien tocó el registro."""
+    real = fila.get("liberada_el") if isinstance(fila, dict) else fila["liberada_el"]
+    req = fila["fecha_requerida"]
+    lat = (real - req).days if (real and req) else None
+    await con.execute(
+        """INSERT INTO prog_restriccion_eventos
+             (restriccion_id, actividad_id, accion, tipo, responsable_id,
+              fecha_requerida, liberada_el, latencia_dias, actor, notas)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+        fila["id"], fila["actividad_id"], accion, fila["tipo"], fila["responsable_id"],
+        req, real, lat, (actor or "?")[:60], (notas or "").strip() or None)
+
+
 @router.get("/actividades/{act_id}/restricciones")
 async def listar_restricciones(act_id: int):
     pool = await db()
     rows = await pool.fetch(
-        "SELECT * FROM prog_restricciones WHERE actividad_id = $1 ORDER BY liberada, id",
+        """SELECT r.*, p.nombre AS responsable_nombre
+             FROM prog_restricciones r
+             LEFT JOIN prog_responsables p ON p.id = r.responsable_id
+            WHERE r.actividad_id = $1 ORDER BY r.liberada, r.id""",
         act_id)
     return [dict(r) for r in rows]
 
 
 @router.post("/actividades/{act_id}/restricciones")
-async def crear_restriccion(act_id: int, data: dict):
+async def crear_restriccion(act_id: int, data: dict,
+                            user: dict = Depends(require_role())):
     desc = str(data.get("descripcion") or "").strip()
     if not desc:
         raise HTTPException(400, "descripcion requerida")
@@ -2442,49 +2465,83 @@ async def crear_restriccion(act_id: int, data: dict):
         raise HTTPException(422, f"tipo inválido (usa {'/'.join(_TIPOS_RESTRICCION)})")
     pool = await db()
     try:
-        row = await pool.fetchrow(
-            """INSERT INTO prog_restricciones
-               (actividad_id, descripcion, tipo, responsable, fecha_requerida)
-               VALUES ($1,$2,$3,$4,$5) RETURNING *""",
-            act_id, desc, tipo, data.get("responsable") or None,
-            parse_fecha(data.get("fecha_requerida")))
+        async with pool.acquire() as con:
+            async with con.transaction():
+                row = await con.fetchrow(
+                    """INSERT INTO prog_restricciones
+                       (actividad_id, descripcion, tipo, responsable, responsable_id,
+                        fecha_requerida)
+                       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *""",
+                    act_id, desc, tipo, data.get("responsable") or None,
+                    data.get("responsable_id") or None,
+                    parse_fecha(data.get("fecha_requerida")))
+                await _evento_restriccion(con, "crear", row, user.get("sub", "?"), desc)
     except _ERRORES_DATO:
         raise HTTPException(400, "Actividad inexistente o datos inválidos")
     return dict(row)
 
 
 @router.put("/restricciones/{rest_id}")
-async def editar_restriccion(rest_id: int, data: dict):
+async def editar_restriccion(rest_id: int, data: dict,
+                             user: dict = Depends(require_role())):
     campos, valores = [], []
     for k in ("descripcion", "responsable"):
         if k in data:
             campos.append(f"{k} = ${len(valores) + 2}")
             valores.append(str(data[k]).strip() or None)
+    if "responsable_id" in data:
+        campos.append(f"responsable_id = ${len(valores) + 2}")
+        valores.append(data["responsable_id"] or None)
     if "fecha_requerida" in data:
         campos.append(f"fecha_requerida = ${len(valores) + 2}")
         valores.append(parse_fecha(data["fecha_requerida"]))
+    # `liberada_el` es la fecha REAL de liberación y `liberada_en` el sello de
+    # captura: si el planner limpia el viernes lo que se liberó el martes, el
+    # libro mayor tiene que medir el martes. Cuando no viene, se asume hoy —
+    # mejor que nada, y el libro lo cuenta como dato derivado.
+    accion = None
+    if "liberada_el" in data:
+        campos.append(f"liberada_el = ${len(valores) + 2}")
+        valores.append(parse_fecha(data["liberada_el"]))
     if "liberada" in data:
         lib = bool(data["liberada"])
+        accion = "liberar" if lib else "reabrir"
         campos.append(f"liberada = ${len(valores) + 2}")
         valores.append(lib)
         campos.append("liberada_en = " + ("now()" if lib else "NULL"))
+        if lib and "liberada_el" not in data:
+            campos.append(f"liberada_el = COALESCE(liberada_el, ${len(valores) + 2})")
+            valores.append(fecha_lima())
+        elif not lib:
+            campos.append("liberada_el = NULL")
     if not campos:
         raise HTTPException(400, "Nada que actualizar")
     pool = await db()
-    row = await pool.fetchrow(
-        f"UPDATE prog_restricciones SET {', '.join(campos)} WHERE id = $1 RETURNING *",
-        rest_id, *valores)
-    if not row:
-        raise HTTPException(404, "Restricción no encontrada")
+    async with pool.acquire() as con:
+        async with con.transaction():
+            row = await con.fetchrow(
+                f"UPDATE prog_restricciones SET {', '.join(campos)} WHERE id = $1 RETURNING *",
+                rest_id, *valores)
+            if not row:
+                raise HTTPException(404, "Restricción no encontrada")
+            await _evento_restriccion(con, accion or "editar", row, user.get("sub", "?"),
+                                      data.get("notas", ""))
     return dict(row)
 
 
 @router.delete("/restricciones/{rest_id}")
-async def borrar_restriccion(rest_id: int):
+async def borrar_restriccion(rest_id: int, user: dict = Depends(require_role())):
     pool = await db()
-    n = await pool.execute("DELETE FROM prog_restricciones WHERE id = $1", rest_id)
-    if n == "DELETE 0":
-        raise HTTPException(404, "Restricción no encontrada")
+    async with pool.acquire() as con:
+        async with con.transaction():
+            row = await con.fetchrow(
+                "SELECT * FROM prog_restricciones WHERE id = $1", rest_id)
+            if not row:
+                raise HTTPException(404, "Restricción no encontrada")
+            # El evento se apunta ANTES de borrar y sin FK a la restricción: la
+            # traza tiene que sobrevivir a la fila que la originó.
+            await _evento_restriccion(con, "eliminar", row, user.get("sub", "?"))
+            await con.execute("DELETE FROM prog_restricciones WHERE id = $1", rest_id)
     return {"ok": True}
 
 

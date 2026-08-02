@@ -21,6 +21,7 @@ from core.auth import require_key, require_role, _hash_pw
 from core.db import db as core_db, close_pool
 from core.log import setup_logging, get_logger
 from routers.fases import router as fases_router
+from routers.fiabilidad import router as fiabilidad_router
 from routers.plantillas import router as plantillas_router
 from routers.jornada import router as jornada_router
 from routers.media import router as media_router
@@ -138,6 +139,7 @@ app.include_router(ro_proyeccion_router, dependencies=[Depends(require_role("ofi
 app.include_router(valorizaciones_router, dependencies=[Depends(require_role("oficina"))])
 # Mejoras UX pre-F4: catálogo de fases (oficina).
 app.include_router(fases_router, dependencies=[Depends(require_role("oficina"))])
+app.include_router(fiabilidad_router, dependencies=[Depends(require_role("oficina"))])
 app.include_router(plantillas_router, dependencies=[Depends(require_role("oficina"))])
 # Mejoras UX pre-F4: calendario de programación (oficina) + reportes de campo
 # (supervisor autenticado) + media firmada (la firma es la credencial).
