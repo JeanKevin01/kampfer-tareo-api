@@ -1899,15 +1899,22 @@ async def empresas_usadas(proyecto_id: int = 1):
     pantalla de administración a darlo de alta. La lista existe para que la
     segunda vez se elija en vez de teclearse — que es lo que evita tener
     «ELECTRO SAC» y «Electro S.A.C.» como dos empresas distintas.
+
+    Ordenado por PRIMERA APARICIÓN (MIN(id)), no por frecuencia. El panel pinta
+    la barra de cada empresa con el color de su posición en esta lista, y un
+    orden por frecuencia se la cambiaría sola en cuanto una empresa adelantara a
+    otra: el color tiene que seguir a la empresa, no a su ranking. Con este
+    orden, una empresa nueva siempre entra al final y no repinta a ninguna.
     """
     pool = await db()
     rows = await pool.fetch(
-        """SELECT empresa, count(*) AS n, MAX(COALESCE(fecha_fin, fecha)) AS ultima
+        """SELECT empresa, count(*) AS n, MAX(COALESCE(fecha_fin, fecha)) AS ultima,
+                  MIN(id) AS primera
              FROM prog_actividades
             WHERE proyecto_id = $1 AND empresa IS NOT NULL AND empresa <> ''
-            GROUP BY empresa ORDER BY n DESC, empresa""", proyecto_id)
-    return [{"empresa": r["empresa"], "n": r["n"], "ultima": str(r["ultima"])}
-            for r in rows]
+            GROUP BY empresa ORDER BY MIN(id)""", proyecto_id)
+    return [{"empresa": r["empresa"], "n": r["n"], "ultima": str(r["ultima"]),
+             "orden": i} for i, r in enumerate(rows)]
 
 
 # ── Lookahead-grid: la vista tipo Excel del ex-gerente ───────

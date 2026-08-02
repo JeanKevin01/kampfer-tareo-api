@@ -1774,6 +1774,27 @@ def main():
           and libre.get("id") in ids_libre,
           f"status={r.status_code} act={libre} ids_cierre={ids_libre}")
 
+    # ── P83 · El catálogo de empresas ordena por PRIMERA APARICIÓN ────────
+    # De este orden sale el color de la barra de cada empresa en el LookAhead.
+    # Si ordenara por frecuencia, la barra cambiaría de color sola en cuanto una
+    # empresa adelantara a otra en número de actividades: el color tiene que
+    # seguir a la empresa, no a su ranking.
+    for i, (emp, n) in enumerate([("E2E ZETA SAC", 1), ("E2E ALFA SAC", 3)]):
+        for k in range(n):
+            c.post(f"{API}/ev/programacion/actividades", json={
+                "proyecto_id": 1, "fecha": "2026-09-28", "otm_id": "OTM-E2E",
+                "titulo": f"{emp} — trabajo {k}", "externa": True,
+                "empresa": emp, "plazo_dias": 2})
+    r = c.get(f"{API}/ev/programacion/empresas", params={"proyecto_id": 1})
+    lista = r.json() if r.status_code == 200 else []
+    solo = [e for e in lista if e["empresa"].startswith("E2E ")]
+    check("P83 el catálogo de empresas ordena por primera aparición, no por frecuencia",
+          r.status_code == 200 and len(solo) == 2
+          and solo[0]["empresa"] == "E2E ZETA SAC"   # apareció primero pese a tener 1
+          and solo[1]["empresa"] == "E2E ALFA SAC"   # tiene 3, va después
+          and [e["orden"] for e in lista] == list(range(len(lista))),
+          f"status={r.status_code} lista={lista}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
