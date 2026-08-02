@@ -427,6 +427,18 @@ async def _redistribuir(con, act: dict, solo_despues_de: Optional[date] = None) 
                       and (solo_despues_de is None or d > solo_despues_de))
     saldo = round(metrado - sum(reales.values()) - plan_manual, 3)
     restantes = [d for d in habiles if d not in intactos]
+    if saldo > 0 and not restantes:
+        # Hay metrado que repartir y NINGÚN día donde ponerlo: todos los del
+        # rango son feriados, saltos ∅ o ya están congelados. El metrado se
+        # queda comprometido pero sin plan diario — y la actividad SÍ sigue
+        # contando en el PPC, así que callarlo la convierte en un compromiso
+        # invisible. Se registra para que quede rastro y el grid lo marca con
+        # `prog_total` = 0.
+        log.warning("saldo sin repartir: la actividad no tiene días hábiles",
+                    extra={"actividad_id": act["id"], "saldo": saldo,
+                           "desde": str(desde), "hasta": str(hasta),
+                           "n_saltos": len(saltos)})
+        return
     if saldo <= 0 or not restantes:
         return
     medios = set(act.get("dias_medio") or [])             # pesan 0.5 (F4 v2)
@@ -1941,6 +1953,18 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             """SELECT actividad_id, fecha::text AS f, cantidad, manual FROM prog_metrado_dia
                WHERE actividad_id = ANY($1) AND fecha BETWEEN $2 AND $3""",
             ids, base, fin) if ids else []
+        # Plan diario TOTAL de cada actividad (fuera de la ventana también). Es
+        # lo que permite distinguir dos filas que en pantalla se ven igual —sin
+        # celdas visibles— pero significan cosas opuestas:
+        #   · terminada o con su plan en otras fechas → normal;
+        #   · metrado comprometido que NO se pudo repartir en ningún día porque
+        #     la actividad se quedó sin días hábiles (todos saltos, feriados o
+        #     ya con avance): `_redistribuir` devuelve sin escribir nada y hasta
+        #     ahora se callaba. Esa fila sigue contando en el PPC, así que el
+        #     panel tiene que poder señalarla en vez de esconderla.
+        prog_total = {r["actividad_id"]: float(r["total"] or 0) for r in await con.fetch(
+            """SELECT actividad_id, SUM(cantidad) AS total FROM prog_metrado_dia
+               WHERE actividad_id = ANY($1) GROUP BY actividad_id""", ids)} if ids else {}
         real_rows = await con.fetch(
             """SELECT partida_id, hito_id, fecha, fecha::text AS f, cantidad_dia,
                       actividad_id, tramo_id
@@ -2119,6 +2143,10 @@ async def lookahead_grid(proyecto_id: int = 1, desde: str = "", semanas: int = 4
             "metrado_prog": float(a["metrado_prog"]) if a["metrado_prog"] is not None else None,
             "metrado_base": met_base,
             "acum_real": acum_real,
+            # Metrado que SÍ quedó repartido en días (todo el rango, no solo la
+            # ventana). Si es 0 con metrado comprometido y sin avance, el plan no
+            # llegó a existir: la actividad se quedó sin días hábiles. § prog_total
+            "prog_total": round(prog_total.get(a["id"], 0.0), 3),
             # En el árbol, el saldo del PRESUPUESTO es uno solo y es el de la
             # partida: la misma cifra en el padre y en todos sus frentes. Fuera
             # del árbol se conserva el saldo por etapa de siempre.

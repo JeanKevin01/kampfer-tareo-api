@@ -1795,6 +1795,37 @@ def main():
           and [e["orden"] for e in lista] == list(range(len(lista))),
           f"status={r.status_code} lista={lista}")
 
+    # ── P84 · Metrado comprometido que no se pudo repartir en ningún día ──
+    # Si TODOS los días del rango son saltos ∅, `_redistribuir` se va sin
+    # escribir una sola celda: el metrado queda comprometido y sin plan diario.
+    # La actividad sigue contando en el PPC, así que el grid tiene que poder
+    # distinguirla de una terminada — para eso está `prog_total`.
+    r = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-10-05", "fecha_fin": "2026-10-07",
+        "otm_id": "OTM-E2E", "titulo": "E2E sin dias habiles",
+        "partida_id": p_d1a, "metrado_prog": 90,
+        "dias_salto": ["2026-10-05", "2026-10-06", "2026-10-07"]})
+    rota = r.json() if r.status_code == 200 else {}
+    cur.execute("SELECT COALESCE(SUM(cantidad),0) FROM prog_metrado_dia WHERE actividad_id=%s",
+                (rota.get("id"),))
+    celdas = float(cur.fetchone()[0])
+    # Y una sana, para que el check distinga en vez de dar siempre lo mismo.
+    r2 = c.post(f"{API}/ev/programacion/actividades", json={
+        "proyecto_id": 1, "fecha": "2026-10-12", "fecha_fin": "2026-10-14",
+        "otm_id": "OTM-E2E", "titulo": "E2E con dias habiles",
+        "partida_id": p_d1a, "metrado_prog": 90})
+    sana = r2.json() if r2.status_code == 200 else {}
+    g = c.get(f"{API}/ev/programacion/lookahead-grid",
+              params={"proyecto_id": 1, "desde": "2026-10-05", "semanas": 3})
+    filas = {a["id"]: a for gr in (g.json() or {}).get("grupos", [])
+             for a in gr.get("actividades", [])}
+    f_rota, f_sana = filas.get(rota.get("id"), {}), filas.get(sana.get("id"), {})
+    check("P84 el grid distingue el metrado que no se pudo repartir (prog_total=0) del que sí",
+          r.status_code == 200 and celdas == 0
+          and f_rota.get("prog_total") == 0 and (f_rota.get("metrado_prog") or 0) > 0
+          and (f_sana.get("prog_total") or 0) > 0,
+          f"celdas={celdas} rota={f_rota.get('prog_total')} sana={f_sana.get('prog_total')}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")
