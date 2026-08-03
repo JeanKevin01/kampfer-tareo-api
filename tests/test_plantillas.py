@@ -151,6 +151,78 @@ def test_los_catalogos_del_proyecto_llegan_a_la_plantilla():
     assert "11" in valores and "Obras civiles" in valores
 
 
+# ── El contrato con los importadores del panel ────────────────
+# Estos importadores viven en TypeScript, así que ningún test de aquí los
+# ejecuta — y ese hueco es justo por donde se coló el fallo del 2-ago: la
+# cabecera se movió a la fila 14-16 al rediseñar las plantillas y los
+# importadores seguían leyendo la fila 1, así que un archivo llenado tal como
+# indican las instrucciones daba 309 filas con «CODIGO vacío».
+#
+# `lib/excel.ts` ya no asume la fila 1: BUSCA la cabecera por estas claves. Lo
+# que se verifica aquí es su parte del trato — que las claves sigan estando, y
+# dentro del rango en el que las busca.
+CLAVES_IMPORTADOR = {
+    # plantilla   → claves que busca el importador (y dónde vive)
+    "partidas":    ["CODIGO", "DESCRIPCION", "METRADO_PRESUP"],   # ImportarPartidas.tsx
+    "personal":    ["NOMBRE", "CARGO", "DNI"],                    # ImportarPersonal.tsx
+    "proyectos":   ["NOMBRE", "AREA", "ESTADO"],                  # OTMs.tsx
+    "presupuesto": ["CODIGO", "METRADO", "PRECIO_UNITARIO"],      # Presupuesto.tsx
+    "costos_ro":   ["TIPO_RECURSO", "PERIODO", "MONTO"],          # Rentabilidad.tsx
+    "costos":      ["TIPO_RECURSO", "FECHA", "MONTO"],            # routers/ro.py (API)
+}
+
+MAX_BUSQUEDA = 40      # el mismo tope que `lib/excel.ts`
+MIN_ACIERTOS = 2       # el mismo umbral que `lib/excel.ts`
+
+
+@pytest.mark.parametrize("clave,esperadas", sorted(CLAVES_IMPORTADOR.items()))
+def test_el_importador_encuentra_la_cabecera(clave, esperadas):
+    wb, _ = _libro(clave)
+    p = plantillas.definir(clave, DATOS)
+    ws = wb[p.hoja]
+
+    mejor, aciertos_max = 0, 0
+    for r in range(1, min(ws.max_row, MAX_BUSQUEDA) + 1):
+        fila = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        aciertos = sum(1 for v in fila if v in esperadas)
+        if aciertos > aciertos_max:
+            mejor, aciertos_max = r, aciertos
+
+    assert aciertos_max >= MIN_ACIERTOS, (
+        f"{clave}: el importador no reconocería la cabecera en las primeras "
+        f"{MAX_BUSQUEDA} filas. Faltan claves o se movieron demasiado abajo.")
+    encontradas = {ws.cell(mejor, c).value for c in range(1, ws.max_column + 1)}
+    assert set(esperadas) <= encontradas, (
+        f"{clave}: faltan {set(esperadas) - encontradas} en la fila {mejor}. "
+        f"Si se renombró una columna, hay que renombrarla también en el panel.")
+
+
+@pytest.mark.parametrize("clave", sorted(CLAVES_IMPORTADOR))
+def test_los_datos_empiezan_justo_debajo_de_la_cabecera(clave):
+    """`leerHoja` lee desde la fila siguiente a la cabecera. Una fila intermedia
+    (una nota, un separador) entraría como un dato vacío y todas las filas
+    quedarían corridas."""
+    wb, _ = _libro(clave)
+    p = plantillas.definir(clave, DATOS)
+    ws = wb[p.hoja]
+    fila_cab = next(r for r in range(1, MAX_BUSQUEDA)
+                    if ws.cell(r, 2).value == p.cols[0].clave)
+    assert ws.cell(fila_cab + 1, 2).font.italic, (
+        f"{clave}: debajo de la cabecera debería ir ya la fila de ejemplo")
+
+
+def test_la_fila_de_ejemplo_lleva_su_marca_en_el_margen():
+    """`leerHoja` descarta las filas marcadas con ▸: si la marca desaparece, los
+    ejemplos se importarían como datos buenos en cuanto alguien no los borre."""
+    for clave in _claves():
+        wb, _ = _libro(clave)
+        p = plantillas.definir(clave, DATOS)
+        ws = wb[p.hoja]
+        fila = next(r for r in range(1, MAX_BUSQUEDA)
+                    if ws.cell(r, 2).value == p.cols[0].clave) + 1
+        assert ws.cell(fila, 1).value == "▸", f"{clave}: ejemplo sin marca"
+
+
 # ── Ida y vuelta: la plantilla PU se lee a sí misma ───────────
 def test_la_plantilla_pu_la_lee_su_propio_parser():
     wb, _ = plantillas.generar("pu", {}, "OBRA DE PRUEBA", date(2026, 8, 1))

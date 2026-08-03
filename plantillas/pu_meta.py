@@ -23,6 +23,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
+from core.tiempo import fecha_lima
+
 from ._estilo import (AMBAR, AMBAR_BG, AMBAR_FUERTE, AZUL, AZUL_BG, DINERO,
                       DINERO_BG, FUENTE, GRIS, GRIS_BG, LINEA, PAPEL, TINTA,
                       TINTA2, TINTA3, WBS, WBS_BG)
@@ -364,7 +366,7 @@ def _hoja_como_funciona(wb: Workbook) -> None:
 
 
 def construir_pu(proyecto: str = "", hoy: Optional[date] = None) -> Workbook:
-    hoy = hoy or date.today()
+    hoy = hoy or fecha_lima()      # el contenedor corre en UTC; ver `_estilo`
     wb = Workbook()
     _hoja_ptometa(wb, proyecto, hoy)
     _hoja_pumeta(wb, proyecto, hoy)

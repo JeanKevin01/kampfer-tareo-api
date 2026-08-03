@@ -24,6 +24,8 @@ from openpyxl.comments import Comment
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+from core.tiempo import fecha_lima
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -488,7 +490,9 @@ def construir(p: Plantilla, proyecto: str = "", hoy: Optional[date] = None) -> W
     col_fin = col_ini + ncols - 1
     _preparar(ws, ncols)
 
-    fecha = (hoy or date.today()).strftime("%d/%m/%Y")
+    # `fecha_lima()` y no `date.today()`: el contenedor corre en UTC y de las
+    # 19:00 de Lima en adelante la plantilla se sellaba con la fecha de MAÑANA.
+    fecha = (hoy or fecha_lima()).strftime("%d/%m/%Y")
     sub = "KAMPFER" + (f" · {proyecto}" if proyecto else "") + f" · generada el {fecha}"
     fila = _banda_titulo(ws, p.titulo, sub, col_ini, col_fin, 2)
 
