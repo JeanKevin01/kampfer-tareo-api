@@ -26,6 +26,16 @@ def hora_lima_t():
     return ahora_lima().time().replace(microsecond=0)
 
 
+def fecha_de(dt):
+    """Día de LIMA de un timestamptz. `dt.date()` a secas da el día en UTC.
+
+    Postgres devuelve los `TIMESTAMPTZ` en UTC, así que a partir de las 19:00 de
+    Lima `.date()` ya contesta el día siguiente. Sobre un sello de captura eso
+    corre la medición un día entero, y hacia el lado que no se nota: parece que
+    se registró más tarde de lo que fue."""
+    return dt.astimezone(LIMA).date() if dt else None
+
+
 def parse_fecha(v):
     """Convierte v a un objeto date (o None). Acepta date/datetime, 'YYYY-MM-DD'
     y 'DD/MM/YYYY'. Necesario porque asyncpg exige date, no str, en columnas date."""

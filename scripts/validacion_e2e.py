@@ -2033,6 +2033,65 @@ def main():
           and out.get("liberadas") == [] and str(ya_estaba) == "2026-06-10",
           f"out={out} fecha={ya_estaba}")
 
+    # ── P97-P99 · Fecha de detección, duración y proyecto (0045) ─────────
+    # Una con la fecha DECLARADA y otra sin ella: la segunda tiene que caer al
+    # sello de captura y decir que lo está haciendo, no fingir que la sabe.
+    declarada = c.post(f"{API}/ev/programacion/actividades/{act['id']}/restricciones", json={
+        "descripcion": "Valvulas importadas", "tipo": "MATERIALES",
+        "responsable_id": resp_log.get("id"), "fecha_requerida": "2026-07-15",
+        "detectada_el": "2026-05-20"}).json()
+    sin_declarar = c.post(f"{API}/ev/programacion/actividades/{act['id']}/restricciones", json={
+        "descripcion": "Certificado de calidad", "tipo": "INFORMACION",
+        "responsable_id": resp_log.get("id"), "fecha_requerida": "2026-07-15"}).json()
+    band = c.get(f"{API}/ev/fiabilidad/pendientes").json()
+    pend = {p["id"]: p for p in band.get("pendientes", [])}
+    pa, pb = pend.get(declarada.get("id"), {}), pend.get(sin_declarar.get("id"), {})
+    hoy_api = band.get("hoy")
+    check("P97 la detección declarada manda; sin ella cae al sello y se marca derivada",
+          pa.get("detectada_el") == "2026-05-20" and pa.get("detectada_derivada") is False
+          and pa.get("antiguedad", 0) > 0
+          and pb.get("detectada_el") == hoy_api and pb.get("detectada_derivada") is True
+          and pb.get("antiguedad") == 0 and pa.get("otm_id") == "OTM-E2E",
+          f"declarada={pa} sin_declarar={pb}")
+
+    # Vivió del 20-may al 30-jun = 41 días, y solo llegó 15 días tarde respecto
+    # de lo pedido: el caso que justifica que duración y latencia sean columnas
+    # distintas.
+    r = c.post(f"{API}/ev/fiabilidad/liberar",
+               json={"items": [{"id": declarada["id"], "liberada_el": "2026-06-30"}]})
+    cur.execute("SELECT latencia_dias, duracion_dias FROM prog_restriccion_eventos "
+                "WHERE restriccion_id=%s AND accion='liberar'", (declarada["id"],))
+    ev = cur.fetchone()
+    fb = c.get(f"{API}/ev/fiabilidad/restricciones").json()
+    otms_fb = {o["otm_id"]: o for o in fb.get("por_otm", [])}
+    fb_otm = c.get(f"{API}/ev/fiabilidad/restricciones?otm=OTM-E2E").json()
+    # n_duracion == 1 es la parte que importa: las otras liberadas de este bloque
+    # NO declararon detección, y con el sello de captura de respaldo darían una
+    # duración negativa. Tienen que quedarse fuera, no entrar con signo cambiado.
+    e2e_otm = otms_fb.get("OTM-E2E", {})
+    check("P98 duración y latencia son distintas, y solo cuenta la detección declarada",
+          r.status_code == 200 and ev == (-15, 41)
+          and e2e_otm.get("duracion_mediana") == 41.0 and e2e_otm.get("n_duracion") == 1
+          and e2e_otm.get("n_medidas", 0) > 1
+          and 0 < fb_otm["total"]["n"] <= fb["total"]["n"],
+          f"evento={ev} por_otm={e2e_otm} filtrado={fb_otm['total']['n']}")
+
+    # Control de atomicidad: un lote con una fecha imposible NO puede dejar la
+    # otra mitad aplicada.
+    otra = c.post(f"{API}/ev/programacion/actividades/{act['id']}/restricciones", json={
+        "descripcion": "Andamio E2E", "tipo": "EQUIPOS",
+        "fecha_requerida": "2026-07-15", "detectada_el": "2026-07-01"}).json()
+    r = c.post(f"{API}/ev/fiabilidad/liberar", json={"items": [
+        {"id": sin_declarar["id"], "liberada_el": "2026-07-20"},
+        {"id": otra["id"], "liberada_el": "2026-06-01"}]})   # antes de detectarse
+    cur.execute("SELECT id, liberada FROM prog_restricciones WHERE id = ANY(%s)",
+                ([sin_declarar["id"], otra["id"]],))
+    estados = dict(cur.fetchall())
+    check("P99 liberar antes de detectar rebota y deshace el lote ENTERO",
+          r.status_code == 422 and estados.get(sin_declarar["id"]) is False
+          and estados.get(otra["id"]) is False,
+          f"status={r.status_code} estados={estados}")
+
     print()
     if _fallas:
         print(f"RESULTADO: {len(_fallas)} verificaciones FALLARON: {_fallas}")

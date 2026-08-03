@@ -2424,7 +2424,7 @@ async def historial_grid(otm: str, desde: str = "", semanas: int = 0):
 
 
 async def _evento_restriccion(con, accion: str, fila, actor: str, notas: str = "") -> None:
-    """Apunta el movimiento en la traza append-only (0044).
+    """Apunta el movimiento en la traza append-only (0044, ampliada en 0045).
 
     Existe porque al desmarcar `liberada` el código pone `liberada_en = NULL` y
     el historial se perdía entero: sin esto, una restricción liberada y reabierta
@@ -2432,14 +2432,33 @@ async def _evento_restriccion(con, accion: str, fila, actor: str, notas: str = "
     la de la última vez que alguien tocó el registro."""
     real = fila.get("liberada_el") if isinstance(fila, dict) else fila["liberada_el"]
     req = fila["fecha_requerida"]
+    det = fila["detectada_el"]
     lat = (real - req).days if (real and req) else None
+    # Duración = cuánto estuvo VIVA. No es la latencia: una restricción puede
+    # liberarse a tiempo respecto de lo pedido y haber bloqueado un mes.
+    dur = (real - det).days if (real and det) else None
     await con.execute(
         """INSERT INTO prog_restriccion_eventos
              (restriccion_id, actividad_id, accion, tipo, responsable_id,
-              fecha_requerida, liberada_el, latencia_dias, actor, notas)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)""",
+              fecha_requerida, liberada_el, latencia_dias, actor, notas,
+              detectada_el, duracion_dias)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)""",
         fila["id"], fila["actividad_id"], accion, fila["tipo"], fila["responsable_id"],
-        req, real, lat, (actor or "?")[:60], (notas or "").strip() or None)
+        req, real, lat, (actor or "?")[:60], (notas or "").strip() or None, det, dur)
+
+
+def _validar_fechas_restriccion(det, lib) -> None:
+    """Coherencia de las dos fechas reales. Compartida por creación y edición.
+
+    Una restricción liberada ANTES de detectarse daría una duración negativa que
+    contamina la mediana sin que nadie la vea; y una fecha futura no es un dato,
+    es un error de tecleo (mismo criterio que el lote de liberación)."""
+    hoy = fecha_lima()
+    if det and det > hoy:
+        raise HTTPException(422, f"La fecha de detección no puede ser futura ({det})")
+    if det and lib and lib < det:
+        raise HTTPException(
+            422, f"No puede liberarse ({lib}) antes de detectarse ({det})")
 
 
 @router.get("/actividades/{act_id}/restricciones")
@@ -2463,6 +2482,10 @@ async def crear_restriccion(act_id: int, data: dict,
     tipo = str(data.get("tipo") or "OTROS").strip().upper()
     if tipo not in _TIPOS_RESTRICCION:
         raise HTTPException(422, f"tipo inválido (usa {'/'.join(_TIPOS_RESTRICCION)})")
+    # 0045: cuándo APARECIÓ el problema, que no es cuándo se teclea. Si no viene,
+    # se queda NULL y la lectura cae a `creado_en` marcándolo como derivado.
+    det = parse_fecha(data.get("detectada_el"))
+    _validar_fechas_restriccion(det, None)
     pool = await db()
     try:
         async with pool.acquire() as con:
@@ -2470,11 +2493,11 @@ async def crear_restriccion(act_id: int, data: dict,
                 row = await con.fetchrow(
                     """INSERT INTO prog_restricciones
                        (actividad_id, descripcion, tipo, responsable, responsable_id,
-                        fecha_requerida)
-                       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *""",
+                        fecha_requerida, detectada_el)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *""",
                     act_id, desc, tipo, data.get("responsable") or None,
                     data.get("responsable_id") or None,
-                    parse_fecha(data.get("fecha_requerida")))
+                    parse_fecha(data.get("fecha_requerida")), det)
                 await _evento_restriccion(con, "crear", row, user.get("sub", "?"), desc)
     except _ERRORES_DATO:
         raise HTTPException(400, "Actividad inexistente o datos inválidos")
@@ -2500,6 +2523,9 @@ async def editar_restriccion(rest_id: int, data: dict,
     # libro mayor tiene que medir el martes. Cuando no viene, se asume hoy —
     # mejor que nada, y el libro lo cuenta como dato derivado.
     accion = None
+    if "detectada_el" in data:
+        campos.append(f"detectada_el = ${len(valores) + 2}")
+        valores.append(parse_fecha(data["detectada_el"]))
     if "liberada_el" in data:
         campos.append(f"liberada_el = ${len(valores) + 2}")
         valores.append(parse_fecha(data["liberada_el"]))
@@ -2524,6 +2550,10 @@ async def editar_restriccion(rest_id: int, data: dict,
                 rest_id, *valores)
             if not row:
                 raise HTTPException(404, "Restricción no encontrada")
+            # Se valida sobre el RESULTADO, no sobre lo que llegó: el dato malo
+            # puede nacer de mezclar una fecha nueva con otra ya guardada. La
+            # excepción aborta la transacción y el UPDATE se deshace.
+            _validar_fechas_restriccion(row["detectada_el"], row["liberada_el"])
             await _evento_restriccion(con, accion or "editar", row, user.get("sub", "?"),
                                       data.get("notas", ""))
     return dict(row)

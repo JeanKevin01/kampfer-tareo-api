@@ -29,10 +29,11 @@ def _modo_prod(monkeypatch):
 
 
 def _f(tipo="MATERIALES", resp=(1, "LOGISTICA"), liberada=True, req=date(2026, 7, 1),
-       latencia=3, derivada=False):
+       latencia=3, derivada=False, otm="OTM-0001", duracion=None, antiguedad=None):
     return {"tipo": tipo, "responsable_id": resp[0], "responsable": resp[1],
             "liberada": liberada, "fecha_requerida": req,
-            "latencia": latencia, "derivada": derivada}
+            "latencia": latencia, "derivada": derivada, "otm_id": otm,
+            "duracion": duracion, "antiguedad": antiguedad}
 
 
 # ── percentil ────────────────────────────────────────────────
@@ -84,6 +85,30 @@ def test_celda_sin_liberadas_no_inventa_mediana():
     assert c["mediana_dias"] is None and c["pct_a_tiempo"] is None
 
 
+# ── duración y antigüedad (0045) ─────────────────────────────
+def test_duracion_es_distinta_de_la_latencia():
+    """El caso que justifica la columna: liberada A TIEMPO respecto de lo que
+    pidió el planner (latencia 0) pero después de bloquear 40 días."""
+    c = _celda([_f(latencia=0, duracion=40), _f(latencia=0, duracion=20)], HOY)
+    assert c["pct_a_tiempo"] == 100.0          # impecable según el plazo pedido
+    assert c["duracion_mediana"] == 30.0       # y aun así vivió un mes
+    assert c["duracion_peor"] == 40 and c["n_duracion"] == 2
+
+
+def test_la_duracion_solo_cuenta_lo_cerrado_y_la_antiguedad_solo_lo_abierto():
+    """Si se mezclaran, cerrar una restricción vieja «mejoraría» la métrica
+    exactamente igual que dejarla abierta."""
+    c = _celda([_f(duracion=10), _f(liberada=False, latencia=None, antiguedad=90)], HOY)
+    assert c["n_duracion"] == 1 and c["duracion_mediana"] == 10.0
+    assert c["antiguedad_peor"] == 90
+
+
+def test_sin_fechas_no_se_inventan_duraciones():
+    c = _celda([_f(duracion=None), _f(liberada=False, latencia=None, antiguedad=None)], HOY)
+    assert c["duracion_mediana"] is None and c["duracion_peor"] is None
+    assert c["antiguedad_peor"] is None and c["n_duracion"] == 0
+
+
 # ── resumen ──────────────────────────────────────────────────
 def test_resumen_agrupa_por_tipo_y_responsable():
     filas = [
@@ -110,9 +135,25 @@ def test_reincidencia_solo_lista_lo_repetido_y_ordena_por_frecuencia():
         ("MATERIALES", 3), ("EQUIPOS", 2)]        # el caso único no aparece
 
 
+def test_resumen_separa_por_proyecto():
+    """Con varias OTM abiertas, una mediana global promedia obras que no se
+    parecen: «no llegó el fierro» no significa lo mismo en cada una."""
+    r = _resumen([_f(otm="OTM-0001", latencia=2), _f(otm="OTM-0001", latencia=4),
+                  _f(otm="OTM-0009", latencia=30)], HOY)
+    por = {o["otm_id"]: o for o in r["por_otm"]}
+    assert por["OTM-0001"]["n"] == 2 and por["OTM-0001"]["mediana_dias"] == 3.0
+    assert por["OTM-0009"]["mediana_dias"] == 30.0
+
+
+def test_restriccion_sin_proyecto_no_desaparece_del_corte():
+    r = _resumen([_f(otm=None)], HOY)
+    assert [o["otm_id"] for o in r["por_otm"]] == ["(sin proyecto)"]
+
+
 def test_resumen_vacio_no_revienta():
     r = _resumen([], HOY)
     assert r["total"]["n"] == 0 and r["por_tipo"] == [] and r["reincidencia"] == []
+    assert r["por_otm"] == []
 
 
 # ── normalización del nombre ─────────────────────────────────
@@ -187,3 +228,16 @@ def test_tipo_de_responsable_invalido_es_422():
 def test_nombre_vacio_es_400():
     r = _client().post("/ev/responsables", json={"nombre": "   "}, headers=_hdr("oficina"))
     assert r.status_code == 400
+
+
+# ── El día de Lima de un sello UTC (bug destapado por el E2E) ─────────
+def test_fecha_de_devuelve_el_dia_de_lima_no_el_de_utc():
+    """Postgres devuelve los TIMESTAMPTZ en UTC. Una restricción registrada a las
+    20:26 de Lima llega como 01:26 del día SIGUIENTE, y `.date()` a secas corría
+    la medición un día entero — la antigüedad salía en -1."""
+    from datetime import datetime, timezone
+    from core.tiempo import fecha_de
+    sello = datetime(2026, 8, 3, 1, 26, tzinfo=timezone.utc)   # = 2-ago 20:26 Lima
+    assert fecha_de(sello) == date(2026, 8, 2)
+    assert fecha_de(datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)) == date(2026, 8, 2)
+    assert fecha_de(None) is None

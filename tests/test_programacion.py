@@ -439,3 +439,27 @@ def test_parte_imprime_area_y_frente():
 
 def test_frentes_sin_credenciales_401():
     assert _client().get("/campo/frentes?otm_id=OTM-0001").status_code == 401
+
+
+# ── Coherencia de las fechas reales de una restricción (0045) ─────────
+def test_no_se_puede_liberar_antes_de_detectar():
+    """Daría una duración negativa que contamina la mediana sin que se vea."""
+    from routers.programacion import _validar_fechas_restriccion
+    with pytest.raises(Exception) as e:
+        _validar_fechas_restriccion(date(2026, 7, 20), date(2026, 7, 10))
+    assert e.value.status_code == 422
+
+
+def test_detectar_en_el_futuro_no_es_un_dato_es_un_tecleo():
+    from routers.programacion import _validar_fechas_restriccion
+    with pytest.raises(Exception) as e:
+        _validar_fechas_restriccion(date(2099, 1, 1), None)
+    assert e.value.status_code == 422
+
+
+def test_fechas_incompletas_no_bloquean():
+    """Lo viejo no tiene `detectada_el` y tiene que poder seguir liberándose."""
+    from routers.programacion import _validar_fechas_restriccion
+    _validar_fechas_restriccion(None, date(2026, 7, 10))
+    _validar_fechas_restriccion(date(2026, 7, 10), None)
+    _validar_fechas_restriccion(date(2026, 7, 10), date(2026, 7, 10))   # mismo día = 0

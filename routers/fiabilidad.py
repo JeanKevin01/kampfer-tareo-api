@@ -30,11 +30,11 @@ from fastapi import APIRouter, Depends, HTTPException
 from core.auth import require_role
 from core.db import db
 from core.log import get_logger
-from core.tiempo import fecha_lima, parse_fecha
+from core.tiempo import fecha_de, fecha_lima, parse_fecha
 # La traza append-only vive con el resto de restricciones; se importa en vez de
 # duplicarla para que exista UN solo sitio que decida qué se apunta al liberar.
 # No hay ciclo: `programacion` no conoce este módulo.
-from routers.programacion import _evento_restriccion
+from routers.programacion import _evento_restriccion, _validar_fechas_restriccion
 
 log = get_logger("api")
 
@@ -84,6 +84,14 @@ def _celda(filas: list, hoy: date) -> dict:
     vencidas = [f for f in filas
                 if not f["liberada"] and f["fecha_requerida"] and f["fecha_requerida"] < hoy]
     a_tiempo = sum(1 for v in lat if v <= 0)
+    # 0045 · DURACIÓN: cuántos días estuvo viva. No es la latencia. Una
+    # restricción puede liberarse a tiempo respecto de lo que pidió el planner y
+    # haber bloqueado un mes; y se mide sobre MÁS filas que la latencia, porque
+    # no necesita `fecha_requerida`. Por eso lleva su propio n.
+    dur = sorted(f["duracion"] for f in filas if f["duracion"] is not None)
+    # Lo pendiente no tiene duración todavía, tiene ANTIGÜEDAD: el peor caso
+    # abierto es lo que de verdad duele hoy, y se perdía al medir solo lo cerrado.
+    ant = [f["antiguedad"] for f in filas if not f["liberada"] and f["antiguedad"] is not None]
     return {
         "n": len(filas),
         "n_liberadas": len(liberadas),
@@ -96,6 +104,10 @@ def _celda(filas: list, hoy: date) -> dict:
         "peor_dias": lat[-1] if lat else None,
         "pct_a_tiempo": round(100 * a_tiempo / len(lat), 1) if lat else None,
         "suficiente": len(lat) >= N_MINIMO,
+        "n_duracion": len(dur),
+        "duracion_mediana": _percentil(dur, 0.5),
+        "duracion_peor": dur[-1] if dur else None,
+        "antiguedad_peor": max(ant) if ant else None,
     }
 
 
@@ -115,6 +127,12 @@ def _resumen(filas: list, hoy: date) -> dict:
                 for k, v in sorted(agrupar(lambda f: (f["responsable_id"], f["responsable"]))
                                    .items(), key=lambda x: str(x[0][1]))]
 
+    # Por proyecto: la misma restricción («no llegó el fierro») significa cosas
+    # distintas según dónde pasa, y con varias OTM abiertas la mediana global
+    # promedia obras que no se parecen.
+    por_otm = [{"otm_id": k, **_celda(v, hoy)}
+               for k, v in sorted(agrupar(lambda f: f["otm_id"] or "(sin proyecto)").items())]
+
     # El cruce solo se ofrece donde hay materia: con 8 tipos por N responsables,
     # la mayoría de las celdas tendrían n=1 y una mediana de una observación no
     # es una mediana. Se devuelven ordenadas por reincidencia, que es lo que
@@ -127,6 +145,7 @@ def _resumen(filas: list, hoy: date) -> dict:
         "total": _celda(filas, hoy),
         "por_tipo": por_tipo,
         "por_responsable": por_resp,
+        "por_otm": por_otm,
         "reincidencia": [c for c in cruce if c["n"] > 1],
         "n_minimo": N_MINIMO,
     }
@@ -212,8 +231,9 @@ async def editar_responsable(resp_id: int, data: dict,
 
 # ── Libro mayor ───────────────────────────────────────────────
 @router.get("/fiabilidad/restricciones")
-async def fiabilidad_restricciones(desde: str = "", hasta: str = "", proyecto_id: int = 1):
-    """Latencia de liberación y reincidencia, por tipo y por responsable."""
+async def fiabilidad_restricciones(desde: str = "", hasta: str = "", proyecto_id: int = 1,
+                                   otm: str = ""):
+    """Latencia de liberación y reincidencia, por tipo, responsable y proyecto."""
     hoy = fecha_lima()
     d, h = parse_fecha(desde), parse_fecha(hasta)
     conds = ["a.proyecto_id = $1"]
@@ -222,16 +242,18 @@ async def fiabilidad_restricciones(desde: str = "", hasta: str = "", proyecto_id
         args.append(d); conds.append(f"r.creado_en >= ${len(args)}")
     if h:
         args.append(h); conds.append(f"r.creado_en < ${len(args)}::date + 1")
+    if otm:
+        args.append(otm); conds.append(f"a.otm_id = ${len(args)}")
 
     pool = await db()
     rows = await pool.fetch(
         f"""SELECT r.id, r.tipo, r.liberada, r.fecha_requerida, r.liberada_el,
                    r.liberada_en, r.responsable_id, r.descripcion, r.actividad_id,
+                   r.detectada_el, r.creado_en,
                    COALESCE(p.nombre, '(sin responsable)') AS responsable,
-                   act.titulo AS actividad
+                   a.titulo AS actividad, a.otm_id
               FROM prog_restricciones r
               JOIN prog_actividades a  ON a.id = r.actividad_id
-              LEFT JOIN prog_actividades act ON act.id = r.actividad_id
               LEFT JOIN prog_responsables p  ON p.id = r.responsable_id
              WHERE {' AND '.join(conds)}""",
         *args)
@@ -244,14 +266,30 @@ async def fiabilidad_restricciones(desde: str = "", hasta: str = "", proyecto_id
         real = r["liberada_el"]
         derivada = False
         if r["liberada"] and not real and r["liberada_en"]:
-            real, derivada = r["liberada_en"].date(), True
+            real, derivada = fecha_de(r["liberada_en"]), True
+        # Mismo criterio en la entrada (0045): `creado_en` es cuándo se tecleó.
+        det = r["detectada_el"] or fecha_de(r["creado_en"])
+        det_derivada = r["detectada_el"] is None and det is not None
         lat = (real - r["fecha_requerida"]).days if (real and r["fecha_requerida"]) else None
         filas.append({
             "id": r["id"], "tipo": r["tipo"], "liberada": r["liberada"],
             "fecha_requerida": r["fecha_requerida"], "latencia": lat, "derivada": derivada,
             "responsable_id": r["responsable_id"], "responsable": r["responsable"],
             "descripcion": r["descripcion"], "actividad": r["actividad"],
-            "actividad_id": r["actividad_id"],
+            "actividad_id": r["actividad_id"], "otm_id": r["otm_id"],
+            "detectada": det, "detectada_derivada": det_derivada,
+            # Duración solo de lo cerrado; antigüedad solo de lo abierto. Mezclarlas
+            # en un mismo número haría que cerrar una restricción vieja «mejore»
+            # la métrica del mismo modo que dejarla abierta.
+            #
+            # Y solo si la detección está DECLARADA: con el sello de captura de
+            # respaldo, «duración» pasa a ser «lo que va del tecleo a la fecha de
+            # liberación», que sale NEGATIVA en cuanto el planner registra hoy
+            # algo que liberó el mes pasado. La latencia sí aguanta el respaldo
+            # porque se mide contra una fecha planificada; esta no.
+            "duracion": ((real - det).days
+                         if (r["liberada"] and real and det and not det_derivada) else None),
+            "antiguedad": (hoy - det).days if (not r["liberada"] and det) else None,
         })
 
     out = _resumen(filas, hoy)
@@ -278,33 +316,47 @@ async def fiabilidad_restricciones(desde: str = "", hasta: str = "", proyecto_id
 # siempre «el día en que el planner tuvo tiempo de limpiar» — justo el sesgo que
 # `liberada_el` existe para evitar.
 @router.get("/fiabilidad/pendientes")
-async def fiabilidad_pendientes(proyecto_id: int = 1):
+async def fiabilidad_pendientes(proyecto_id: int = 1, otm: str = ""):
     """Restricciones sin liberar, la más urgente primero."""
     hoy = fecha_lima()
+    args: list = [proyecto_id]
+    filtro = ""
+    if otm:
+        args.append(otm); filtro = f" AND a.otm_id = ${len(args)}"
     pool = await db()
     rows = await pool.fetch(
-        """SELECT r.id, r.descripcion, r.tipo, r.fecha_requerida, r.responsable_id,
-                  COALESCE(p.nombre, '(sin responsable)') AS responsable,
-                  a.id AS actividad_id, a.titulo AS actividad, a.fecha AS actividad_fecha,
-                  a.estado, a.otm_id
-             FROM prog_restricciones r
-             JOIN prog_actividades a       ON a.id = r.actividad_id
-             LEFT JOIN prog_responsables p ON p.id = r.responsable_id
-            WHERE a.proyecto_id = $1 AND NOT r.liberada
-            ORDER BY r.fecha_requerida NULLS LAST, r.id""",
-        proyecto_id)
-    return {
-        "hoy": str(hoy),
-        # `dias` positivo = vencida hace tantos días; negativo = aún queda plazo.
-        # Se manda calculado para que el panel no repita la aritmética de fechas
-        # (que en JS, con zonas horarias de por medio, se equivoca sola).
-        "pendientes": [
-            {**dict(r),
-             "fecha_requerida": str(r["fecha_requerida"]) if r["fecha_requerida"] else None,
-             "actividad_fecha": str(r["actividad_fecha"]) if r["actividad_fecha"] else None,
-             "dias": (hoy - r["fecha_requerida"]).days if r["fecha_requerida"] else None}
-            for r in rows],
-    }
+        f"""SELECT r.id, r.descripcion, r.tipo, r.fecha_requerida, r.responsable_id,
+                   r.detectada_el, r.creado_en,
+                   COALESCE(p.nombre, '(sin responsable)') AS responsable,
+                   a.id AS actividad_id, a.titulo AS actividad, a.fecha AS actividad_fecha,
+                   a.estado, a.otm_id, o.descripcion AS otm_desc
+              FROM prog_restricciones r
+              JOIN prog_actividades a       ON a.id = r.actividad_id
+              LEFT JOIN prog_responsables p ON p.id = r.responsable_id
+              LEFT JOIN otms o              ON o.id = a.otm_id
+             WHERE a.proyecto_id = $1 AND NOT r.liberada{filtro}
+             ORDER BY r.fecha_requerida NULLS LAST, r.id""",
+        *args)
+
+    out = []
+    for r in rows:
+        det = r["detectada_el"] or fecha_de(r["creado_en"])
+        out.append({
+            **dict(r),
+            "creado_en": str(r["creado_en"]) if r["creado_en"] else None,
+            "fecha_requerida": str(r["fecha_requerida"]) if r["fecha_requerida"] else None,
+            "actividad_fecha": str(r["actividad_fecha"]) if r["actividad_fecha"] else None,
+            # `dias` positivo = vencida hace tantos; negativo = aún queda plazo.
+            # Se manda calculado para que el panel no repita la aritmética de
+            # fechas (que en JS, con zonas horarias, se equivoca sola).
+            "dias": (hoy - r["fecha_requerida"]).days if r["fecha_requerida"] else None,
+            "detectada_el": str(det) if det else None,
+            # Sin fecha declarada se cae al sello de captura, marcándolo: así el
+            # planner ve de un vistazo cuáles todavía tiene que declarar.
+            "detectada_derivada": r["detectada_el"] is None,
+            "antiguedad": (hoy - det).days if det else None,
+        })
+    return {"hoy": str(hoy), "pendientes": out}
 
 
 def _validar_lote(items, hoy: date) -> list:
@@ -358,6 +410,11 @@ async def liberar_lote(data: dict, user: dict = Depends(require_role("oficina"))
                 if not row:
                     omitidas.append(rid)
                     continue
+                # 0045: liberar antes de detectar daría una duración negativa.
+                # La excepción aborta la transacción entera — la revisión semanal
+                # es un acto, y prefiero rechazarla completa señalando cuál está
+                # mal que dejar la mitad aplicada con un dato imposible dentro.
+                _validar_fechas_restriccion(row["detectada_el"], fecha)
                 await _evento_restriccion(con, "liberar", row, actor, notas)
                 liberadas.append(rid)
     return {"liberadas": liberadas, "omitidas": omitidas, "hoy": str(hoy)}
