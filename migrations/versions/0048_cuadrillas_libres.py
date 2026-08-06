@@ -32,10 +32,20 @@ propósito: el id es único por definición, así que el índice no puede fallar
 después. Un contador puede chocar contra un «Encofrado (2)» que ya exista y
 tumbar la migración entera.
 
-DOWNGRADE: devuelve la columna, el índice y `asignado_en`. No des-desambigua los
-nombres (no hay forma de saber cuáles se tocaron sin guardar otra tabla para
-eso), así que un nombre renombrado se queda renombrado. Es la única pérdida y no
-afecta a ningún dato de tareo.
+DOWNGRADE: devuelve la columna, la unicidad por supervisor y `asignado_en`. No
+des-desambigua los nombres (no hay forma de saber cuáles se tocaron sin guardar
+otra tabla para eso), así que un nombre renombrado se queda renombrado. Es la
+única pérdida y no afecta a ningún dato de tareo.
+
+CONSTRAINT vs ÍNDICE (lección 0008, que aquí volví a pagar): la unicidad
+`(supervisor_id, nombre)` es un CONSTRAINT en la BD real y un índice suelto en
+el baseline —el dump que lo generó imprime las unique constraints como
+`CREATE UNIQUE INDEX`, y esa distinción se perdió—. `DROP INDEX IF EXISTS` NO
+es inofensivo contra un índice que respalda un constraint: Postgres aborta con
+DependentObjectsStillExist en vez de ignorarlo. Por eso se suelta primero el
+constraint (que se lleva su índice) y solo después se intenta el índice suelto:
+así funciona en los dos mundos. El downgrade lo devuelve como CONSTRAINT, que
+es la forma de producción.
 """
 from alembic import op
 
@@ -47,9 +57,14 @@ depends_on = None
 _UP = """
 DROP INDEX IF EXISTS idx_cgrupos_pool_nombre;
 DROP INDEX IF EXISTS idx_cgrupos_sup;
-DROP INDEX IF EXISTS cuadrilla_grupos_supervisor_id_nombre_key;
+
+-- El constraint PRIMERO: se lleva por delante su propio índice. Al revés,
+-- `DROP INDEX` sobre un índice que respalda un constraint aborta la migración
+-- entera (DependentObjectsStillExist), no lo ignora. El `DROP INDEX` de después
+-- cubre el caso del baseline, donde la unicidad es un índice suelto.
 ALTER TABLE cuadrilla_grupos
   DROP CONSTRAINT IF EXISTS cuadrilla_grupos_supervisor_id_nombre_key;
+DROP INDEX IF EXISTS cuadrilla_grupos_supervisor_id_nombre_key;
 
 ALTER TABLE cuadrilla_grupos RENAME COLUMN supervisor_id TO creada_por;
 ALTER TABLE cuadrilla_grupos DROP COLUMN IF EXISTS asignado_en;
@@ -76,8 +91,16 @@ DROP INDEX IF EXISTS idx_cgrupos_creada_por;
 DROP INDEX IF EXISTS idx_cgrupos_nombre;
 ALTER TABLE cuadrilla_grupos ADD COLUMN IF NOT EXISTS asignado_en TIMESTAMPTZ;
 ALTER TABLE cuadrilla_grupos RENAME COLUMN creada_por TO supervisor_id;
-CREATE UNIQUE INDEX IF NOT EXISTS cuadrilla_grupos_supervisor_id_nombre_key
-    ON cuadrilla_grupos (supervisor_id, nombre);
+
+-- Se devuelve como CONSTRAINT —la forma que tiene en producción—, no como
+-- índice suelto. Limpiar los dos nombres antes deja el terreno libre venga de
+-- donde venga la BD.
+ALTER TABLE cuadrilla_grupos
+  DROP CONSTRAINT IF EXISTS cuadrilla_grupos_supervisor_id_nombre_key;
+DROP INDEX IF EXISTS cuadrilla_grupos_supervisor_id_nombre_key;
+ALTER TABLE cuadrilla_grupos
+  ADD CONSTRAINT cuadrilla_grupos_supervisor_id_nombre_key
+  UNIQUE (supervisor_id, nombre);
 UPDATE cuadrilla_grupos SET asignado_en = creado_en WHERE supervisor_id IS NOT NULL;
 """
 
