@@ -76,6 +76,8 @@ def limpiar_y_sembrar(cur):
     # semilla del arranque del API.
     cur.execute("DELETE FROM usuarios WHERE supervisor_id='SUPE2F'")
     cur.execute("DELETE FROM cuadrillas WHERE supervisor_id='SUPE2F'")
+    # Cuadrillas del bloque F-CUADRILLA (los miembros se van por cascada).
+    cur.execute("DELETE FROM cuadrilla_grupos WHERE supervisor_id IN ('SUPE2E','SUPE2F')")
     cur.execute("DELETE FROM supervisores WHERE id='SUPE2F'")
     cur.execute("DELETE FROM ev_avances WHERE hito_id IN (SELECT id FROM ev_hitos WHERE "
                 "partida_id IN (SELECT id FROM ev_partidas WHERE codigo LIKE 'E2E-%'))")
@@ -2091,6 +2093,103 @@ def main():
           r.status_code == 422 and estados.get(sin_declarar["id"]) is False
           and estados.get(otra["id"]) is False,
           f"status={r.status_code} estados={estados}")
+
+    # ══════════════════════════════════════════════════════════════
+    # F-CUADRILLA — el puente panel ↔ tareo (0046)
+    #
+    # Este bloque existe por un bug que ningún test unitario podía cazar: el
+    # panel escribía en la tabla `cuadrillas` y la app de campo leía
+    # `cuadrilla_otm`. Las dos mitades funcionaban perfectamente contra su
+    # propia tabla y la cuadrilla creada en oficina no llegaba nunca al
+    # teléfono. Lo único que lo detecta es cruzar los dos lados: escribir por
+    # un endpoint y leer por el del otro.
+    # ══════════════════════════════════════════════════════════════
+    def cuadrillas_campo():
+        """Lo que ve el TELÉFONO: {nombre: [miembros]}."""
+        rr = c.get(f"{API}/ev/cuadrillas-plantilla", params={"supervisor_id": "SUPE2E"})
+        return rr.json() if rr.status_code == 200 else {}
+
+    def cuadrillas_panel():
+        """Lo que ve OFICINA: [{id, nombre, miembros[]}]."""
+        rr = c.get(f"{API}/api/cuadrillas/SUPE2E")
+        return rr.json() if rr.status_code == 200 else []
+
+    # C1 — oficina crea la cuadrilla; el orden que manda es el que se guarda.
+    r = c.post(f"{API}/api/cuadrillas/SUPE2E",
+               json={"nombre": "  E2E  Excavación ", "trab_ids": ["902", "901", "902"]})
+    cua = r.json() if r.status_code == 200 else {}
+    check("C1 el panel crea la cuadrilla (nombre normalizado, sin repetidos)",
+          r.status_code == 200 and cua.get("nombre") == "E2E Excavación"
+          and cua.get("total") == 2,
+          f"status={r.status_code} body={r.text[:200]}")
+
+    # C2 — EL CHECK QUE FALTABA: lo creado en el panel se ve en el teléfono.
+    campo = cuadrillas_campo()
+    miembros = campo.get("E2E Excavación", [])
+    check("C2 esa cuadrilla llega al TAREO con su gente y en su orden",
+          "E2E Excavación" in campo and len(miembros) == 2
+          and [m["trabajador_id"] for m in miembros] == ["902", "901"]
+          and miembros[0]["nombre"] and miembros[0]["cargo"],
+          f"campo={campo}")
+
+    # C3 — el nombre es único por supervisor: crear otra igual no machaca.
+    r = c.post(f"{API}/api/cuadrillas/SUPE2E", json={"nombre": "E2E Excavación"})
+    check("C3 nombre repetido rebota con 409 (no pisa la que está en uso)",
+          r.status_code == 409 and len(cuadrillas_campo().get("E2E Excavación", [])) == 2,
+          f"status={r.status_code}")
+
+    # C4 — varias cuadrillas a la vez: es lo que pidió Jean.
+    r = c.post(f"{API}/api/cuadrillas/SUPE2E",
+               json={"nombre": "E2E Encofrado", "trab_ids": ["901"]})
+    campo = cuadrillas_campo()
+    check("C4 el supervisor tiene VARIAS cuadrillas a la vez",
+          r.status_code == 200 and "E2E Excavación" in campo and "E2E Encofrado" in campo
+          and len(campo["E2E Encofrado"]) == 1,
+          f"status={r.status_code} campo={list(campo)}")
+
+    # C5 — el circuito inverso: lo que el teléfono guarda se ve en oficina.
+    # `otm_id` sigue viajando desde la app desplegada; ya no discrimina.
+    r = c.post(f"{API}/ev/cuadrillas-plantilla", json={
+        "supervisor_id": "SUPE2E", "otm_id": "OTM-E2E",
+        "nombre": "E2E Del teléfono", "trabajadores": ["901", "902"]})
+    panel = {g["nombre"]: g for g in cuadrillas_panel()}
+    tel = panel.get("E2E Del teléfono", {})
+    check("C5 la cuadrilla guardada en CAMPO se ve en el panel",
+          r.status_code == 200 and tel.get("total") == 2
+          and [m["trab_id"] for m in tel.get("miembros", [])] == ["901", "902"],
+          f"status={r.status_code} panel={list(panel)}")
+
+    # C6 — renombrar: antes un nombre mal escrito era permanente.
+    gid = panel["E2E Excavación"]["id"]
+    r = c.patch(f"{API}/api/cuadrilla-grupo/{gid}", json={"nombre": "E2E Excavación 2"})
+    r409 = c.patch(f"{API}/api/cuadrilla-grupo/{gid}", json={"nombre": "E2E Encofrado"})
+    campo = cuadrillas_campo()
+    check("C6 renombrar llega al tareo y no permite chocar con otra",
+          r.status_code == 200 and "E2E Excavación 2" in campo
+          and "E2E Excavación" not in campo and r409.status_code == 409,
+          f"status={r.status_code} dup={r409.status_code} campo={list(campo)}")
+
+    # C7 — agregar y quitar gente de UNA cuadrilla sin tocar las otras.
+    c.post(f"{API}/api/cuadrilla-grupo/{gid}/miembro/901")
+    c.delete(f"{API}/api/cuadrilla-grupo/{gid}/miembro/902")
+    campo = cuadrillas_campo()
+    check("C7 alta y baja de un miembro afectan solo a su cuadrilla",
+          [m["trabajador_id"] for m in campo.get("E2E Excavación 2", [])] == ["901"]
+          and len(campo.get("E2E Encofrado", [])) == 1,
+          f"campo={campo}")
+
+    # C8 — eliminar: desaparece de los dos lados a la vez.
+    r = c.delete(f"{API}/api/cuadrilla-grupo/{gid}")
+    campo, panel = cuadrillas_campo(), {g["nombre"] for g in cuadrillas_panel()}
+    check("C8 eliminar la cuadrilla la retira del panel Y del tareo",
+          r.status_code == 200 and "E2E Excavación 2" not in campo
+          and "E2E Excavación 2" not in panel and "E2E Encofrado" in campo,
+          f"campo={list(campo)} panel={panel}")
+
+    # C9 — nadie se lleva por delante la cuadrilla de otro supervisor.
+    r = c.post(f"{API}/api/cuadrillas/SUPE2E", json={"nombre": ""})
+    check("C9 cuadrilla sin nombre rebota con 422", r.status_code == 422,
+          f"status={r.status_code}")
 
     print()
     if _fallas:

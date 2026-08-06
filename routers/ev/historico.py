@@ -9,10 +9,12 @@ from datetime import date, timedelta, datetime, timezone  # noqa: F401
 from typing import Optional  # noqa: F401
 
 import asyncpg  # noqa: F401
-from fastapi import APIRouter, HTTPException  # noqa: F401
+from fastapi import APIRouter, Depends, HTTPException  # noqa: F401
 from pydantic import BaseModel, Field  # noqa: F401
 
+from core.auth import exigir_identidad_supervisor, require_role
 from core.db import db  # noqa: F401
+from core.ids import ids_unicos as _ids_unicos
 from core.log import get_logger
 from core.tiempo import LIMA, semana_de as _semana_de  # noqa: F401
 
@@ -38,32 +40,46 @@ router_campo = APIRouter()
 # FASE 1 — Control Maestro: Cuadrillas + Asignación + Histórico
 # ═══════════════════════════════════════════════════════════════
 
-# ── Cuadrillas típicas por OTM ────────────────────────────────
+# ── Cuadrillas del supervisor ─────────────────────────────────
+# Fuente única desde 0046: `cuadrilla_grupos` + `cuadrilla_grupo_miembros`, la
+# MISMA que gestiona el panel (/api/cuadrillas/*). Antes esto vivía en
+# `cuadrilla_otm`, que nadie más leía: el panel escribía en otra tabla y por eso
+# crear una cuadrilla en oficina no se veía nunca en el tareo.
+#
+# El path y el shape se conservan intactos —{nombre: [miembros]}— porque el
+# index.html desplegado en campo los consume tal cual. `otm_id` se sigue
+# aceptando por compatibilidad con esa app y con lo que haya en su outbox, pero
+# ya no discrimina: la cuadrilla es del supervisor y sirve en cualquier proyecto.
 
 @router_campo.get("/cuadrillas-plantilla")
 async def listar_cuadrillas_plantilla(
     supervisor_id: str,
-    otm_id: str,
+    otm_id: str | None = None,   # aceptado por compat; ya no filtra
 ):
-    """Devuelve las cuadrillas típicas del supervisor para esa OTM."""
+    """Devuelve las cuadrillas guardadas del supervisor, con sus miembros."""
     pool = await db()
     async with pool.acquire() as con:
         rows = await con.fetch(
-            """SELECT c.trabajador_id, t.nombre, t.cargo,
-                      COALESCE(t.tipo,'DIRECTO') AS tipo,
-                      c.nombre AS plantilla, c.orden
-               FROM cuadrilla_otm c
-               JOIN trabajadores t ON t.id = c.trabajador_id
-               WHERE c.supervisor_id = $1 AND c.otm_id = $2 AND c.activo = TRUE
-               ORDER BY c.nombre, c.orden""",
-            supervisor_id, otm_id
+            """SELECT g.nombre AS plantilla, m.trab_id AS trabajador_id,
+                      t.nombre, t.cargo, COALESCE(t.tipo,'DIRECTO') AS tipo,
+                      m.orden
+               FROM cuadrilla_grupos g
+               LEFT JOIN cuadrilla_grupo_miembros m ON m.grupo_id = g.id
+               LEFT JOIN trabajadores t ON t.id = m.trab_id AND t.activo = TRUE
+               WHERE g.supervisor_id = $1 AND g.activo = TRUE
+               ORDER BY g.nombre, m.orden, t.nombre""",
+            supervisor_id
         )
+        # El LEFT JOIN mantiene visible la cuadrilla que se quedó sin miembros
+        # activos: que desaparezca de la pantalla sin explicación es peor que
+        # verla vacía. Un trabajador dado de baja sí sale de la lista — no se
+        # puede tarear a alguien que ya no está en el padrón.
         plantillas: dict = {}
         for r in rows:
-            n = r["plantilla"]
-            if n not in plantillas:
-                plantillas[n] = []
-            plantillas[n].append({
+            plantillas.setdefault(r["plantilla"], [])
+            if r["trabajador_id"] is None or r["nombre"] is None:
+                continue
+            plantillas[r["plantilla"]].append({
                 "trabajador_id": r["trabajador_id"],
                 "nombre":        r["nombre"],
                 "cargo":         r["cargo"],
@@ -74,31 +90,44 @@ async def listar_cuadrillas_plantilla(
 
 
 @router_campo.post("/cuadrillas-plantilla")
-async def guardar_cuadrilla_plantilla(data: dict):
-    """Crea o reemplaza una cuadrilla típica para supervisor+OTM."""
+async def guardar_cuadrilla_plantilla(
+    data: dict,
+    user: dict = Depends(require_role()),
+):
+    """Crea o reemplaza una cuadrilla del supervisor (la guarda el teléfono)."""
     supervisor_id = data.get("supervisor_id")
-    otm_id        = data.get("otm_id")
-    nombre        = data.get("nombre", "Principal")
+    nombre        = str(data.get("nombre") or "Principal").strip()[:100]
     trabajadores  = data.get("trabajadores", [])
 
-    if not supervisor_id or not otm_id:
-        raise HTTPException(400, "supervisor_id y otm_id son requeridos")
+    if not supervisor_id:
+        raise HTTPException(400, "supervisor_id es requerido")
+    if not nombre:
+        raise HTTPException(422, "La cuadrilla necesita un nombre")
+    # F0.6: sin esto cualquier supervisor autenticado podía sobrescribir la
+    # cuadrilla de otro mandando su id en el cuerpo.
+    exigir_identidad_supervisor(user, supervisor_id)
 
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
-            await con.execute(
-                "DELETE FROM cuadrilla_otm WHERE supervisor_id=$1 AND otm_id=$2 AND nombre=$3",
-                supervisor_id, otm_id, nombre
+            gid = await con.fetchval(
+                """INSERT INTO cuadrilla_grupos (supervisor_id, nombre)
+                   VALUES ($1,$2)
+                   ON CONFLICT (supervisor_id, nombre)
+                   DO UPDATE SET activo = TRUE RETURNING id""",
+                supervisor_id, nombre
             )
-            for idx, tid in enumerate(trabajadores):
+            # Reemplazo, no merge: la app manda la lista completa que el
+            # supervisor tiene en pantalla (misma semántica que antes).
+            await con.execute(
+                "DELETE FROM cuadrilla_grupo_miembros WHERE grupo_id = $1", gid)
+            for idx, tid in enumerate(_ids_unicos(trabajadores)):
                 await con.execute(
-                    """INSERT INTO cuadrilla_otm
-                         (supervisor_id, otm_id, nombre, trabajador_id, orden)
-                       VALUES ($1,$2,$3,$4,$5)""",
-                    supervisor_id, otm_id, nombre, str(tid), idx
+                    """INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id, orden)
+                       VALUES ($1,$2,$3) ON CONFLICT DO NOTHING""",
+                    gid, tid, idx
                 )
-    return {"ok": True, "nombre": nombre, "total": len(trabajadores)}
+    return {"ok": True, "nombre": nombre, "total": len(_ids_unicos(trabajadores))}
 
 
 @router.post("/historico/cargar")
