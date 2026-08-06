@@ -4,8 +4,11 @@ Responder en español. Este es el backend del sistema KAMPFER (tareo QR → ISP 
 
 ## Comandos
 
-- Tests: `.venv/Scripts/python -m pytest tests/ -q` (61 puros; los 403 de roles usan TestClient sin BD)
-- E2E local (11 checks, mismo arnés del CI): ver cabecera de `scripts/validacion_e2e.py`
+- Tests: `PYTHONIOENCODING=utf-8 .venv/Scripts/python -m pytest tests/ -q` (**574** puros; los 403 de
+  roles usan TestClient sin BD)
+- E2E local (**153** checks, mismo arnés del CI): ver cabecera de `scripts/validacion_e2e.py`.
+  Correrlo **dos veces seguidas**: la segunda pasada destapa que un humo no limpió lo suyo.
+  Reiniciar el uvicorn local antes de cada corrida — no lleva `--reload` y serviría el código viejo.
 - Migraciones: `DATABASE_URL=... .venv/Scripts/python -m alembic upgrade head`
 - Postgres local: contenedor `postgres:16` (ver README). App local: uvicorn puerto 8001.
 
@@ -38,11 +41,13 @@ Responder en español. Este es el backend del sistema KAMPFER (tareo QR → ISP 
    Los usuarios rol supervisor llevan `supervisor_id` (claim `sup_id` en el token).
 7. Commits convencionales `tipo(scope): descripción` en español.
 
-## Estado (plan vigente: PLAN_MAESTRO v3.1 en `Analisis Claude/` del workspace)
+## Estado (plan vigente: `Analisis Claude/VIGENTE/PLAN_MAESTRO_V9.md` del workspace)
 
-- Fase 0 completa salvo F0.5b (partir `valor_ganado.py` en `routers/ev/` — 2,2k líneas;
-  los tests importan de `routers.valor_ganado`, usar shim de re-exports al partirlo).
+- Fases 0, 1, 2, S y 4 completas. `valor_ganado.py` ya está partido en `routers/ev/` (los tests
+  importan de `routers.valor_ganado`: hay shim de re-exports, no romperlo).
+- **El archivo grande de hoy es `routers/programacion.py` (4,3k líneas)** — es el próximo a partir,
+  pero **no durante el piloto**.
 - Migración aplicada más alta en prod: verificar con `alembic current` en el contenedor (Coolify).
 - Sistema aún sin usuarios activos (pre-despliegue a supervisores): ventanas de migración flexibles.
-- Siguiente en el orden ajustado: F4 (app de campo offline v2 + piloto = experimento de la tesis)
-  → F1 (APU) → F2 (RO mensual).
+- Siguiente: congelar el resultado semanal (T2) → métricas de la tesis (T5) → validación de una
+  semana real → piloto. Ver §12 del plan maestro.
