@@ -56,7 +56,11 @@ async def listar_cuadrillas_plantilla(
     supervisor_id: str,
     otm_id: str | None = None,   # aceptado por compat; ya no filtra
 ):
-    """Devuelve las cuadrillas guardadas del supervisor, con sus miembros."""
+    """TODAS las cuadrillas, con las que armó ESTE supervisor primero.
+
+    Desde 0048 son libres: si hoy le toca el frente de otro, quiere su lista sin
+    tener que pedirla. El orden es lo que evita que eso sea una lista larga
+    donde la suya está enterrada — el dict conserva el orden en JSON."""
     pool = await db()
     async with pool.acquire() as con:
         rows = await con.fetch(
@@ -66,8 +70,9 @@ async def listar_cuadrillas_plantilla(
                FROM cuadrilla_grupos g
                LEFT JOIN cuadrilla_grupo_miembros m ON m.grupo_id = g.id
                LEFT JOIN trabajadores t ON t.id = m.trab_id AND t.activo = TRUE
-               WHERE g.supervisor_id = $1 AND g.activo = TRUE
-               ORDER BY g.nombre, m.orden, t.nombre""",
+               WHERE g.activo = TRUE
+               ORDER BY (g.creada_por IS DISTINCT FROM $1), lower(g.nombre),
+                        m.orden, t.nombre""",
             supervisor_id
         )
         # El LEFT JOIN mantiene visible la cuadrilla que se quedó sin miembros
@@ -110,13 +115,16 @@ async def guardar_cuadrilla_plantilla(
     pool = await db()
     async with pool.acquire() as con:
         async with con.transaction():
+            # El nombre es único en toda la empresa (0048): guardar «Encofrado»
+            # cuando ya existe REEMPLAZA su lista, que es la misma semántica que
+            # tenía por supervisor y la que espera el outbox del teléfono.
             gid = await con.fetchval(
-                """INSERT INTO cuadrilla_grupos (supervisor_id, nombre)
-                   VALUES ($1,$2)
-                   ON CONFLICT (supervisor_id, nombre)
-                   DO UPDATE SET activo = TRUE RETURNING id""",
-                supervisor_id, nombre
-            )
+                "UPDATE cuadrilla_grupos SET activo = TRUE, nombre = $1 "
+                " WHERE lower(nombre) = lower($1) RETURNING id", nombre)
+            if not gid:
+                gid = await con.fetchval(
+                    "INSERT INTO cuadrilla_grupos (creada_por, nombre) "
+                    "VALUES ($1,$2) RETURNING id", supervisor_id, nombre)
             # Reemplazo, no merge: la app manda la lista completa que el
             # supervisor tiene en pantalla (misma semántica que antes).
             await con.execute(

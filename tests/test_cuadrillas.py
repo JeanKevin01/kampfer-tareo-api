@@ -1,4 +1,4 @@
-"""Cuadrillas del supervisor (0046) — normalización, validación e identidad.
+"""Cuadrillas libres (0046→0048) — normalización, validación e identidad.
 
 El bug que originó este módulo no era de lógica: el panel escribía en la tabla
 `cuadrillas` y el tareo leía `cuadrilla_otm`, dos circuitos que nunca se
@@ -114,42 +114,45 @@ def test_oficina_gestiona_cualquier_cuadrilla():
     assert r.status_code not in (401, 403)
 
 
-# ── Cuadrillas asignables (0047) ─────────────────────────────
-def test_supervisor_no_reasigna():
-    """Repartir cuadrillas es de oficina: un supervisor no decide quién dirige qué."""
-    r = _client().patch("/api/cuadrilla-grupo/1", json={"supervisor_id": "02"},
+# ── Cuadrillas libres (0048) ─────────────────────────────────
+# La cuadrilla no es de nadie: es una lista preestablecida para que el registro
+# diario sea de un toque. Por eso cualquier supervisor puede editar cualquiera
+# —antes se exigía ser el dueño, y ese dueño ya no existe— y solo oficina crea
+# desde el catálogo.
+def test_supervisor_edita_cualquier_cuadrilla():
+    r = _client().patch("/api/cuadrilla-grupo/1", json={"nombre": "Encofrado"},
                         headers=_hdr("supervisor", "01"))
-    assert r.status_code == 403
+    assert r.status_code not in (401, 403)
+
+
+def test_supervisor_duplica():
+    r = _client().post("/api/cuadrilla-grupo/1/duplicar", json={"nombre": "Otra"},
+                       headers=_hdr("supervisor", "01"))
+    assert r.status_code not in (401, 403)
 
 
 def test_supervisor_no_crea_en_el_catalogo():
+    """El alta suelta sigue siendo de oficina; el supervisor crea la suya por
+    /api/cuadrillas/{sup}, que deja constancia de quién la armó."""
     r = _client().post("/api/cuadrillas", json={"nombre": "X"},
                        headers=_hdr("supervisor", "01"))
     assert r.status_code == 403
 
 
-def test_supervisor_no_duplica():
-    r = _client().post("/api/cuadrilla-grupo/1/duplicar", json={},
-                       headers=_hdr("supervisor", "01"))
-    assert r.status_code == 403
-
-
-def test_patch_vacio_422():
-    """Sin `nombre` ni `supervisor_id` no hay nada que hacer; que no pase por
-    silencio, porque un cuerpo mal armado se vería como éxito."""
+def test_patch_sin_nombre_422():
     r = _client().patch("/api/cuadrilla-grupo/1", json={}, headers=_hdr("oficina"))
     assert r.status_code == 422
 
 
-def test_mensaje_de_choque_distingue_el_pool():
-    assert "sin asignar" in _ya_existe("Encofrado", None)
-    assert "sin asignar" not in _ya_existe("Encofrado", "01")
+def test_mensaje_de_choque_es_unico():
+    """El nombre es único en toda la empresa: ya no hay «el tuyo» y «el mío»."""
+    assert "Encofrado" in _ya_existe("Encofrado")
 
 
 # ── Ensamblado de filas planas → cuadrillas ──────────────────
 def _fila(**kw):
     base = {"id": 1, "nombre": "Encofrado", "activo": True, "creado_en": None,
-            "asignado_en": None, "supervisor_id": None, "supervisor_nombre": None,
+            "creada_por": None, "creada_por_nombre": None,
             "trab_id": None, "orden": None, "trab_nombre": None, "cargo": None,
             "en_cuantas": None}
     base.update(kw)

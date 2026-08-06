@@ -113,22 +113,20 @@ def _nombre_cuadrilla(valor) -> str:
 
 
 async def _grupo_habitual(con, supervisor_id: str) -> int:
-    """Id de la cuadrilla por defecto, creándola si hace falta.
+    """Id de «la cuadrilla de fulano», creándola si hace falta.
 
-    Sostiene los tres endpoints `/api/cuadrilla/{sup}` de abajo, que no saben de
-    cuadrillas nombradas.
+    Sostiene los tres endpoints `/api/cuadrilla/{sup}` de abajo, que son de
+    antes de que existieran las cuadrillas nombradas y manejan UNA sola lista.
+    El nombre lleva el supervisor porque desde 0048 es único en toda la empresa:
+    una «Cuadrilla habitual» a secas se la quedaría el primero que la creara.
     """
-    return await con.fetchval(
-        "INSERT INTO cuadrilla_grupos (supervisor_id, nombre) VALUES ($1, $2) "
-        "ON CONFLICT (supervisor_id, nombre) DO UPDATE SET activo = true "
-        "RETURNING id",
-        supervisor_id, "Cuadrilla habitual",
-    )
+    return await _crear_o_reactivar(
+        con, supervisor_id, f"Cuadrilla de {supervisor_id}")
 
 
-# ── Compat: cuadrilla única del supervisor (la usa admin.html) ─
-# F0.3: path y shape intactos. Lo que cambia es el sustrato — antes escribían la
-# tabla `cuadrillas`, que era un sumidero: nada la leía.
+# ── Compat: la lista plana de un supervisor (admin.html) ──────
+# F0.3: path y shape intactos. Lo que cambia debajo es que ya no existe «la
+# cuadrilla de X»: devuelve la gente de la lista que lleva su nombre.
 @router.get("/api/cuadrilla/{supervisor_id}")
 async def get_cuadrilla(supervisor_id: str):
     pool = await core_db()
@@ -137,10 +135,10 @@ async def get_cuadrilla(supervisor_id: str):
         "FROM cuadrilla_grupos g "
         "JOIN cuadrilla_grupo_miembros m ON m.grupo_id = g.id "
         "JOIN trabajadores t ON t.id = m.trab_id "
-        "WHERE g.supervisor_id = $1 AND g.activo = true AND t.activo = true "
+        "WHERE lower(g.nombre) = lower($1) AND g.activo = true AND t.activo = true "
         "GROUP BY m.trab_id, t.nombre, t.cargo "
         "ORDER BY t.nombre",
-        supervisor_id,
+        f"Cuadrilla de {supervisor_id}",
     )
     return [dict(r) for r in rows]
 
@@ -171,30 +169,32 @@ async def quitar_cuadrilla(supervisor_id: str, trab_id: str,
     await pool.execute(
         "DELETE FROM cuadrilla_grupo_miembros m "
         "USING cuadrilla_grupos g "
-        "WHERE m.grupo_id = g.id AND g.supervisor_id = $1 AND m.trab_id = $2",
-        supervisor_id, norm_trab_id(trab_id),
+        "WHERE m.grupo_id = g.id AND lower(g.nombre) = lower($1) AND m.trab_id = $2",
+        f"Cuadrilla de {supervisor_id}", norm_trab_id(trab_id),
     )
     return {"ok": True}
 
 
-# ── Cuadrillas nombradas (varias por supervisor) ──────────────
-# El SELECT es el mismo para el catálogo y para las de un supervisor; lo único
-# que cambia es el WHERE. `en_otras` cuenta en cuántas cuadrillas activas MÁS
-# está esa persona: dos supervisores que la tienen en su lista van a tarearla
-# los dos el mismo día, y eso son HH duplicadas que hoy solo se descubren
-# después, en /ev/conflictos.
+# ── Cuadrillas: listas de gente que usa CUALQUIER supervisor ──
+# `creada_por` dice quién la armó, no de quién es (0048): son libres. Solo sirve
+# para poner las tuyas primero en el teléfono.
+#
+# `en_otras` cuenta en cuántas cuadrillas activas MÁS está esa persona. Con
+# listas compartidas eso es normal —la misma persona sale en varias— pero sigue
+# valiendo como aviso: si dos supervisores la tarean el mismo día son HH
+# duplicadas, y eso hoy solo se descubre después en /ev/conflictos.
 _CUADRILLAS_SQL = """
-    SELECT g.id, g.nombre, g.activo, g.creado_en, g.asignado_en,
-           g.supervisor_id, s.nombre AS supervisor_nombre,
+    SELECT g.id, g.nombre, g.activo, g.creado_en,
+           g.creada_por, s.nombre AS creada_por_nombre,
            m.trab_id, m.orden, t.nombre AS trab_nombre, t.cargo,
            (SELECT COUNT(*) FROM cuadrilla_grupo_miembros m2
               JOIN cuadrilla_grupos g2 ON g2.id = m2.grupo_id AND g2.activo
              WHERE m2.trab_id = m.trab_id) AS en_cuantas
       FROM cuadrilla_grupos g
-      LEFT JOIN supervisores s ON s.id = g.supervisor_id
+      LEFT JOIN supervisores s ON s.id = g.creada_por
       LEFT JOIN cuadrilla_grupo_miembros m ON m.grupo_id = g.id
       LEFT JOIN trabajadores t ON t.id = m.trab_id AND t.activo = true
-     WHERE g.activo = true AND {filtro}
+     WHERE g.activo = true
      ORDER BY {orden}, m.orden, t.nombre
 """
 
@@ -205,9 +205,9 @@ def _ensamblar_cuadrillas(rows) -> list:
     for r in rows:
         g = grupos.setdefault(r["id"], {
             "id": r["id"], "nombre": r["nombre"], "activo": r["activo"],
-            "creado_en": r["creado_en"], "asignado_en": r.get("asignado_en"),
-            "supervisor_id": r.get("supervisor_id"),
-            "supervisor_nombre": r.get("supervisor_nombre"),
+            "creado_en": r["creado_en"],
+            "creada_por": r.get("creada_por"),
+            "creada_por_nombre": r.get("creada_por_nombre"),
             "miembros": [],
         })
         # trab_nombre NULL = la fila del LEFT JOIN de un grupo vacío, o un
@@ -226,44 +226,64 @@ def _ensamblar_cuadrillas(rows) -> list:
 
 @router.get("/api/cuadrillas")
 async def catalogo_cuadrillas():
-    """TODAS las cuadrillas, con quién las lleva. Las sin asignar van primero:
-    son las que esperan supervisor y las que se pueden repartir."""
+    """El catálogo entero, por orden alfabético."""
     pool = await core_db()
-    rows = await pool.fetch(_CUADRILLAS_SQL.format(
-        filtro="TRUE",
-        orden="(g.supervisor_id IS NOT NULL), s.nombre, g.nombre"))
+    rows = await pool.fetch(_CUADRILLAS_SQL.format(orden="lower(g.nombre)"))
     return _ensamblar_cuadrillas(rows)
 
 
 @router.get("/api/cuadrillas/{supervisor_id}")
 async def listar_cuadrilla_grupos(supervisor_id: str):
-    """Las cuadrillas de ESE supervisor — las mismas que ve en su teléfono."""
+    """Las mismas cuadrillas que ve ese supervisor en su teléfono: TODAS, con
+    las que armó él arriba. Path y shape intactos; lo que cambió es que ya no
+    son «las suyas» sino el catálogo ordenado para él."""
     pool = await core_db()
-    rows = await pool.fetch(_CUADRILLAS_SQL.format(
-        filtro="g.supervisor_id = $1", orden="g.creado_en"), supervisor_id)
+    rows = await pool.fetch(
+        _CUADRILLAS_SQL.format(
+            orden="(g.creada_por IS DISTINCT FROM $1), lower(g.nombre)"),
+        supervisor_id)
     return _ensamblar_cuadrillas(rows)
 
 
-@router.post("/api/cuadrillas")
-async def crear_cuadrilla_sin_asignar(data: dict,
-                                      user: dict = Depends(require_role("oficina"))):
-    """Crea una cuadrilla en el catálogo, todavía sin supervisor.
+@router.get("/api/trabajadores-sin-cuadrilla")
+async def trabajadores_sin_cuadrilla():
+    """Personal activo que no está en NINGUNA cuadrilla.
 
-    Sirve para armar la plantilla de gente ANTES de saber quién la va a dirigir
-    —el caso de Jean: el supervisor entra después— y para dejar aparcada la
-    cuadrilla de alguien que se fue sin perder su lista."""
+    Es el reverso del aviso de solapamiento: a estos nadie los va a encontrar en
+    una lista guardada, así que o se tarean a mano cada día o —lo que de verdad
+    pasa— se quedan sin tarear."""
+    pool = await core_db()
+    rows = await pool.fetch(
+        """SELECT t.id, t.nombre, t.cargo, COALESCE(t.tipo,'DIRECTO') AS tipo
+           FROM trabajadores t
+          WHERE t.activo = true
+            AND NOT EXISTS (
+                SELECT 1 FROM cuadrilla_grupo_miembros m
+                  JOIN cuadrilla_grupos g ON g.id = m.grupo_id AND g.activo
+                 WHERE m.trab_id = t.id)
+          ORDER BY t.nombre""")
+    return [dict(r) for r in rows]
+
+
+@router.post("/api/cuadrillas")
+async def crear_cuadrilla_catalogo(data: dict,
+                                   user: dict = Depends(require_role("oficina"))):
+    """Crea una cuadrilla desde oficina. Queda disponible para todos."""
     return await _crear_cuadrilla(None, data)
 
 
 @router.post("/api/cuadrillas/{supervisor_id}")
 async def crear_cuadrilla_grupo(supervisor_id: str, data: dict,
                                 user: dict = Depends(require_role())):
-    """Crea una cuadrilla nombrada, asignada a ese supervisor."""
+    """Crea una cuadrilla anotando quién la armó (para ordenarle su pantalla).
+
+    Path y shape intactos: `supervisor_id` era el dueño y ahora es solo el
+    autor — la cuadrilla la puede usar cualquiera."""
     exigir_identidad_supervisor(user, supervisor_id)
     return await _crear_cuadrilla(supervisor_id, data)
 
 
-async def _crear_cuadrilla(supervisor_id, data: dict) -> dict:
+async def _crear_cuadrilla(creada_por, data: dict) -> dict:
     nombre   = _nombre_cuadrilla(data.get("nombre"))
     trab_ids = ids_unicos(data.get("trab_ids", []))
     if len(trab_ids) > MAX_MIEMBROS:
@@ -272,84 +292,70 @@ async def _crear_cuadrilla(supervisor_id, data: dict) -> dict:
     pool = await core_db()
     async with pool.acquire() as con:
         async with con.transaction():
-            await _verificar_cupo(con, supervisor_id)
+            await _verificar_cupo(con)
             # Reactivar una borrada con ese nombre es lo esperable; machacar una
             # que está en uso, no.
             existente = await con.fetchrow(
-                "SELECT id, activo FROM cuadrilla_grupos "
-                "WHERE supervisor_id IS NOT DISTINCT FROM $1 AND nombre = $2",
-                supervisor_id, nombre)
+                "SELECT id, activo FROM cuadrilla_grupos WHERE lower(nombre) = lower($1)",
+                nombre)
             if existente and existente["activo"]:
-                raise HTTPException(409, _ya_existe(nombre, supervisor_id))
-            grupo_id = await _crear_o_reactivar(con, supervisor_id, nombre)
+                raise HTTPException(409, _ya_existe(nombre))
+            grupo_id = await _crear_o_reactivar(con, creada_por, nombre)
             await _reemplazar_miembros(con, grupo_id, trab_ids)
     return {"ok": True, "id": grupo_id, "nombre": nombre,
-            "supervisor_id": supervisor_id, "total": len(trab_ids)}
+            "creada_por": creada_por, "total": len(trab_ids)}
 
 
-def _ya_existe(nombre: str, supervisor_id) -> str:
-    return (f"Ya existe una cuadrilla «{nombre}»" if supervisor_id
-            else f"Ya hay una cuadrilla sin asignar llamada «{nombre}»")
+def _ya_existe(nombre: str) -> str:
+    """El nombre es único en toda la empresa desde 0048: las cuadrillas se ven
+    todas juntas y dos «Encofrado» son indistinguibles al elegir."""
+    return f"Ya existe una cuadrilla «{nombre}»"
 
 
-async def _verificar_cupo(con, supervisor_id) -> None:
-    """El tope es por supervisor; las sin asignar comparten el suyo."""
+async def _verificar_cupo(con) -> None:
     vivas = await con.fetchval(
-        "SELECT COUNT(*) FROM cuadrilla_grupos "
-        "WHERE supervisor_id IS NOT DISTINCT FROM $1 AND activo = true",
-        supervisor_id)
+        "SELECT COUNT(*) FROM cuadrilla_grupos WHERE activo = true")
     if vivas >= MAX_CUADRILLAS:
-        raise HTTPException(422, (
-            f"Máximo {MAX_CUADRILLAS} cuadrillas por supervisor" if supervisor_id
-            else f"Máximo {MAX_CUADRILLAS} cuadrillas sin asignar"))
+        raise HTTPException(
+            422, f"Máximo {MAX_CUADRILLAS} cuadrillas; borra alguna que no uses")
 
 
-async def _crear_o_reactivar(con, supervisor_id, nombre: str) -> int:
-    """IS NOT DISTINCT FROM y no `=`: en SQL, NULL = NULL es NULL, así que con
-    `=` la cuadrilla sin asignar nunca se encontraría a sí misma."""
+async def _crear_o_reactivar(con, creada_por, nombre: str) -> int:
+    """Una borrada con ese nombre se revive en vez de duplicarse: el índice
+    único no distingue activas de inactivas, así que el nombre sigue ocupado."""
     gid = await con.fetchval(
-        "UPDATE cuadrilla_grupos SET activo = true "
-        "WHERE supervisor_id IS NOT DISTINCT FROM $1 AND nombre = $2 RETURNING id",
-        supervisor_id, nombre)
+        "UPDATE cuadrilla_grupos SET activo = true, nombre = $1 "
+        " WHERE lower(nombre) = lower($1) RETURNING id", nombre)
     if gid:
         return gid
     return await con.fetchval(
-        "INSERT INTO cuadrilla_grupos (supervisor_id, nombre, asignado_en) "
-        "VALUES ($1, $2, CASE WHEN $1::varchar IS NULL THEN NULL ELSE now() END) "
-        "RETURNING id",
-        supervisor_id, nombre,
-    )
+        "INSERT INTO cuadrilla_grupos (creada_por, nombre) VALUES ($1, $2) "
+        "RETURNING id", creada_por, nombre)
 
 
 @router.post("/api/cuadrilla-grupo/{grupo_id}/duplicar")
 async def duplicar_cuadrilla_grupo(grupo_id: int, data: dict,
-                                   user: dict = Depends(require_role("oficina"))):
-    """Copia la cuadrilla con toda su gente, para otro supervisor o sin asignar.
+                                   user: dict = Depends(require_role())):
+    """Copia la cuadrilla con toda su gente bajo otro nombre.
 
-    Es el atajo del caso real: entra un supervisor nuevo y su cuadrilla es «la
-    de fulano», no una lista en blanco. Copia la FOTO de hoy — después las dos
-    viven por su cuenta y editar una no toca a la otra."""
-    destino = data.get("supervisor_id")            # None = al catálogo, sin asignar
+    Sirve para las variantes de siempre —«Encofrado» y «Encofrado sin los dos
+    que están de descanso»— sin volver a armarla. Copia la FOTO de hoy: después
+    las dos viven por su cuenta y editar una no toca a la otra."""
     pool = await core_db()
     async with pool.acquire() as con:
         async with con.transaction():
             origen = await con.fetchrow(
-                "SELECT id, nombre, supervisor_id FROM cuadrilla_grupos WHERE id = $1",
-                grupo_id)
+                "SELECT id, nombre FROM cuadrilla_grupos WHERE id = $1", grupo_id)
             if not origen:
                 raise HTTPException(404, "Esa cuadrilla no existe")
-            if destino:
-                await _verificar_supervisor(con, destino)
-            await _verificar_cupo(con, destino)
-            nombre = _nombre_cuadrilla(data.get("nombre") or origen["nombre"])
+            await _verificar_cupo(con)
+            nombre = _nombre_cuadrilla(data.get("nombre") or f"{origen['nombre']} (copia)")
             existente = await con.fetchval(
                 "SELECT id FROM cuadrilla_grupos "
-                "WHERE supervisor_id IS NOT DISTINCT FROM $1 AND nombre = $2 "
-                "  AND activo = true",
-                destino, nombre)
+                " WHERE lower(nombre) = lower($1) AND activo = true", nombre)
             if existente:
-                raise HTTPException(409, _ya_existe(nombre, destino))
-            nuevo = await _crear_o_reactivar(con, destino, nombre)
+                raise HTTPException(409, _ya_existe(nombre))
+            nuevo = await _crear_o_reactivar(con, data.get("creada_por"), nombre)
             await con.execute(
                 "INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id, orden) "
                 "SELECT $1, trab_id, orden FROM cuadrilla_grupo_miembros "
@@ -358,17 +364,7 @@ async def duplicar_cuadrilla_grupo(grupo_id: int, data: dict,
             total = await con.fetchval(
                 "SELECT COUNT(*) FROM cuadrilla_grupo_miembros WHERE grupo_id = $1",
                 nuevo)
-    return {"ok": True, "id": nuevo, "nombre": nombre,
-            "supervisor_id": destino, "total": total}
-
-
-async def _verificar_supervisor(con, supervisor_id: str) -> None:
-    activo = await con.fetchval(
-        "SELECT activo FROM supervisores WHERE id = $1", supervisor_id)
-    if activo is None:
-        raise HTTPException(422, "Ese supervisor no existe")
-    if not activo:
-        raise HTTPException(422, "Ese supervisor está dado de baja")
+    return {"ok": True, "id": nuevo, "nombre": nombre, "total": total}
 
 
 async def _reemplazar_miembros(con, grupo_id: int, trab_ids: list) -> None:
@@ -383,70 +379,34 @@ async def _reemplazar_miembros(con, grupo_id: int, trab_ids: list) -> None:
         )
 
 
-async def _exigir_dueno_grupo(pool, grupo_id: int, user: dict) -> None:
-    """F0.6: las escrituras sobre un grupo solo las hace su supervisor dueño
-    (o un rol de oficina/admin/servicio)."""
-    if user and user.get("rol") == "supervisor":
-        dueno = await pool.fetchval(
-            "SELECT supervisor_id FROM cuadrilla_grupos WHERE id = $1", grupo_id)
-        exigir_identidad_supervisor(user, dueno)
-
-
 @router.patch("/api/cuadrilla-grupo/{grupo_id}")
 async def editar_cuadrilla_grupo(grupo_id: int, data: dict,
                                  user: dict = Depends(require_role())):
-    """Renombra y/o cambia de supervisor.
+    """Renombra la cuadrilla.
 
-    `supervisor_id` solo se toca si la clave VIENE en el cuerpo: mandarla en
-    null desasigna (la cuadrilla vuelve al catálogo) y no mandarla la deja como
-    está. Sin esa distinción, renombrar desasignaría de rebote."""
-    # Lo que se puede juzgar sin BD, primero: un cuerpo inválido o un rol que no
-    # toca no merecen una conexión (y así el 422/403 no depende de que la haya).
-    cambia_sup = "supervisor_id" in data
-    destino    = data.get("supervisor_id") or None
-    nombre     = _nombre_cuadrilla(data.get("nombre")) if "nombre" in data else None
-    if nombre is None and not cambia_sup:
-        raise HTTPException(422, "Nada que cambiar")
-    # Repartir cuadrillas es de oficina. Un supervisor administra las suyas
-    # (nombre, gente) pero no decide quién dirige qué.
-    if cambia_sup and user and user.get("rol") == "supervisor":
-        raise HTTPException(403, "Solo oficina puede reasignar una cuadrilla")
-
+    Ya no hay a quién reasignársela: desde 0048 las cuadrillas son de todos. Y
+    por lo mismo cualquier supervisor puede editar cualquiera — antes se exigía
+    ser el dueño, y ese dueño ya no existe."""
+    # Sin BD, primero: un nombre inválido no merece una conexión (y así el 422
+    # no depende de que la haya).
+    nombre = _nombre_cuadrilla(data.get("nombre"))
     pool = await core_db()
-    await _exigir_dueno_grupo(pool, grupo_id, user)
     async with pool.acquire() as con:
         async with con.transaction():
-            actual = await con.fetchrow(
-                "SELECT nombre, supervisor_id FROM cuadrilla_grupos WHERE id = $1",
-                grupo_id)
-            if not actual:
+            actual = await con.fetchval(
+                "SELECT nombre FROM cuadrilla_grupos WHERE id = $1", grupo_id)
+            if actual is None:
                 raise HTTPException(404, "Esa cuadrilla no existe")
-            if cambia_sup and destino:
-                await _verificar_supervisor(con, destino)
-            n_final   = nombre if nombre is not None else actual["nombre"]
-            sup_final = destino if cambia_sup else actual["supervisor_id"]
-            # El choque de nombre es lo que más se va a ver al reasignar: el
-            # destino ya tiene su propia «Encofrado». Se avisa con 409 en vez de
-            # renombrar por nuestra cuenta.
             choque = await con.fetchval(
                 "SELECT id FROM cuadrilla_grupos "
-                "WHERE supervisor_id IS NOT DISTINCT FROM $1 AND nombre = $2 "
-                "  AND activo = true AND id <> $3",
-                sup_final, n_final, grupo_id)
+                " WHERE lower(nombre) = lower($1) AND activo = true AND id <> $2",
+                nombre, grupo_id)
             if choque:
-                raise HTTPException(409, (
-                    _ya_existe(n_final, sup_final) if not cambia_sup else
-                    f"Quien la recibe ya tiene una cuadrilla «{n_final}» — "
-                    f"renombra una de las dos"))
+                raise HTTPException(409, _ya_existe(nombre))
             await con.execute(
-                "UPDATE cuadrilla_grupos SET nombre = $2, supervisor_id = $3, "
-                "       asignado_en = CASE WHEN NOT $4 THEN asignado_en "
-                "                          WHEN $3::varchar IS NULL THEN NULL "
-                "                          ELSE now() END "
-                " WHERE id = $1",
-                grupo_id, n_final, sup_final, cambia_sup)
-    return {"ok": True, "id": grupo_id, "nombre": n_final,
-            "supervisor_id": sup_final}
+                "UPDATE cuadrilla_grupos SET nombre = $2 WHERE id = $1",
+                grupo_id, nombre)
+    return {"ok": True, "id": grupo_id, "nombre": nombre}
 
 
 @router.put("/api/cuadrilla-grupo/{grupo_id}/miembros")
@@ -457,7 +417,6 @@ async def reemplazar_miembros_grupo(grupo_id: int, data: dict,
     if len(trab_ids) > MAX_MIEMBROS:
         raise HTTPException(422, f"Máximo {MAX_MIEMBROS} personas por cuadrilla")
     pool = await core_db()
-    await _exigir_dueno_grupo(pool, grupo_id, user)
     async with pool.acquire() as con:
         async with con.transaction():
             await _reemplazar_miembros(con, grupo_id, trab_ids)
@@ -468,7 +427,6 @@ async def reemplazar_miembros_grupo(grupo_id: int, data: dict,
 async def agregar_miembro_grupo(grupo_id: int, trab_id: str,
                                 user: dict = Depends(require_role())):
     pool = await core_db()
-    await _exigir_dueno_grupo(pool, grupo_id, user)
     await pool.execute(
         "INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id, orden) "
         "SELECT $1, $2, COALESCE(MAX(orden) + 1, 0) "
@@ -483,7 +441,6 @@ async def agregar_miembro_grupo(grupo_id: int, trab_id: str,
 async def quitar_miembro_grupo(grupo_id: int, trab_id: str,
                                user: dict = Depends(require_role())):
     pool = await core_db()
-    await _exigir_dueno_grupo(pool, grupo_id, user)
     await pool.execute(
         "DELETE FROM cuadrilla_grupo_miembros WHERE grupo_id = $1 AND trab_id = $2",
         grupo_id, norm_trab_id(trab_id),
@@ -494,10 +451,10 @@ async def quitar_miembro_grupo(grupo_id: int, trab_id: str,
 @router.delete("/api/cuadrilla-grupo/{grupo_id}")
 async def eliminar_cuadrilla_grupo(grupo_id: int,
                                    user: dict = Depends(require_role())):
-    """Baja lógica: el nombre queda libre para reutilizarse y los partes ya
-    enviados no dependen de esta tabla."""
+    """Baja lógica: la cuadrilla desaparece de las listas y los partes ya
+    enviados no dependen de esta tabla. Crear otra con el mismo nombre la
+    revive con su gente en vez de duplicarla."""
     pool = await core_db()
-    await _exigir_dueno_grupo(pool, grupo_id, user)
     await pool.execute(
         "UPDATE cuadrilla_grupos SET activo = false WHERE id = $1", grupo_id)
     return {"ok": True}
