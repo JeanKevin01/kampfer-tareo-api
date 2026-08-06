@@ -2228,11 +2228,12 @@ def main():
           f"SUPE2E={list(de_2e)} SUPE2F={list(de_2f)}")
 
     # K3 — pero cada uno encuentra las SUYAS arriba: 30 listas sin orden es
-    # peor que no tenerlas.
+    # peor que no tenerlas. Desde 0049 «las suyas» son sus HABITUALES, y armar
+    # una la marca habitual de quien la armó (si no, caería al fondo mañana).
     r = c.post(f"{API}/api/cuadrillas/SUPE2F", json={"nombre": "E2E La de dos"})
     orden_2f = list(ve_el_telefono("SUPE2F"))
     orden_2e = list(ve_el_telefono("SUPE2E"))
-    check("K3 cada supervisor ve primero las que armó él",
+    check("K3 cada supervisor ve primero sus habituales",
           r.status_code == 200 and orden_2f[0] == "E2E La de dos"
           and orden_2e[0] != "E2E La de dos",
           f"SUPE2F={orden_2f} SUPE2E={orden_2e}")
@@ -2296,6 +2297,106 @@ def main():
           r.status_code == 200 and fuera and r2.status_code == 200
           and "E2E Compartida sin uno" in catalogo(),
           f"borrar={r.status_code} fuera={fuera} recrear={r2.status_code}")
+
+    # ══════════════════════════════════════════════════════════════
+    # F-HABITUAL — cuáles usa NORMALMENTE cada supervisor (0049)
+    #
+    # Encargo de Jean: «poder asignarle a cada supervisor cuadrillas habituales,
+    # que le aparezcan al inicio y como por separado, y luego las demás». Es un
+    # atajo de PANTALLA: lo que hay que probar no es solo que suban, sino que
+    # NADIE deje de ver ninguna por no tenerla marcada.
+    # ══════════════════════════════════════════════════════════════
+    def habituales_de(sup):
+        rr = c.get(f"{API}/ev/cuadrillas-habituales", params={"supervisor_id": sup})
+        return rr.json().get("habituales", []) if rr.status_code == 200 else []
+
+    def asignacion():
+        rr = c.get(f"{API}/api/cuadrillas-habituales")
+        return {f["supervisor_id"]: f for f in (rr.json() if rr.status_code == 200 else [])}
+
+    cat = catalogo()
+    id_comp = cat["E2E Compartida"]["id"]
+
+    # H1 — armar una cuadrilla la deja como habitual de quien la armó (K3).
+    check("H1 quien arma una cuadrilla la recibe como habitual",
+          "E2E La de dos" in habituales_de("SUPE2F"),
+          f"SUPE2F={habituales_de('SUPE2F')}")
+
+    # H2 — oficina se la asigna a otro: el caso de Jean, un supervisor nuevo que
+    # no ha armado nada y necesita tener a mano las de siempre.
+    r = c.put(f"{API}/api/supervisor/SUPE2E/cuadrillas-habituales",
+              json={"grupos": [id_comp]})
+    check("H2 oficina fija las habituales de un supervisor",
+          r.status_code == 200 and habituales_de("SUPE2E") == ["E2E Compartida"],
+          f"status={r.status_code} SUPE2E={habituales_de('SUPE2E')}")
+
+    # H3 — y en su teléfono sale ARRIBA, que es todo el objetivo.
+    orden_2e = list(ve_el_telefono("SUPE2E"))
+    check("H3 la habitual encabeza la lista del teléfono",
+          orden_2e[:1] == ["E2E Compartida"], f"SUPE2E={orden_2e}")
+
+    # H4 — LO QUE NO DEBE PASAR: asignarla a uno no se la quita a los demás.
+    # Si esto cae, «habitual» se convirtió en propiedad, que es justo el modelo
+    # que Jean descartó.
+    de_2f = ve_el_telefono("SUPE2F")
+    check("H4 marcarla habitual de uno no se la esconde a nadie",
+          "E2E Compartida" in de_2f and "E2E La de dos" in de_2f,
+          f"SUPE2F={list(de_2f)}")
+
+    # H5 — N:M de verdad: la misma cuadrilla es habitual de dos supervisores a
+    # la vez (dos frentes, o el turno que se cubre entre dos).
+    r = c.put(f"{API}/api/supervisor/SUPE2F/cuadrillas-habituales",
+              json={"grupos": [id_comp, cat["E2E La de dos"]["id"]]})
+    asig = asignacion()
+    check("H5 la misma cuadrilla es habitual de dos supervisores",
+          r.status_code == 200
+          and id_comp in asig.get("SUPE2E", {}).get("grupos", [])
+          and id_comp in asig.get("SUPE2F", {}).get("grupos", []),
+          f"status={r.status_code} 2E={asig.get('SUPE2E')} 2F={asig.get('SUPE2F')}")
+
+    # H6 — es un REEMPLAZO: la lista que llega es el estado final, no un alta.
+    r = c.put(f"{API}/api/supervisor/SUPE2F/cuadrillas-habituales",
+              json={"grupos": [id_comp]})
+    check("H6 fijar habituales reemplaza, no acumula",
+          r.status_code == 200 and habituales_de("SUPE2F") == ["E2E Compartida"],
+          f"status={r.status_code} SUPE2F={habituales_de('SUPE2F')}")
+
+    # H7 — vaciarlas es legítimo y devuelve el orden alfabético.
+    r = c.put(f"{API}/api/supervisor/SUPE2F/cuadrillas-habituales", json={"grupos": []})
+    orden_2f = list(ve_el_telefono("SUPE2F"))
+    check("H7 sin habituales, el teléfono vuelve al orden alfabético",
+          r.status_code == 200 and not habituales_de("SUPE2F")
+          and orden_2f == sorted(orden_2f, key=str.lower),
+          f"status={r.status_code} SUPE2F={orden_2f}")
+
+    # H8 — una cuadrilla que no existe se ignora en silencio en vez de reventar:
+    # el panel puede mandar un id que otro acaba de borrar.
+    r = c.put(f"{API}/api/supervisor/SUPE2F/cuadrillas-habituales",
+              json={"grupos": [id_comp, 999999]})
+    check("H8 un id de cuadrilla inexistente se descarta, no rompe",
+          r.status_code == 200 and r.json().get("grupos") == [id_comp],
+          f"status={r.status_code} body={r.text[:160]}")
+
+    # H9 — la asignación en bloque trae a TODOS los supervisores activos, tengan
+    # o no habituales: la pantalla de oficina es la lista completa.
+    asig = asignacion()
+    check("H9 la asignación lista a todo supervisor activo",
+          "SUPE2E" in asig and "SUPE2F" in asig
+          and isinstance(asig["SUPE2E"]["grupos"], list),
+          f"supervisores={sorted(asig)[:6]}")
+
+    # H10 — el borrado de cuadrillas es LÓGICO (activo=false), así que la marca
+    # de habitual sigue en la tabla. Ni el teléfono ni la pantalla de oficina
+    # deben enseñarla: sería una habitual con un nombre que ya no existe.
+    id_dos = catalogo()["E2E La de dos"]["id"]
+    c.put(f"{API}/api/supervisor/SUPE2E/cuadrillas-habituales",
+          json={"grupos": [id_comp, id_dos]})
+    c.delete(f"{API}/api/cuadrilla-grupo/{id_dos}")
+    asig = asignacion()
+    check("H10 una cuadrilla borrada desaparece de las habituales",
+          habituales_de("SUPE2E") == ["E2E Compartida"]
+          and asig.get("SUPE2E", {}).get("grupos") == [id_comp],
+          f"telefono={habituales_de('SUPE2E')} oficina={asig.get('SUPE2E')}")
 
     print()
     if _fallas:

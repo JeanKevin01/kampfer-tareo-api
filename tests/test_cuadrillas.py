@@ -152,7 +152,7 @@ def test_mensaje_de_choque_es_unico():
 # ── Ensamblado de filas planas → cuadrillas ──────────────────
 def _fila(**kw):
     base = {"id": 1, "nombre": "Encofrado", "activo": True, "creado_en": None,
-            "creada_por": None, "creada_por_nombre": None,
+            "creada_por": None, "creada_por_nombre": None, "habitual": False,
             "trab_id": None, "orden": None, "trab_nombre": None, "cargo": None,
             "en_cuantas": None}
     base.update(kw)
@@ -194,3 +194,47 @@ def test_en_otras_nunca_es_negativo():
         filas = [_fila(trab_id="001", orden=0, trab_nombre="A", cargo="PEON", en_cuantas=n)]
         [c] = _ensamblar_cuadrillas(filas)
         assert c["miembros"][0]["en_otras"] == 0
+
+
+# ── Cuadrillas habituales (0049) ─────────────────────────────
+# Cuáles usa NORMALMENTE cada supervisor: le salen arriba y aparte en el
+# teléfono. No es propiedad ni permiso — la lista entera se sigue viendo.
+def test_habitual_se_propaga_al_ensamblar():
+    [c] = _ensamblar_cuadrillas([_fila(habitual=True)])
+    assert c["habitual"] is True
+
+
+def test_habitual_es_bool_aunque_falte_la_columna():
+    """El catálogo sin supervisor no la trae; el panel no debe recibir None."""
+    fila = _fila()
+    del fila["habitual"]
+    [c] = _ensamblar_cuadrillas([fila])
+    assert c["habitual"] is False
+
+
+def test_fijar_habituales_ajenas_403():
+    r = _client().put("/api/supervisor/02/cuadrillas-habituales",
+                      json={"grupos": [1]}, headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_fijar_habituales_sin_lista_422():
+    """Sin la lista no se distingue «déjalo vacío» de «no me la mandes»: con un
+    reemplazo eso es la diferencia entre borrarlas todas y no tocar nada."""
+    for cuerpo in ({}, {"grupos": None}, {"grupos": "1,2"}):
+        r = _client().put("/api/supervisor/01/cuadrillas-habituales",
+                          json=cuerpo, headers=_hdr("oficina"))
+        assert r.status_code == 422, cuerpo
+
+
+def test_fijar_habituales_vacias_no_es_422():
+    """Quitarle todas las habituales es una operación legítima."""
+    r = _client().put("/api/supervisor/01/cuadrillas-habituales",
+                      json={"grupos": []}, headers=_hdr("oficina"))
+    assert r.status_code not in (401, 403, 422)
+
+
+def test_supervisor_no_lee_la_asignacion_completa():
+    """Quién usa qué es vista de oficina; el teléfono pide solo la suya."""
+    r = _client().get("/api/cuadrillas-habituales", headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403

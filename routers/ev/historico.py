@@ -14,6 +14,8 @@ from pydantic import BaseModel, Field  # noqa: F401
 
 from core.auth import exigir_identidad_supervisor, require_role
 from core.db import db  # noqa: F401
+# Una sola regla de «quien la arma la usa», compartida con el alta del panel.
+from core.cuadrillas import marcar_habitual as _marcar_habitual
 from core.ids import ids_unicos as _ids_unicos
 from core.log import get_logger
 from core.tiempo import LIMA, semana_de as _semana_de  # noqa: F401
@@ -56,11 +58,13 @@ async def listar_cuadrillas_plantilla(
     supervisor_id: str,
     otm_id: str | None = None,   # aceptado por compat; ya no filtra
 ):
-    """TODAS las cuadrillas, con las que armó ESTE supervisor primero.
+    """TODAS las cuadrillas, con las HABITUALES de este supervisor primero.
 
     Desde 0048 son libres: si hoy le toca el frente de otro, quiere su lista sin
     tener que pedirla. El orden es lo que evita que eso sea una lista larga
-    donde la suya está enterrada — el dict conserva el orden en JSON."""
+    donde la suya está enterrada — el dict conserva el orden en JSON. Cuáles son
+    habituales se pide aparte (`/ev/cuadrillas-habituales`) para no tocar este
+    shape, que lo consume el index.html ya desplegado en los teléfonos."""
     pool = await db()
     async with pool.acquire() as con:
         rows = await con.fetch(
@@ -71,8 +75,10 @@ async def listar_cuadrillas_plantilla(
                LEFT JOIN cuadrilla_grupo_miembros m ON m.grupo_id = g.id
                LEFT JOIN trabajadores t ON t.id = m.trab_id AND t.activo = TRUE
                WHERE g.activo = TRUE
-               ORDER BY (g.creada_por IS DISTINCT FROM $1), lower(g.nombre),
-                        m.orden, t.nombre""",
+               ORDER BY (NOT EXISTS (SELECT 1 FROM cuadrilla_habituales h
+                                      WHERE h.grupo_id = g.id
+                                        AND h.supervisor_id = $1)),
+                        lower(g.nombre), m.orden, t.nombre""",
             supervisor_id
         )
         # El LEFT JOIN mantiene visible la cuadrilla que se quedó sin miembros
@@ -92,6 +98,28 @@ async def listar_cuadrillas_plantilla(
                 "orden":         r["orden"],
             })
         return plantillas
+
+
+@router_campo.get("/cuadrillas-habituales")
+async def listar_cuadrillas_habituales(supervisor_id: str):
+    """Nombres de las cuadrillas habituales de ese supervisor.
+
+    Endpoint aparte y no un campo dentro de `/cuadrillas-plantilla` porque ese
+    shape es `{nombre: [miembros]}` y lo consume el teléfono ya desplegado:
+    meterle una clave especial la convertiría en una cuadrilla fantasma. Van
+    nombres y no ids porque el teléfono indexa las plantillas por nombre, que
+    desde 0048 es único en toda la empresa."""
+    pool = await db()
+    async with pool.acquire() as con:
+        rows = await con.fetch(
+            """SELECT g.nombre
+                 FROM cuadrilla_habituales h
+                 JOIN cuadrilla_grupos g ON g.id = h.grupo_id AND g.activo
+                WHERE h.supervisor_id = $1
+                ORDER BY lower(g.nombre)""",
+            supervisor_id
+        )
+        return {"habituales": [r["nombre"] for r in rows]}
 
 
 @router_campo.post("/cuadrillas-plantilla")
@@ -135,6 +163,9 @@ async def guardar_cuadrilla_plantilla(
                        VALUES ($1,$2,$3) ON CONFLICT DO NOTHING""",
                     gid, tid, idx
                 )
+            # La guardó desde su teléfono: mañana la quiere arriba, no revuelta
+            # con las de todos.
+            await _marcar_habitual(con, supervisor_id, gid)
     return {"ok": True, "nombre": nombre, "total": len(_ids_unicos(trabajadores))}
 
 

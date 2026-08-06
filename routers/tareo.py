@@ -9,6 +9,7 @@ from datetime import date
 from fastapi import APIRouter, Depends, HTTPException
 
 from core.auth import exigir_identidad_supervisor, require_role
+from core.cuadrillas import marcar_habitual
 from core.db import db as core_db
 from core.ids import ids_unicos, norm_trab_id
 from core.log import get_logger
@@ -112,13 +113,17 @@ def _nombre_cuadrilla(valor) -> str:
     return n
 
 
-async def _grupo_habitual(con, supervisor_id: str) -> int:
+async def _grupo_compat_supervisor(con, supervisor_id: str) -> int:
     """Id de «la cuadrilla de fulano», creándola si hace falta.
 
     Sostiene los tres endpoints `/api/cuadrilla/{sup}` de abajo, que son de
     antes de que existieran las cuadrillas nombradas y manejan UNA sola lista.
     El nombre lleva el supervisor porque desde 0048 es único en toda la empresa:
-    una «Cuadrilla habitual» a secas se la quedaría el primero que la creara.
+    una «Cuadrilla de siempre» a secas se la quedaría el primero que la creara.
+
+    Nada que ver con las cuadrillas HABITUALES de 0049 (`cuadrilla_habituales`):
+    esto es la lista única de un supervisor en el admin viejo; aquello es qué
+    cuadrillas del catálogo usa normalmente cada uno.
     """
     return await _crear_o_reactivar(
         con, supervisor_id, f"Cuadrilla de {supervisor_id}")
@@ -150,7 +155,7 @@ async def agregar_cuadrilla(supervisor_id: str, trab_id: str,
     pool = await core_db()
     async with pool.acquire() as con:
         async with con.transaction():
-            gid = await _grupo_habitual(con, supervisor_id)
+            gid = await _grupo_compat_supervisor(con, supervisor_id)
             await con.execute(
                 "INSERT INTO cuadrilla_grupo_miembros (grupo_id, trab_id, orden) "
                 "SELECT $1, $2, COALESCE(MAX(orden) + 1, 0) "
@@ -183,9 +188,19 @@ async def quitar_cuadrilla(supervisor_id: str, trab_id: str,
 # listas compartidas eso es normal —la misma persona sale en varias— pero sigue
 # valiendo como aviso: si dos supervisores la tarean el mismo día son HH
 # duplicadas, y eso hoy solo se descubre después en /ev/conflictos.
+#
+# `habitual` (0049) es cuáles usa NORMALMENTE ese supervisor. Es un atajo de
+# pantalla, no un permiso: la lista completa se ve igual, las habituales solo
+# van arriba y separadas. Ordenar por `creada_por` era un apaño — quien armó la
+# lista no es necesariamente quien la usa, y un supervisor que entra hoy no ha
+# armado ninguna.
+_ES_HABITUAL = ("EXISTS (SELECT 1 FROM cuadrilla_habituales h"
+                "         WHERE h.grupo_id = g.id AND h.supervisor_id = $1)")
+
 _CUADRILLAS_SQL = """
     SELECT g.id, g.nombre, g.activo, g.creado_en,
            g.creada_por, s.nombre AS creada_por_nombre,
+           {habitual} AS habitual,
            m.trab_id, m.orden, t.nombre AS trab_nombre, t.cargo,
            (SELECT COUNT(*) FROM cuadrilla_grupo_miembros m2
               JOIN cuadrilla_grupos g2 ON g2.id = m2.grupo_id AND g2.activo
@@ -208,6 +223,7 @@ def _ensamblar_cuadrillas(rows) -> list:
             "creado_en": r["creado_en"],
             "creada_por": r.get("creada_por"),
             "creada_por_nombre": r.get("creada_por_nombre"),
+            "habitual": bool(r.get("habitual")),
             "miembros": [],
         })
         # trab_nombre NULL = la fila del LEFT JOIN de un grupo vacío, o un
@@ -226,23 +242,92 @@ def _ensamblar_cuadrillas(rows) -> list:
 
 @router.get("/api/cuadrillas")
 async def catalogo_cuadrillas():
-    """El catálogo entero, por orden alfabético."""
+    """El catálogo entero, por orden alfabético.
+
+    Sin supervisor en el path no hay a quién medirle lo habitual: `habitual`
+    sale false para todas. Quién tiene cuáles se pide en bloque por
+    `/api/cuadrillas-habituales`."""
     pool = await core_db()
-    rows = await pool.fetch(_CUADRILLAS_SQL.format(orden="lower(g.nombre)"))
+    rows = await pool.fetch(
+        _CUADRILLAS_SQL.format(habitual="FALSE", orden="lower(g.nombre)"))
     return _ensamblar_cuadrillas(rows)
 
 
 @router.get("/api/cuadrillas/{supervisor_id}")
 async def listar_cuadrilla_grupos(supervisor_id: str):
     """Las mismas cuadrillas que ve ese supervisor en su teléfono: TODAS, con
-    las que armó él arriba. Path y shape intactos; lo que cambió es que ya no
-    son «las suyas» sino el catálogo ordenado para él."""
+    sus habituales arriba. Path y shape intactos (`habitual` es aditivo)."""
     pool = await core_db()
     rows = await pool.fetch(
         _CUADRILLAS_SQL.format(
-            orden="(g.creada_por IS DISTINCT FROM $1), lower(g.nombre)"),
+            habitual=_ES_HABITUAL,
+            orden=f"(NOT {_ES_HABITUAL}), lower(g.nombre)"),
         supervisor_id)
     return _ensamblar_cuadrillas(rows)
+
+
+# ── Quién usa habitualmente qué ───────────────────────────────
+@router.get("/api/cuadrillas-habituales")
+async def cuadrillas_habituales(user: dict = Depends(require_role("oficina"))):
+    """La asignación entera, un renglón por supervisor activo.
+
+    En bloque y no por supervisor porque la pantalla de oficina las pinta todas
+    a la vez, y así una sola consulta sirve para el sentido contrario («de quién
+    es habitual esta cuadrilla») sin pedir nada más."""
+    pool = await core_db()
+    rows = await pool.fetch(
+        # Se agrega `g.id` y no `h.grupo_id`: el LEFT JOIN filtra por activo
+        # dejando g en NULL, pero h.grupo_id sigue lleno. Agregando por h una
+        # cuadrilla BORRADA seguiría saliendo marcada en la pantalla de oficina,
+        # con un nombre que ya no existe.
+        """SELECT s.id, s.nombre,
+                  COALESCE(ARRAY_AGG(g.id ORDER BY g.id)
+                           FILTER (WHERE g.id IS NOT NULL),
+                           '{}')::int[] AS grupos
+             FROM supervisores s
+             LEFT JOIN cuadrilla_habituales h ON h.supervisor_id = s.id
+             LEFT JOIN cuadrilla_grupos g ON g.id = h.grupo_id AND g.activo
+            WHERE s.activo = true
+            GROUP BY s.id, s.nombre
+            ORDER BY s.nombre""")
+    return [{"supervisor_id": r["id"], "nombre": r["nombre"],
+             "grupos": list(r["grupos"])} for r in rows]
+
+
+@router.put("/api/supervisor/{supervisor_id}/cuadrillas-habituales")
+async def fijar_cuadrillas_habituales(supervisor_id: str, data: dict,
+                                      user: dict = Depends(require_role())):
+    """Deja a ese supervisor exactamente con esas habituales.
+
+    Reemplazo y no alta/baja suelta porque la pantalla es una lista de casillas:
+    manda el estado final y no hay que reconstruir qué se marcó y qué se
+    desmarcó. Marcar una cuadrilla no da ningún permiso — todos las ven todas."""
+    exigir_identidad_supervisor(user, supervisor_id)
+    grupos = data.get("grupos")
+    if not isinstance(grupos, list):
+        raise HTTPException(422, "Falta la lista de cuadrillas («grupos»)")
+    ids = sorted({int(g) for g in grupos if str(g).strip().lstrip("-").isdigit()})
+
+    pool = await core_db()
+    async with pool.acquire() as con:
+        async with con.transaction():
+            if not await con.fetchval(
+                    "SELECT 1 FROM supervisores WHERE id = $1", supervisor_id):
+                raise HTTPException(404, "Ese supervisor no existe")
+            # Solo cuadrillas vivas: marcar una borrada dejaría una habitual
+            # invisible que reaparece si alguien recrea ese nombre.
+            vivas = [r["id"] for r in await con.fetch(
+                "SELECT id FROM cuadrilla_grupos WHERE id = ANY($1::int[]) AND activo",
+                ids)]
+            await con.execute(
+                "DELETE FROM cuadrilla_habituales WHERE supervisor_id = $1",
+                supervisor_id)
+            for gid in vivas:
+                await con.execute(
+                    "INSERT INTO cuadrilla_habituales (supervisor_id, grupo_id) "
+                    "VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    supervisor_id, gid)
+    return {"ok": True, "supervisor_id": supervisor_id, "grupos": vivas}
 
 
 @router.get("/api/trabajadores-sin-cuadrilla")
@@ -302,6 +387,7 @@ async def _crear_cuadrilla(creada_por, data: dict) -> dict:
                 raise HTTPException(409, _ya_existe(nombre))
             grupo_id = await _crear_o_reactivar(con, creada_por, nombre)
             await _reemplazar_miembros(con, grupo_id, trab_ids)
+            await marcar_habitual(con, creada_por, grupo_id)
     return {"ok": True, "id": grupo_id, "nombre": nombre,
             "creada_por": creada_por, "total": len(trab_ids)}
 
