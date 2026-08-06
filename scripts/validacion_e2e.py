@@ -76,8 +76,13 @@ def limpiar_y_sembrar(cur):
     # semilla del arranque del API.
     cur.execute("DELETE FROM usuarios WHERE supervisor_id='SUPE2F'")
     cur.execute("DELETE FROM cuadrillas WHERE supervisor_id='SUPE2F'")
-    # Cuadrillas del bloque F-CUADRILLA (los miembros se van por cascada).
+    # Cuadrillas de F-CUADRILLA y F-CATALOGO (los miembros se van por cascada).
+    # Las del catálogo NO tienen supervisor, así que el filtro por supervisor no
+    # las alcanza: sin la segunda línea sobreviven al run y la pasada siguiente
+    # choca de nombre contra su propia basura.
     cur.execute("DELETE FROM cuadrilla_grupos WHERE supervisor_id IN ('SUPE2E','SUPE2F')")
+    cur.execute("DELETE FROM cuadrilla_grupos "
+                " WHERE supervisor_id IS NULL AND nombre LIKE 'E2E %'")
     cur.execute("DELETE FROM supervisores WHERE id='SUPE2F'")
     cur.execute("DELETE FROM ev_avances WHERE hito_id IN (SELECT id FROM ev_hitos WHERE "
                 "partida_id IN (SELECT id FROM ev_partidas WHERE codigo LIKE 'E2E-%'))")
@@ -2190,6 +2195,107 @@ def main():
     r = c.post(f"{API}/api/cuadrillas/SUPE2E", json={"nombre": ""})
     check("C9 cuadrilla sin nombre rebota con 422", r.status_code == 422,
           f"status={r.status_code}")
+
+    # ══════════════════════════════════════════════════════════════
+    # F-CATALOGO — la cuadrilla existe sola y el supervisor se asigna (0047)
+    #
+    # Lo que rota en obra es el mando, no la gente: entra un supervisor nuevo y
+    # su cuadrilla es «la de fulano», no una lista en blanco. Estos checks
+    # cubren el ciclo que antes obligaba a teclearla otra vez.
+    # ══════════════════════════════════════════════════════════════
+    def catalogo():
+        rr = c.get(f"{API}/api/cuadrillas")
+        return {g["nombre"]: g for g in (rr.json() if rr.status_code == 200 else [])}
+
+    # K1 — nace sin dueño: la gente se arma antes de saber quién la dirigirá.
+    r = c.post(f"{API}/api/cuadrillas",
+               json={"nombre": "E2E Pool", "trab_ids": ["901", "902"]})
+    cat = catalogo()
+    check("K1 se crea una cuadrilla SIN supervisor y sale en el catálogo",
+          r.status_code == 200 and cat.get("E2E Pool", {}).get("supervisor_id") is None
+          and cat["E2E Pool"]["total"] == 2,
+          f"status={r.status_code} body={r.text[:200]}")
+
+    # K2 — el catálogo ve TODAS, no solo las de un supervisor.
+    check("K2 el catálogo trae también las que ya tienen supervisor",
+          "E2E Encofrado" in cat
+          and cat["E2E Encofrado"]["supervisor_id"] == "SUPE2E"
+          and cat["E2E Encofrado"]["supervisor_nombre"],
+          f"catálogo={ {k: v['supervisor_id'] for k, v in cat.items()} }")
+
+    # K3 — asignarla: aparece en el teléfono de quien la recibe.
+    pool_id = cat["E2E Pool"]["id"]
+    r = c.patch(f"{API}/api/cuadrilla-grupo/{pool_id}", json={"supervisor_id": "SUPE2E"})
+    campo = cuadrillas_campo()
+    check("K3 al asignarla, el supervisor la ve en su teléfono",
+          r.status_code == 200 and "E2E Pool" in campo and len(campo["E2E Pool"]) == 2
+          and catalogo()["E2E Pool"]["asignado_en"],
+          f"status={r.status_code} campo={list(campo)}")
+
+    # K4 — reasignar a otro: sale de uno y entra en el otro. Un solo dueño.
+    r = c.patch(f"{API}/api/cuadrilla-grupo/{pool_id}", json={"supervisor_id": "SUPE2F"})
+    otro = c.get(f"{API}/ev/cuadrillas-plantilla", params={"supervisor_id": "SUPE2F"}).json()
+    check("K4 reasignar la mueve de un teléfono al otro",
+          r.status_code == 200 and "E2E Pool" in otro
+          and "E2E Pool" not in cuadrillas_campo(),
+          f"status={r.status_code} SUPE2F={list(otro)}")
+
+    # K5 — renombrar NO desasigna: el PATCH solo toca lo que viene en el cuerpo.
+    r = c.patch(f"{API}/api/cuadrilla-grupo/{pool_id}", json={"nombre": "E2E Pool 2"})
+    check("K5 renombrar no se lleva por delante la asignación",
+          r.status_code == 200
+          and catalogo().get("E2E Pool 2", {}).get("supervisor_id") == "SUPE2F",
+          f"status={r.status_code}")
+
+    # K6 — devolverla al catálogo cuando el supervisor se va.
+    r = c.patch(f"{API}/api/cuadrilla-grupo/{pool_id}", json={"supervisor_id": None})
+    check("K6 desasignar la devuelve al catálogo sin perder su gente",
+          r.status_code == 200
+          and catalogo()["E2E Pool 2"]["supervisor_id"] is None
+          and catalogo()["E2E Pool 2"]["total"] == 2,
+          f"status={r.status_code}")
+
+    # K7 — DUPLICAR: el atajo del supervisor nuevo.
+    r = c.post(f"{API}/api/cuadrilla-grupo/{pool_id}/duplicar",
+               json={"nombre": "E2E Copia", "supervisor_id": "SUPE2E"})
+    campo = cuadrillas_campo()
+    check("K7 duplicar copia la gente al supervisor nuevo",
+          r.status_code == 200 and "E2E Copia" in campo
+          and [m["trabajador_id"] for m in campo["E2E Copia"]] == ["901", "902"],
+          f"status={r.status_code} campo={list(campo)}")
+
+    # K8 — la copia es independiente: editarla no toca al original.
+    copia_id = catalogo()["E2E Copia"]["id"]
+    c.delete(f"{API}/api/cuadrilla-grupo/{copia_id}/miembro/902")
+    cat = catalogo()
+    check("K8 la copia va por su cuenta: quitar a uno no afecta al original",
+          cat["E2E Copia"]["total"] == 1 and cat["E2E Pool 2"]["total"] == 2,
+          f"copia={cat['E2E Copia']['total']} original={cat['E2E Pool 2']['total']}")
+
+    # K9 — el aviso que evita el doble tareo: 901 está en las dos.
+    m901 = [m for m in cat["E2E Copia"]["miembros"] if m["trab_id"] == "901"]
+    check("K9 avisa que esa persona está en más de una cuadrilla",
+          len(m901) == 1 and m901[0]["en_otras"] >= 1,
+          f"miembro={m901}")
+
+    # K10 — chocar de nombre al reasignar se avisa, no se renombra por su cuenta.
+    r = c.post(f"{API}/api/cuadrilla-grupo/{copia_id}/duplicar",
+               json={"nombre": "E2E Copia", "supervisor_id": "SUPE2E"})
+    r2 = c.patch(f"{API}/api/cuadrilla-grupo/{pool_id}",
+                 json={"nombre": "E2E Copia", "supervisor_id": "SUPE2E"})
+    check("K10 nombre repetido en el destino: 409 en duplicar y en reasignar",
+          r.status_code == 409 and r2.status_code == 409,
+          f"duplicar={r.status_code} reasignar={r2.status_code}")
+
+    # K11 — dos sin asignar con el mismo nombre son indistinguibles en el catálogo.
+    r = c.post(f"{API}/api/cuadrillas", json={"nombre": "E2E Pool 2"})
+    check("K11 el catálogo no admite dos «sin asignar» con el mismo nombre",
+          r.status_code == 409, f"status={r.status_code}")
+
+    # K12 — no se puede endosar una cuadrilla a alguien que no existe.
+    r = c.patch(f"{API}/api/cuadrilla-grupo/{pool_id}", json={"supervisor_id": "NO-EXISTE"})
+    check("K12 asignar a un supervisor inexistente rebota con 422",
+          r.status_code == 422, f"status={r.status_code}")
 
     print()
     if _fallas:

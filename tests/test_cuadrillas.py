@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from core import auth, config
 from core.ids import ids_unicos, norm_trab_id
-from routers.tareo import _nombre_cuadrilla
+from routers.tareo import _ensamblar_cuadrillas, _nombre_cuadrilla, _ya_existe
 import main
 
 
@@ -112,3 +112,82 @@ def test_guardar_plantilla_propia_pasa():
 def test_oficina_gestiona_cualquier_cuadrilla():
     r = _client().post("/api/cuadrillas/02", json={"nombre": "X"}, headers=_hdr("oficina"))
     assert r.status_code not in (401, 403)
+
+
+# ── Cuadrillas asignables (0047) ─────────────────────────────
+def test_supervisor_no_reasigna():
+    """Repartir cuadrillas es de oficina: un supervisor no decide quién dirige qué."""
+    r = _client().patch("/api/cuadrilla-grupo/1", json={"supervisor_id": "02"},
+                        headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_supervisor_no_crea_en_el_catalogo():
+    r = _client().post("/api/cuadrillas", json={"nombre": "X"},
+                       headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_supervisor_no_duplica():
+    r = _client().post("/api/cuadrilla-grupo/1/duplicar", json={},
+                       headers=_hdr("supervisor", "01"))
+    assert r.status_code == 403
+
+
+def test_patch_vacio_422():
+    """Sin `nombre` ni `supervisor_id` no hay nada que hacer; que no pase por
+    silencio, porque un cuerpo mal armado se vería como éxito."""
+    r = _client().patch("/api/cuadrilla-grupo/1", json={}, headers=_hdr("oficina"))
+    assert r.status_code == 422
+
+
+def test_mensaje_de_choque_distingue_el_pool():
+    assert "sin asignar" in _ya_existe("Encofrado", None)
+    assert "sin asignar" not in _ya_existe("Encofrado", "01")
+
+
+# ── Ensamblado de filas planas → cuadrillas ──────────────────
+def _fila(**kw):
+    base = {"id": 1, "nombre": "Encofrado", "activo": True, "creado_en": None,
+            "asignado_en": None, "supervisor_id": None, "supervisor_nombre": None,
+            "trab_id": None, "orden": None, "trab_nombre": None, "cargo": None,
+            "en_cuantas": None}
+    base.update(kw)
+    return base
+
+
+def test_ensamblar_agrupa_y_ordena():
+    filas = [
+        _fila(trab_id="002", orden=0, trab_nombre="B", cargo="OFICIAL", en_cuantas=1),
+        _fila(trab_id="001", orden=1, trab_nombre="A", cargo="PEON", en_cuantas=1),
+    ]
+    [c] = _ensamblar_cuadrillas(filas)
+    assert c["total"] == 2
+    assert [m["trab_id"] for m in c["miembros"]] == ["002", "001"]
+
+
+def test_ensamblar_conserva_la_cuadrilla_vacia():
+    """El LEFT JOIN de un grupo sin miembros trae una fila con todo en NULL: la
+    cuadrilla tiene que seguir apareciendo, vacía, no desaparecer."""
+    [c] = _ensamblar_cuadrillas([_fila()])
+    assert c["total"] == 0 and c["miembros"] == []
+
+
+def test_ensamblar_descarta_al_dado_de_baja():
+    """trab_id con trab_nombre NULL = el JOIN filtró por activo: ya no puede tarear."""
+    [c] = _ensamblar_cuadrillas([_fila(trab_id="009", orden=0, en_cuantas=1)])
+    assert c["total"] == 0
+
+
+def test_en_otras_descuenta_la_propia():
+    filas = [_fila(trab_id="001", orden=0, trab_nombre="A", cargo="PEON", en_cuantas=3)]
+    [c] = _ensamblar_cuadrillas(filas)
+    assert c["miembros"][0]["en_otras"] == 2
+
+
+def test_en_otras_nunca_es_negativo():
+    """Si el conteo llegara en 0 o NULL, restar 1 daría «-1 cuadrillas»."""
+    for n in (None, 0):
+        filas = [_fila(trab_id="001", orden=0, trab_nombre="A", cargo="PEON", en_cuantas=n)]
+        [c] = _ensamblar_cuadrillas(filas)
+        assert c["miembros"][0]["en_otras"] == 0
