@@ -31,6 +31,15 @@ DB = os.environ["DATABASE_URL"]
 FECHA_BASE = "2026-06-01"   # lunes → semana 1 = 2026-06-01..07
 FECHA_TAREO = "2026-06-02"  # martes de la semana 1
 
+# ── Semilla del WBS: HOJAS (con fase) vs CABECERA (fase NULL) ────────────────
+# Los totales del EV se calculan SOLO sobre hojas. Que estos números vivan aquí
+# permite que EV3 compruebe la suma exacta en vez de afirmarlo de palabra.
+HOJAS_EV = (("E2E-001", 100, 10), ("E2E-002", 50, 5))   # (codigo, hh_presup, metrado)
+HH_PARTIDA_PROG = 100000        # las 12 partidas desechables de programación
+N_PARTIDAS_PROG = 12
+HH_CABECERA_WBS = 777           # HH de la cabecera del WBS. NO puede aparecer
+METRADO_CABECERA_WBS = 999      # en ningún total: ver el check EV3.
+
 _fallas = []
 
 
@@ -125,7 +134,7 @@ def limpiar_y_sembrar(cur):
                 "ON CONFLICT (clave) DO UPDATE SET valor=%s", (FECHA_BASE, FECHA_BASE))
 
     partidas = {}
-    for codigo, hh_presup, metrado in (("E2E-001", 100, 10), ("E2E-002", 50, 5)):
+    for codigo, hh_presup, metrado in HOJAS_EV:
         cur.execute(
             "INSERT INTO ev_partidas (codigo, fase, descripcion, unidad, metrado_presup, "
             "hh_presup, otm_id) VALUES (%s,'F-E2E',%s,'und',%s,%s,'OTM-E2E') RETURNING id",
@@ -142,21 +151,28 @@ def limpiar_y_sembrar(cur):
     # `fase is not None`. Sin una cabecera sembrada, los datos del humo no tienen
     # la forma de los de producción y endpoints enteros pueden estar caídos sin
     # que nada avise (fue el caso de /ev/curva-fase). Ver check EV1.
+    #
+    # Lleva HH ADREDE (HH_CABECERA_WBS, un número que no sale por casualidad):
+    # en producción las cabeceras traen `hh_presup > 0` —lo verificó la auditoría
+    # sobre la BD real— y si la semilla las pusiera a cero, EV3 no podría
+    # detectar que se cuelan en los totales: contaminar con cero no se nota.
     cur.execute(
         "INSERT INTO ev_partidas (codigo, fase, descripcion, unidad, metrado_presup, "
-        "hh_presup, otm_id) VALUES ('E2E-WBS', NULL, 'Cabecera de WBS E2E', 'und', 0, 0, "
-        "'OTM-E2E') RETURNING id")
+        "hh_presup, otm_id) VALUES ('E2E-WBS', NULL, 'Cabecera de WBS E2E', 'und', %s, %s, "
+        "'OTM-E2E') RETURNING id",
+        (METRADO_CABECERA_WBS, HH_CABECERA_WBS))
     partidas["E2E-WBS"] = {"id": cur.fetchone()[0]}
 
     # Partidas DESECHABLES para las pruebas de programación (calendario, plazos,
     # vínculos): desde 0034 una actividad con metrado exige partida, y esas
     # pruebas necesitan una limpia —sin avances registrados— para que el
     # prorrateo salga predecible. Una por actividad, para que no se estorben.
-    for i in range(1, 13):
+    for i in range(1, N_PARTIDAS_PROG + 1):
         cur.execute(
             "INSERT INTO ev_partidas (codigo, fase, descripcion, unidad, metrado_presup, "
-            "hh_presup, otm_id) VALUES (%s,'F-E2E',%s,'und',100000,100000,'OTM-E2E') RETURNING id",
-            (f"E2E-L{i:02d}", f"Partida de programación {i}"))
+            "hh_presup, otm_id) VALUES (%s,'F-E2E',%s,'und',%s,%s,'OTM-E2E') RETURNING id",
+            (f"E2E-L{i:02d}", f"Partida de programación {i}",
+             HH_PARTIDA_PROG, HH_PARTIDA_PROG))
         pid = cur.fetchone()[0]
         cur.execute(
             "INSERT INTO ev_hitos (partida_id, numero, descripcion, peso, es_principal) "
@@ -295,16 +311,47 @@ def main():
     check("EV2 ningun endpoint del EV cae por la cabecera de WBS",
           not caidos, f"caidos={caidos}")
 
-    # La cabecera NO debe contaminar los totales: aporta 0 al BAC porque no es
-    # hoja. Es la garantía de que filtrar por `fase` sigue siendo el criterio.
+    # La cabecera NO debe contaminar los totales: el detalle la incluye, pero las
+    # sumas se calculan SOLO sobre hojas. Es la garantía de que filtrar por
+    # `fase` sigue siendo el criterio en todo el motor.
+    #
+    # La 1ª versión de este check comparaba "E2E-WBS" contra `por_fase`, que
+    # agrupa por FASE y no por código: la condición no podía fallar jamás, ni
+    # quitando el filtro. Un check que no puede fallar da confianza sin haberla
+    # ganado — exactamente lo que dejó /ev/curva-fase caído semanas. Ahora se
+    # comprueban las dos cosas que sí distinguen:
+    #   · si la cabecera se colara en las hojas, `_agrupar(hojas,"fase")` la
+    #     metería en el grupo "SIN ASIGNAR" (`f[clave] or "SIN ASIGNAR"`);
+    #   · y sus 777 HH aparecerían en `totales.hh_presup`.
+    #
+    # El total NO se compara contra una constante: otros checks siembran más
+    # partidas en OTM-E2E (la fase CIV, por ejemplo), así que la cifra absoluta
+    # depende del orden de ejecución. Se compara contra la suma de las HOJAS de
+    # la propia respuesta, que es la definición de lo que el total debe ser.
+    # PRUEBA DE CONTROL: cambiar `hojas` por `filas` en isp.py::reporte y EV3
+    # tiene que caer por los dos motivos a la vez.
     r = c.get(f"{API}/ev/reporte", params={"semana": 3, "otm": "OTM-E2E"})
     rep = r.json() if r.status_code == 200 else {}
-    cods_rep = [p.get("codigo") for p in rep.get("partidas", [])]
+    detalle = rep.get("partidas", [])
+    cods_rep = [p.get("codigo") for p in detalle]
     grupos_fase = [g.get("grupo") for g in rep.get("por_fase", [])]
-    check("EV3 la cabecera sale en el detalle pero no como grupo de fase",
-          r.status_code == 200 and "E2E-WBS" in cods_rep
-          and "E2E-WBS" not in grupos_fase,
-          f"status={r.status_code} en_detalle={'E2E-WBS' in cods_rep} grupos={grupos_fase[:6]}")
+    hh_presup_tot = (rep.get("totales") or {}).get("hh_presup")
+    suma_hojas = round(sum(p.get("hh_presup") or 0
+                           for p in detalle if p.get("fase") is not None), 2)
+    # Sin esta línea el check pasaría también con una cabecera de 0 HH, que es
+    # justo el agujero que tenía la 1ª versión: no se puede detectar
+    # contaminación cuando lo que contamina vale cero.
+    cabeceras_con_hh = [p.get("codigo") for p in detalle
+                        if p.get("fase") is None and (p.get("hh_presup") or 0) > 0]
+    check("EV3 la cabecera sale en el detalle y NO suma en los totales",
+          r.status_code == 200
+          and "E2E-WBS" in cods_rep                 # está en el detalle
+          and "E2E-WBS" in cabeceras_con_hh         # y con HH, si no no prueba nada
+          and "SIN ASIGNAR" not in grupos_fase      # no se coló como hoja sin fase
+          and hh_presup_tot == suma_hojas,          # el total = solo hojas
+          f"status={r.status_code} en_detalle={'E2E-WBS' in cods_rep} "
+          f"cabeceras_con_hh={cabeceras_con_hh} grupos={grupos_fase[:6]} "
+          f"hh_presup={hh_presup_tot} suma_hojas={suma_hojas}")
 
     # F-FASES — catálogo de fases (migración 0018 + CRUD)
     r = c.get(f"{API}/ev/fases", params={"proyecto_id": 1})
