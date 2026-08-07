@@ -253,7 +253,11 @@ async def curva_fase(hasta: int, otm: Optional[str] = None):
         {a["semana"] for a in avances} | {r["semana"] for r in hh}
         | {s for (_, s) in tareo.keys()} | {hasta}
     )
-    fases = sorted({p["fase"] for p in partidas})
+    # `fase is not None` = es HOJA. Misma convención que `reporte` (arriba): los nodos
+    # padre del WBS vienen sin fase. Sin este filtro el set mezcla None con str y el
+    # sorted() revienta con TypeError — 500 en cuanto el proyecto tiene un WBS con
+    # cabeceras, que es el caso normal en producción.
+    fases = sorted({p["fase"] for p in partidas if p["fase"] is not None})
     serie = []
     for s in semanas_set:
         if s > hasta:

@@ -136,6 +136,18 @@ def limpiar_y_sembrar(cur):
             "VALUES (%s,1,'Ejecución',1.0,true) RETURNING id", (pid,))
         partidas[codigo] = {"id": pid, "hito_id": cur.fetchone()[0]}
 
+    # CABECERA del WBS: partida SIN fase (fase NULL). Es la forma que tiene un
+    # nodo padre en producción —los crea el importador de partidas, no el POST
+    # de la API, que exige fase— y es lo que distingue una HOJA de un padre:
+    # `fase is not None`. Sin una cabecera sembrada, los datos del humo no tienen
+    # la forma de los de producción y endpoints enteros pueden estar caídos sin
+    # que nada avise (fue el caso de /ev/curva-fase). Ver check EV1.
+    cur.execute(
+        "INSERT INTO ev_partidas (codigo, fase, descripcion, unidad, metrado_presup, "
+        "hh_presup, otm_id) VALUES ('E2E-WBS', NULL, 'Cabecera de WBS E2E', 'und', 0, 0, "
+        "'OTM-E2E') RETURNING id")
+    partidas["E2E-WBS"] = {"id": cur.fetchone()[0]}
+
     # Partidas DESECHABLES para las pruebas de programación (calendario, plazos,
     # vínculos): desde 0034 una actividad con metrado exige partida, y esas
     # pruebas necesitan una limpia —sin avances registrados— para que el
@@ -254,6 +266,45 @@ def main():
     cods = [p.get("codigo") for p in r.json().get("partidas", [])] if ok else []
     check("T7 /ev/isp incluye E2E-001 y E2E-002",
           ok and "E2E-001" in cods and "E2E-002" in cods, f"status={r.status_code} codigos={cods[:5]}")
+
+    # ── EV-WBS — los endpoints del EV con una CABECERA de WBS presente ──────
+    # Una partida sin fase (nodo padre) no es un caso raro: es lo normal en
+    # cualquier proyecto importado. Estos checks existen porque /ev/curva-fase
+    # llevaba caído en producción con 500 —`sorted()` sobre un set que mezclaba
+    # None con str— y ningún test lo veía: el humo solo sembraba hojas.
+    # PRUEBA DE CONTROL: quitar el filtro `if p["fase"] is not None` de
+    # isp.py::curva_fase y EV1 tiene que caer con 500.
+    r = c.get(f"{API}/ev/curva-fase", params={"hasta": 3, "otm": "OTM-E2E"})
+    cf = r.json() if r.status_code == 200 else {}
+    check("EV1 /ev/curva-fase no revienta con una cabecera de WBS (fase NULL)",
+          r.status_code == 200 and isinstance(cf.get("fases"), list)
+          and all(f is not None for f in cf.get("fases", [])),
+          f"status={r.status_code} fases={cf.get('fases')} body={r.text[:120]}")
+
+    # Y el resto de la familia, con la misma cabecera viva: si alguno hereda el
+    # mismo descuido, cae aquí y no en producción.
+    caidos = []
+    for ruta, params in (("/ev/reporte", {"semana": 3, "otm": "OTM-E2E"}),
+                         ("/ev/isp", {"otm": "OTM-E2E"}),
+                         ("/ev/curva", {"hasta": 3, "otm": "OTM-E2E"}),
+                         ("/ev/performance", {"hasta": 3, "otm": "OTM-E2E"}),
+                         ("/ev/programacion/historial-grid", {"otm": "OTM-E2E"})):
+        rr = c.get(f"{API}{ruta}", params=params)
+        if rr.status_code != 200:
+            caidos.append(f"{ruta}->{rr.status_code}")
+    check("EV2 ningun endpoint del EV cae por la cabecera de WBS",
+          not caidos, f"caidos={caidos}")
+
+    # La cabecera NO debe contaminar los totales: aporta 0 al BAC porque no es
+    # hoja. Es la garantía de que filtrar por `fase` sigue siendo el criterio.
+    r = c.get(f"{API}/ev/reporte", params={"semana": 3, "otm": "OTM-E2E"})
+    rep = r.json() if r.status_code == 200 else {}
+    cods_rep = [p.get("codigo") for p in rep.get("partidas", [])]
+    grupos_fase = [g.get("grupo") for g in rep.get("por_fase", [])]
+    check("EV3 la cabecera sale en el detalle pero no como grupo de fase",
+          r.status_code == 200 and "E2E-WBS" in cods_rep
+          and "E2E-WBS" not in grupos_fase,
+          f"status={r.status_code} en_detalle={'E2E-WBS' in cods_rep} grupos={grupos_fase[:6]}")
 
     # F-FASES — catálogo de fases (migración 0018 + CRUD)
     r = c.get(f"{API}/ev/fases", params={"proyecto_id": 1})
